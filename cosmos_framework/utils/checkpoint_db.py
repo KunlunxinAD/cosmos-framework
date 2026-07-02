@@ -145,6 +145,24 @@ def _hf_download(cmd_args: list[str]) -> str:
     Uses a newer Hugging Face CLI version to download checkpoint. The dependency
     version is very old and not robust.
     """
+    # --- local override ---
+    # 形如: COSMOS_HF_LOCAL__Wan-AI__Wan2.2-TI2V-5B=/home/daichaonan/Wan2.2-TI2V-5B
+    repo = cmd_args[0]                          # e.g. "Wan-AI/Wan2.2-TI2V-5B"
+    env_key = "COSMOS_HF_LOCAL__" + (
+            repo.replace("/", "__").replace(".", "_").replace("-", "_")
+            )
+    local_root = os.environ.get(env_key)
+    if local_root:
+        # 单文件下载：cmd_args 末尾是 filename
+        if "--include" not in cmd_args and "--exclude" not in cmd_args:
+            filename = cmd_args[-1]
+            path = os.path.join(local_root, filename)
+        else:
+            path = local_root
+        assert os.path.exists(path), f"{env_key} -> {path} not found"
+        log.info(f"[local override] {repo} -> {path}")
+        return path
+    # --- end override ---
     is_rank0 = os.environ.get("RANK", "0") == "0"
     cmd = [
         "uvx",

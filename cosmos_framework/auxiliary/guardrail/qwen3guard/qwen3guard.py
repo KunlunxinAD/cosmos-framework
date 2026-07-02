@@ -3,6 +3,7 @@
 
 import argparse
 import re
+import os
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -18,6 +19,7 @@ UNSAFE = misc.Color.red("UNSAFE")
 class Qwen3Guard(ContentSafetyGuardrail):
     def __init__(
         self,
+        checkpoint_dir: str | None = None,
         offload_model_to_cpu: bool = True,
     ) -> None:
         """Llama Guard 3 model for text filtering safety check.
@@ -29,7 +31,12 @@ class Qwen3Guard(ContentSafetyGuardrail):
         self.offload_model = offload_model_to_cpu
         self.dtype = torch.bfloat16
 
-        model_id = "Qwen/Qwen3Guard-Gen-0.6B"
+        #model_id = "Qwen/Qwen3Guard-Gen-0.6B"
+        model_id = (
+            checkpoint_dir
+            or os.environ.get("QWEN3GUARD_DIR")
+            or "Qwen/Qwen3Guard-Gen-0.6B"
+            )
 
         self.model = AutoModelForCausalLM.from_pretrained(model_id)
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)

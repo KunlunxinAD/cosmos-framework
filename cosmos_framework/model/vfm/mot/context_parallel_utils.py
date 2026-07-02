@@ -405,8 +405,27 @@ def context_parallel_attention(
     attn_output_und_hp = get_und_seq(attn_output_pack_hp)  # [text_len,H_local,head_dim]
     attn_output_gen_hp = get_gen_seq(attn_output_pack_hp)  # [gen_len,H_local,head_dim]
 
-    attn_output_und_hp = attn_output_und_hp[:q_und_seq_len].contiguous()  # [text_len,H_local,head_dim]
-    attn_output_gen_hp = attn_output_gen_hp[:q_gen_seq_len].contiguous()  # [gen_len,H_local,head_dim]
+    #attn_output_und_hp = attn_output_und_hp[:q_und_seq_len].contiguous()  # [text_len,H_local,head_dim]
+    #attn_output_gen_hp = attn_output_gen_hp[:q_gen_seq_len].contiguous()  # [gen_len,H_local,head_dim]
+    # Restore the attention output to the cp-padded full length before the
+    # seq-scatter all-to-all.  The attention kernel may internally unpad gen/und
+    # back to ``_num_full_tokens`` / ``_num_causal_tokens`` (the true,
+    # pre-cp-padding token counts), which need not be divisible by the cp world
+    # size.  Scattering such a length yields uneven shards (the last cp rank gets
+    # fewer tokens), so the gen/und shard would no longer match the seq-sharded
+    # residual on that rank.  Pad (or truncate) back to ``q_*_seq_len`` -- the
+    # gathered full length captured before attention, which is a multiple of the
+    # cp world size -- so the scatter produces even shards on every rank.
+    def _pad_or_trunc_seq(x: torch.Tensor, target_len: int) -> torch.Tensor:
+        if x.shape[0] == target_len:
+            return x.contiguous()
+        if x.shape[0] > target_len:
+            return x[:target_len].contiguous()
+        pad = x.new_zeros(target_len - x.shape[0], *x.shape[1:])
+        return torch.cat([x, pad], dim=0).contiguous()
+
+    attn_output_und_hp = _pad_or_trunc_seq(attn_output_und_hp, q_und_seq_len)  # [text_len,H_local,head_dim]
+    attn_output_gen_hp = _pad_or_trunc_seq(attn_output_gen_hp, q_gen_seq_len)
 
     # all2all: gather heads, scatter seq → seq-sharded
     attn_output_und_sp = gather_heads_scatter_seq(
@@ -425,5 +444,5 @@ def context_parallel_attention(
     final_output_pack_sp = from_mode_splits(
         attn_output_und_sp, attn_output_gen_sp, packed_query_states, is_sharded=True
     )
-
+    
     return final_output_pack_sp, kv_to_store

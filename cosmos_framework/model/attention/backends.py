@@ -14,6 +14,7 @@ from cosmos_framework.model.attention.flash2.checks import flash2_attention_chec
 from cosmos_framework.model.attention.flash3.checks import flash3_attention_check
 from cosmos_framework.model.attention.masks import CausalType
 from cosmos_framework.model.attention.natten.checks import natten_attention_check, natten_multi_dim_attention_check
+from cosmos_framework.model.attention.torch_sdpa import torch_sdpa_attention_check
 from cosmos_framework.model.attention.utils import get_arch_tag
 from cosmos_framework.model.attention.utils.environment import (
     filter_attention_backends,
@@ -27,6 +28,7 @@ BACKEND_CHECK_MAP = {
     "natten": natten_attention_check,
     "flash2": flash2_attention_check,
     "flash3": flash3_attention_check,
+    "torch_sdpa": torch_sdpa_attention_check,
 }
 
 BACKEND_MULTI_DIM_CHECK_MAP = {
@@ -125,7 +127,7 @@ def get_backend_list(arch_tag: int) -> list[str]:
 
     if arch_tag < 75:
         log.debug(f"Minimum architecture supported for Attention is 75, got {arch_tag=}.")
-        return []
+        return ["torch_sdpa"]
 
     default_backends = []
     if arch_tag == 90:
@@ -133,19 +135,22 @@ def get_backend_list(arch_tag: int) -> list[str]:
             "flash3",
             "natten",
             "flash2",
+            "torch_sdpa",
         ]
     elif arch_tag in [100, 103]:
         default_backends = [
             "natten",
             "flash2",
+            "torch_sdpa",
         ]
     elif arch_tag >= 80:
         default_backends = [
             "flash2",
             "natten",
+            "torch_sdpa",
         ]
     else:
-        default_backends = ["natten"]
+        default_backends = ["natten", "torch_sdpa"]
 
     # Apply environment variable filtering
     return filter_attention_backends(default_backends)
