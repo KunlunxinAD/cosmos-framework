@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 
 import gc
-import math
 import os
 from functools import wraps
 
 import pynvml
+import torch_xmlir._XMLIRC as XMLIR_C
 from loguru import logger as logging
 
 
@@ -85,23 +85,28 @@ def gpu0_has_80gb_or_less():
 
 class Device:
 
-    _nvml_affinity_elements = math.ceil(os.cpu_count() / 64)  # type: ignore
-
     def __init__(self, device_idx: int):
         super().__init__()
-        self.handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
+        self.device_idx = device_idx
+        XMLIR_C.xpumlInit()
+        self.handle = XMLIR_C.xpumlDeviceGetHandleByIndex(device_idx)
 
     def get_name(self) -> str:
-        return pynvml.nvmlDeviceGetName(self.handle)
+        return XMLIR_C.xpumlDeviceGetName(self.handle)
 
     def get_cpu_affinity(self) -> list[int]:
-        affinity_string = ""
-        for j in pynvml.nvmlDeviceGetCpuAffinity(self.handle, Device._nvml_affinity_elements):
-            # assume nvml returns list of 64 bit ints
-            affinity_string = "{:064b}".format(j) + affinity_string
-        affinity_list = [int(x) for x in affinity_string]
-        affinity_list.reverse()  # so core 0 is in 0th element of list
-        return [i for i, e in enumerate(affinity_list) if e != 0]
+        cpu_count = os.cpu_count() or 1
+        device_count = XMLIR_C.xpumlDeviceGetCount()
+        if device_count <= 0 or cpu_count <= device_count:
+            return list(range(cpu_count))
+
+        cores_per_device = max(1, cpu_count // device_count)
+        start_core = self.device_idx * cores_per_device
+        if self.device_idx == device_count - 1:
+            end_core = cpu_count
+        else:
+            end_core = min(start_core + cores_per_device, cpu_count)
+        return list(range(start_core, end_core))
 
 
 def with_torch_device(device):
