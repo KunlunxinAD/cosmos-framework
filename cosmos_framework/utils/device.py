@@ -5,7 +5,6 @@ import gc
 import os
 from functools import wraps
 
-import pynvml
 import torch_xmlir._XMLIRC as XMLIR_C
 from loguru import logger as logging
 
@@ -18,17 +17,14 @@ def get_gpu_architecture():
         str: The GPU architecture, which can be "H100", "A100", or "Other".
     """
     try:
-        pynvml.nvmlInit()
-        device_count = pynvml.nvmlDeviceGetCount()
+        XMLIR_C.xpumlInit()
+        device_count = XMLIR_C.xpumlDeviceGetCount()
         for i in range(device_count):
-            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-            model_name = pynvml.nvmlDeviceGetName(handle)
+            handle = XMLIR_C.xpumlDeviceGetHandleByIndex(i)
+            model_name = XMLIR_C.xpumlDeviceGetName(handle)
             if isinstance(model_name, bytes):
                 model_name = model_name.decode("utf-8")
-            print(f"GPU {i}: Model: {model_name}")
-
-            # Check for specific models like H100 or A100
-            if "H100" in model_name or "H200" in model_name:
+            if "H100" in model_name:
                 return "H100"
             elif "A100" in model_name:
                 return "A100"
@@ -36,10 +32,13 @@ def get_gpu_architecture():
                 return "L40S"
             elif "B200" in model_name:
                 return "B200"
-    except pynvml.NVMLError as error:
-        print(f"Failed to get GPU info: {error}")
+            else:
+                return "Other"
+    except Exception as error:
+        logging.error(f"Error retrieving device information: {error}")
+        return "Other"
     finally:
-        pynvml.nvmlShutdown()
+        XMLIR_C.xpumlShutdown()
 
     # return "Other" incase of non hopper/ampere or error
     return "Other"
@@ -55,13 +54,13 @@ class GPUArchitectureNotSupported(Exception):
 
 def print_gpu_mem(str=None):
     try:
-        pynvml.nvmlInit()
-        meminfo = pynvml.nvmlDeviceGetMemoryInfo(pynvml.nvmlDeviceGetHandleByIndex(0))
+        XMLIR_C.xpumlInit()
+        meminfo = XMLIR_C.xpumlDeviceGetMemoryInfo(XMLIR_C.xpumlDeviceGetHandleByIndex(0))
         logging.info(
             f"{str}: {meminfo.used / 1024 / 1024}/{meminfo.total / 1024 / 1024}MiB used ({meminfo.free / 1024 / 1024}MiB free)"
         )
-    except pynvml.NVMLError as error:
-        print(f"Failed to get GPU memory info: {error}")
+    except Exception as error:
+        print(f"Failed to get device memory info: {error}")
 
 
 def force_gc():
@@ -76,11 +75,11 @@ def force_gc():
 
 def gpu0_has_80gb_or_less():
     try:
-        pynvml.nvmlInit()
-        meminfo = pynvml.nvmlDeviceGetMemoryInfo(pynvml.nvmlDeviceGetHandleByIndex(0))
+        XMLIR_C.xpumlInit()
+        meminfo = XMLIR_C.xpumlDeviceGetMemoryInfo(XMLIR_C.xpumlDeviceGetHandleByIndex(0))
         return meminfo.total / 1024 / 1024 / 1024 <= 80
-    except pynvml.NVMLError as error:
-        print(f"Failed to get GPU memory info: {error}")
+    except Exception as error:
+        print(f"Failed to get device memory info: {error}")
 
 
 class Device:
