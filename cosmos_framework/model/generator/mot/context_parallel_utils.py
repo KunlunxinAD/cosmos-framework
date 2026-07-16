@@ -465,5 +465,5 @@ def context_parallel_attention(
     final_output_pack_sp = from_mode_splits(
         attn_output_und_sp, attn_output_gen_sp, packed_query_states, is_sharded=True
     )
-    
+
     return final_output_pack_sp, kv_to_store
