@@ -46,16 +46,11 @@ def _build_decoder(
     num_threads: int = 1,
     seek_mode: str = "exact",
     device: str = "cpu",
-    custom_frame_mappings: bytes | None = None,
 ) -> Any:
     normalized_source = _normalize_source(source)
     # Preserve FFmpeg/TorchCodec's 0 sentinel so callers can request automatic thread selection.
     num_ffmpeg_threads = 0 if num_threads == 0 else max(num_threads, 1)
-    kwargs: dict[str, Any] = {"num_ffmpeg_threads": num_ffmpeg_threads}
-    if custom_frame_mappings is None:
-        kwargs["seek_mode"] = seek_mode
-    else:
-        kwargs["custom_frame_mappings"] = custom_frame_mappings
+    kwargs: dict[str, Any] = {"seek_mode": seek_mode, "num_ffmpeg_threads": num_ffmpeg_threads}
     if device != "cpu":
         kwargs["device"] = device
     video_decoder_cls = _get_video_decoder_cls()
@@ -112,15 +107,8 @@ class TorchCodecVideoReader:
         seek_mode: str = "exact",
         device: str = "cpu",
         include_dimensions: bool = False,
-        custom_frame_mappings: bytes | None = None,
     ) -> None:
-        self._decoder = _build_decoder(
-            source,
-            num_threads=num_threads,
-            seek_mode=seek_mode,
-            device=device,
-            custom_frame_mappings=custom_frame_mappings,
-        )
+        self._decoder = _build_decoder(source, num_threads=num_threads, seek_mode=seek_mode, device=device)
         self.metadata = _metadata_from_frame(self._decoder, include_dimensions=include_dimensions)
 
     def __len__(self) -> int:
