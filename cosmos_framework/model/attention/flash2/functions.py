@@ -9,6 +9,7 @@ Flash Attention v2 (flash2) Backend: intermediate APIs
 Only safe to import when FLASH2_SUPPORTED is True.
 """
 
+import torch
 from flash_attn.flash_attn_interface import flash_attn_func, flash_attn_varlen_func
 from torch import Tensor
 
@@ -149,6 +150,14 @@ def flash2_attention(
             # block_table=None,
         )
         assert out.dim() == 3  # [total_tokens,H,Dv]
+
+        # LSE layout differs across flash_attn builds:
+        #   * NVIDIA: [H, total_tokens] (dim == 2)
+        #   * Kunlun XPU: [batch, H, max_seqlen] (dim == 3), padded per sample.
+        # Normalize both to [H, total_tokens] by un-padding the Kunlun layout using cu_seqlens_q.
+        if lse_.dim() == 3:
+            seqlens_q = (cumulative_seqlen_Q[1:] - cumulative_seqlen_Q[:-1]).tolist()
+            lse_ = torch.cat([lse_[i, :, : seqlens_q[i]] for i in range(len(seqlens_q))], dim=-1)
         assert lse_.dim() == 2  # [H,total_tokens]
 
         output = out.unsqueeze(0)  # [1,total_tokens,H,Dv]

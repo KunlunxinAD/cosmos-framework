@@ -25,16 +25,19 @@ def original_datadir(request: pytest.FixtureRequest) -> Path:
 
 @cache
 def _get_available_gpus() -> int:
-    import pynvml
+    import torch_xmlir._XMLIRC as XMLIR_C
 
+    initialized = False
     try:
-        pynvml.nvmlInit()
-        device_count = pynvml.nvmlDeviceGetCount()
-        pynvml.nvmlShutdown()
-        return device_count
-    except pynvml.NVMLError as e:
-        print(f"WARNING: Failed to get available GPUs: {e}")
+        XMLIR_C.xpumlInit()
+        initialized = True
+        return XMLIR_C.xpumlDeviceGetCount()
+    except Exception as e:
+        print(f"WARNING: Failed to get available devices: {e}")
         return 0
+    finally:
+        if initialized:
+            XMLIR_C.xpumlShutdown()
 
 
 def pytest_addoption(parser: pytest.Parser):

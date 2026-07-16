@@ -12,8 +12,8 @@ from contextlib import contextmanager
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Callable, Container, Optional
 
-import pynvml
 import torch
+import torch_xmlir._XMLIRC as XMLIR_C
 import torch.distributed as dist
 from torch.distributed import get_process_group_ranks
 
@@ -32,19 +32,20 @@ if TYPE_CHECKING:
 
 def init() -> int | None:
     """Initialize distributed training."""
-    if dist.is_initialized():
-        return torch.cuda.current_device()
-
-    # Set GPU affinity.
-    pynvml.nvmlInit()
+    # if dist.is_initialized():
+    #     return torch.cuda.current_device()
+    XMLIR_C.xpumlInit()
     local_rank = int(os.getenv("LOCAL_RANK", 0))
+    # if hasattr(os, "sched_setaffinity"):
     try:
         device = Device(local_rank)
-        os.sched_setaffinity(0, device.get_cpu_affinity())
-    except pynvml.NVMLError as e:
-        log.warning(f"Failed to set device affinity: {e}")
-    # Set up distributed communication. CPU checkpoint conversion needs Gloo
-    # because NCCL cannot synchronize CPU-resident tokenizer or model tensors.
+        affinity_mask = set(device.get_cpu_affinity())
+        if affinity_mask:
+            os.sched_setaffinity(0, affinity_mask)
+            log.info(f"Set CPU affinity for device {local_rank} to cores {affinity_mask}")
+    except Exception as e:
+        log.warning(f"Failed to set CPU affinity: {e}")
+
     os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "0"
     os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
     if dist.is_available():
@@ -61,13 +62,23 @@ def init() -> int | None:
         )
     # Increase the L2 fetch granularity for faster speed.
     # For oss, we need to search for the library in site-packages.
-    if INTERNAL:
-        _libcudart = ctypes.CDLL("libcudart.so")
-        # Set device limit on the current device.
-        p_value = ctypes.cast((ctypes.c_int * 1)(), ctypes.POINTER(ctypes.c_int))
-        _libcudart.cudaDeviceSetLimit(ctypes.c_int(0x05), ctypes.c_int(128))
-        _libcudart.cudaDeviceGetLimit(p_value, ctypes.c_int(0x05))
-    log.info(f"Training with {get_world_size()} GPUs.")
+    try:
+        if INTERNAL:
+            _libcudart = ctypes.CDLL("libcudart.so")
+            # Set device limit on the current device.
+            p_value = ctypes.cast((ctypes.c_int * 1)(), ctypes.POINTER(ctypes.c_int))
+            _libcudart.cudaDeviceSetLimit(ctypes.c_int(0x05), ctypes.c_int(128))
+            _libcudart.cudaDeviceGetLimit(p_value, ctypes.c_int(0x05))
+        log.info(f"Training with {get_world_size()} GPUs.")
+    except Exception as e:
+        log.warning(f"Failed to set CUDA L2 cache limit: {e}")
+
+    # 获取world size大小
+    world_size = get_world_size() if dist.is_initialized() else 1
+    log.info(f"Training with {world_size} GPUs.")
+
+    return local_rank
+
 
 
 def get_rank(group: Optional[dist.ProcessGroup] = None) -> int:
