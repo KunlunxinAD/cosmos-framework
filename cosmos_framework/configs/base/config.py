@@ -94,9 +94,16 @@ def make_config() -> Config:
 
     # Register shipped experiments explicitly. (vision_sft_nano also defines
     # vision_sft_nano_mapstyle_dataloader — the CosmosDataLoader variant — in the same module.)
-    import cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_droid_nano  # noqa: F401
-    import cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_libero_all_nano  # noqa: F401
-    import cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_libero_nano  # noqa: F401
+    # Action experiments depend on the optional lerobot package; tolerate its
+    # absence so vision / reasoner SFT still loads on envs without action deps.
+    try:
+        import cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_droid_nano  # noqa: F401
+        import cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_libero_all_nano  # noqa: F401
+        import cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_libero_nano  # noqa: F401
+    except ImportError as e:
+        import logging
+
+        logging.getLogger(__name__).warning(f"Skipping action experiment registration (optional dep missing): {e}")
     import cosmos_framework.configs.base.experiment.sft.vision_sft_nano  # noqa: F401
     import cosmos_framework.configs.base.experiment.sft.vision_sft_super  # noqa: F401
     import cosmos_framework.configs.base.experiment.sft.vision_sft_edge  # noqa: F401

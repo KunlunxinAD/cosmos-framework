@@ -6,8 +6,8 @@ from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 import psutil
-import pynvml
 import torch
+import torch_xmlir._XMLIRC as XMLIR_C
 import wandb
 
 from cosmos_framework.callbacks.every_n import EveryN
@@ -102,7 +102,14 @@ class DeviceMonitor(EveryN):
             log.info(f"{self.name} callback: local_dir: {self.local_dir}")
 
         local_rank = int(os.getenv("LOCAL_RANK", 0))
-        self.handle = pynvml.nvmlDeviceGetHandleByIndex(local_rank)
+        self._init_device_handle(local_rank)
+
+    def _init_device_handle(self, local_rank: int) -> None:
+        XMLIR_C.xpumlInit()
+        self.handle = XMLIR_C.xpumlDeviceGetHandleByIndex(local_rank)
+
+    def _get_device_memory_info(self) -> Any:
+        return XMLIR_C.xpumlDeviceGetMemoryInfo(self.handle)
 
     def every_n_impl(
         self,
@@ -133,7 +140,7 @@ class DeviceMonitor(EveryN):
         util = torch.cuda.utilization()
         clock = torch.cuda.clock_rate()
 
-        memory_info = pynvml.nvmlDeviceGetMemoryInfo(self.handle)
+        memory_info = self._get_device_memory_info()
         nvml_used_gpu_mem_gb = memory_info.used / (1024**3)
         nvml_free_gpu_mem_gb = memory_info.free / (1024**3)
 
