@@ -54,8 +54,11 @@ def init() -> int | None:
         timeout_seconds = os.getenv("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", 1800)
         # Convert the timeout to an integer (if it isn't already) and then to a timedelta
         timeout_timedelta = timedelta(seconds=int(timeout_seconds))
-        backend = "nccl" if os.environ.get("COSMOS_DEVICE", "cuda").lower() == "cuda" else "gloo"
-        dist.init_process_group(backend=backend, init_method="env://", timeout=timeout_timedelta)
+        # On P800/torch_xmlir (XCCL) the default process group may already be
+        # initialized by the compat layer before this runs; re-initializing
+        # raises "trying to initialize the default process group twice!".
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl", init_method="env://", timeout=timeout_timedelta)
         log.critical(
             f"Initialized distributed training with local rank {local_rank} using {backend} with timeout {timeout_seconds}",
             rank0_only=False,
