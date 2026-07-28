@@ -9,22 +9,24 @@ import torch_xmlir._XMLIRC as XMLIR_C
 from loguru import logger as logging
 
 
-def get_gpu_architecture():
+def get_gpu_architecture() -> str:
     """
     Retrieves the GPU architecture of the available GPUs.
 
     Returns:
         str: The GPU architecture, which can be "H100", "A100", or "Other".
     """
+    xpuml_initialized = False
     try:
         XMLIR_C.xpumlInit()
+        xpuml_initialized = True
         device_count = XMLIR_C.xpumlDeviceGetCount()
         for i in range(device_count):
             handle = XMLIR_C.xpumlDeviceGetHandleByIndex(i)
             model_name = XMLIR_C.xpumlDeviceGetName(handle)
             if isinstance(model_name, bytes):
                 model_name = model_name.decode("utf-8")
-            if "H100" in model_name:
+            if "H100" in model_name or "H200" in model_name:
                 return "H100"
             elif "A100" in model_name:
                 return "A100"
@@ -32,13 +34,12 @@ def get_gpu_architecture():
                 return "L40S"
             elif "B200" in model_name:
                 return "B200"
-            else:
-                return "Other"
     except Exception as error:
         logging.error(f"Error retrieving device information: {error}")
         return "Other"
     finally:
-        XMLIR_C.xpumlShutdown()
+        if xpuml_initialized:
+            XMLIR_C.xpumlShutdown()
 
     # return "Other" incase of non hopper/ampere or error
     return "Other"
@@ -83,7 +84,6 @@ def gpu0_has_80gb_or_less():
 
 
 class Device:
-
     def __init__(self, device_idx: int):
         super().__init__()
         self.device_idx = device_idx
