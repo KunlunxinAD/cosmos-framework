@@ -115,6 +115,7 @@ def two_way_attention(
     packed_key_states: SequencePack,
     packed_value_states: SequencePack,
     packed_key_states_normalized: SequencePack | None = None,
+    backend: str | None = None,
 ):
     """
     Performs two-way attention with causal and full attention.
@@ -141,9 +142,9 @@ def two_way_attention(
     # are the same.
     # We don't want to launch a kernel just to perform this check and slow down our model, and
     # we definitely don't want to complicate the sequence_packing code so that it performs a
-    # static check when creating the packed sequence and metadata. Instead, we just rely
-    # on causal_q_offsets and causal_k_offsets being the same tensor.
-    use_dont_care_mask = causal_q_offsets is causal_k_offsets
+    # static check when creating the packed sequence and metadata. Instead, compare
+    # offsets by value because Q/K packs may hold distinct tensor objects.
+    use_dont_care_mask = torch.equal(causal_q_offsets, causal_k_offsets)
 
     sample_offsets = packed_query_states["sample_offsets"]
 
@@ -183,6 +184,7 @@ def two_way_attention(
         causal_v.unsqueeze(0),  # [1,N_und,heads,head_dim]
         is_causal=True,
         causal_type=CausalType.DontCare if use_dont_care_mask else CausalType.TopLeft,
+        backend=backend,
         **causal_varlen_kwargs,
     )  # [1,N_und,heads,head_dim]
 
@@ -203,6 +205,7 @@ def two_way_attention(
         full_q.unsqueeze(0),  # [1,N_full,heads,head_dim]
         get_all_seq(packed_key_normalized).unsqueeze(0),  # [1,N_all,heads,head_dim]  normed und K for gen
         get_all_seq(packed_value_states).unsqueeze(0),  # [1,N_all,heads,head_dim]
+        backend=backend,
         **full_varlen_kwargs,
     )  # [1,N_full,heads,head_dim]
 
@@ -358,6 +361,7 @@ def multi_control_two_way_attention(
     packed_key_states: SequencePack,
     packed_value_states: SequencePack,
     split_info: SplitInfo,
+    backend: str | None = None,
 ) -> SequencePack:
     """Two-way attention for multi-control transfer inference.
 
@@ -401,7 +405,6 @@ def multi_control_two_way_attention(
     causal_k, causal_k_offsets = get_causal_seq(packed_key_states)
     causal_v, _ = get_causal_seq(packed_value_states)
 
-    use_dont_care_mask = causal_q_offsets is causal_k_offsets
     causal_res = attention(
         causal_q.unsqueeze(0),
         causal_k.unsqueeze(0),
@@ -411,7 +414,8 @@ def multi_control_two_way_attention(
         max_seqlen_Q=packed_query_states["max_causal_len"],
         max_seqlen_KV=packed_query_states["max_causal_len"],
         is_causal=True,
-        causal_type=CausalType.DontCare if use_dont_care_mask else CausalType.TopLeft,
+        causal_type=CausalType.DontCare,
+        backend=backend,
     )
     causal_out = causal_res.squeeze(0).flatten(-2, -1)  # [N_text, Hq*D]
 
@@ -478,6 +482,7 @@ def multi_control_two_way_attention(
             cumulative_seqlen_KV=cu_seqlens_kv,
             max_seqlen_Q=n_q,
             max_seqlen_KV=n_kv,
+            backend=backend,
         )  # [1, N_q, Hq, D]
         return res.squeeze(0).flatten(-2, -1)  # [N_q, Hq*D]
 
@@ -525,6 +530,7 @@ def dispatch_attention(
     natten_metadata: dict | None = None,
     memory_value: MemoryValue | None = None,
     packed_key_states_normalized: SequencePack | None = None,
+    backend: str | None = None,
 ) -> tuple[SequencePack, KVToStore | None]:
     assert memory_value is None, "Base dispatch_attention does not handle MemoryValue"
     if not _is_split_info_compatible(attention_mask):
@@ -535,6 +541,7 @@ def dispatch_attention(
             packed_key_states,
             packed_value_states,
             attention_mask,
+            backend=backend,
         )
     elif attention_mask.is_three_way:
         output = three_way_attention(
@@ -551,6 +558,7 @@ def dispatch_attention(
             packed_key_states,
             packed_value_states,
             packed_key_states_normalized=packed_key_states_normalized,
+            backend=backend,
         )
     return output, None
 

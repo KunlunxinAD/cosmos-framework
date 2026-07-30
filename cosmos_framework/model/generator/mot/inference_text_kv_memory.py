@@ -102,6 +102,7 @@ def _attention_gen_with_cached_text(
     packed_key_states: SequencePack,
     packed_value_states: SequencePack,
     memory_value: InferenceTextKVMemoryValue,
+    backend: str | None = None,
 ) -> tuple[SequencePack, KVToStore | None]:
     """Gen-only attention attending to cached text K/V plus current gen K/V."""
     q_gen = get_gen_seq(packed_query_states)  # [S_curr, H, D]
@@ -128,6 +129,7 @@ def _attention_gen_with_cached_text(
         value=v_full,
         is_causal=False,
         return_lse=False,
+        backend=backend,
     )
     assert isinstance(attn_result, torch.Tensor)
     gen_out = attn_result.squeeze(0).flatten(-2, -1)  # [S_curr, H*D]
@@ -148,6 +150,7 @@ def dispatch_attention_with_text_kv_memory(
     natten_metadata: dict | None = None,
     memory_value: MemoryValue | None = None,
     packed_key_states_normalized: SequencePack | None = None,
+    backend: str | None = None,
 ) -> tuple[SequencePack, KVToStore | None]:
     """Dispatch attention with optional request-local text K/V reuse.
 
@@ -160,6 +163,7 @@ def dispatch_attention_with_text_kv_memory(
             packed_key_states,
             packed_value_states,
             memory_value,
+            backend=backend,
         )
     return dispatch_attention(
         packed_query_states,
@@ -169,6 +173,7 @@ def dispatch_attention_with_text_kv_memory(
         natten_metadata=natten_metadata,
         memory_value=None,
         packed_key_states_normalized=packed_key_states_normalized,
+        backend=backend,
     )
 
 

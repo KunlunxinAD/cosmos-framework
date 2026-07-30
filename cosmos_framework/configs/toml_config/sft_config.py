@@ -334,6 +334,13 @@ class ModelConfig(BaseModel):
             "[job].task='vfm'; skipped on VLM."
         ),
     )
+    attention_backend: str | None = Field(
+        default=None,
+        description=(
+            "Explicit VFM two-way/multi-control attention backend: 'flash2' or "
+            "'torch_sdpa'. None preserves automatic backend selection."
+        ),
+    )
     attn_implementation: str = Field(
         default="cosmos",
         description=(
