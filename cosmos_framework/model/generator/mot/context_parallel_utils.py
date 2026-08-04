@@ -277,6 +277,7 @@ def context_parallel_attention(
     natten_metadata: dict | None = None,
     memory_value: MemoryValue | None = None,
     packed_key_states_normalized: SequencePack | None = None,
+    backend: str | None = None,
 ) -> tuple[SequencePack, KVToStore | None]:
     """Ulysses-style context parallel attention for packed und+gen sequences.
 
@@ -421,6 +422,7 @@ def context_parallel_attention(
         natten_metadata=natten_metadata,
         memory_value=memory_value,
         packed_key_states_normalized=packed_key_states_normalized_,
+        backend=backend,
     )
 
     attn_output_und_hp = get_und_seq(attn_output_pack_hp)  # [text_len,H_local,head_dim]

@@ -236,6 +236,7 @@ class _MoTConfigBase(object):
         qk_norm_for_text: bool = True,
         qk_norm_for_diffusion: bool = True,
         include_visual: bool = False,
+        attention_backend: str | None = None,
         gen_noisy_gating: bool = False,
         gen_cosine_router_config: CosineRouterConfig | None = None,
         gen_aux_loss_free_load_balancing_config: AuxLossFreeLoadBalancingConfig | None = None,
@@ -247,6 +248,9 @@ class _MoTConfigBase(object):
         self.qk_norm_for_text = qk_norm_for_text
         self.qk_norm_for_diffusion = qk_norm_for_diffusion
         self.include_visual = include_visual
+        # Optional explicit backend for two-way and multi-control attention.
+        # None preserves automatic backend selection.
+        self.attention_backend = attention_backend
         # Noisy top-k gating on the generation-tower MoE blocks (Shazeer 2017).
         # Gen-tower only; the understanding tower never receives this flag.
         self.gen_noisy_gating = gen_noisy_gating
@@ -485,9 +489,11 @@ class PackedAttentionMoT(nn.Module):
         qk_norm_for_text: bool,
         qk_norm_for_diffusion: bool,
         use_und_k_norm_for_gen: bool = False,
+        attention_backend: str | None = None,
     ):
         super().__init__()
         self.config = config
+        self.attention_backend = attention_backend
         self.layer_idx = layer_idx
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.hidden_size = config.hidden_size
@@ -679,6 +685,7 @@ class PackedAttentionMoT(nn.Module):
             natten_metadata=natten_metadata,
             memory_value=memory_value,
             packed_key_states_normalized=packed_key_states_normalized_,
+            backend=self.attention_backend,
         )
 
         # Produce kv_to_store for MemoryState.write_for_layer() when the
@@ -820,6 +827,7 @@ def _impl_init(
     qk_norm_for_text: bool,
     qk_norm_for_diffusion: bool,
     use_und_k_norm_for_gen: bool = False,
+    attention_backend: str | None = None,
     gen_noisy_gating: bool = False,
     gen_cosine_router_config: CosineRouterConfig | None = None,
     gen_aux_loss_free_load_balancing_config: AuxLossFreeLoadBalancingConfig | None = None,
@@ -845,6 +853,7 @@ def _impl_init(
                 qk_norm_for_text=qk_norm_for_text,
                 qk_norm_for_diffusion=qk_norm_for_diffusion,
                 use_und_k_norm_for_gen=use_und_k_norm_for_gen,
+                attention_backend=attention_backend,
                 gen_noisy_gating=gen_noisy_gating,
                 gen_cosine_router_config=gen_cosine_router_config,
                 gen_aux_loss_free_load_balancing_config=gen_aux_loss_free_load_balancing_config,
@@ -1029,6 +1038,7 @@ class MoTDecoderLayer(nn.Module):
         use_und_k_norm_for_gen: bool = False,
         gen_noisy_gating: bool = False,
         gen_cosine_router_config: CosineRouterConfig | None = None,
+        attention_backend: str | None = None,
         gen_aux_loss_free_load_balancing_config: AuxLossFreeLoadBalancingConfig | None = None,
     ) -> None:
         super().__init__()
@@ -1040,6 +1050,7 @@ class MoTDecoderLayer(nn.Module):
             qk_norm_for_text=qk_norm_for_text,
             qk_norm_for_diffusion=qk_norm_for_diffusion,
             use_und_k_norm_for_gen=use_und_k_norm_for_gen,
+            attention_backend=attention_backend,
         )
 
         if (
@@ -1272,6 +1283,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         qk_norm_for_text: bool,
         qk_norm_for_diffusion: bool,
         use_und_k_norm_for_gen: bool,
+        attention_backend: str | None = None,
     ):
         super().__init__(config)
         _impl_init(
@@ -1281,6 +1293,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             qk_norm_for_text=qk_norm_for_text,
             qk_norm_for_diffusion=qk_norm_for_diffusion,
             use_und_k_norm_for_gen=use_und_k_norm_for_gen,
+            attention_backend=attention_backend,
         )
 
     def init_taylorseer(self, cache_dic=None, current=None):
@@ -1307,6 +1320,7 @@ class Qwen3VLMoeTextModel(Qwen3VLMoePreTrainedModel):
         qk_norm_for_text: bool,
         qk_norm_for_diffusion: bool,
         use_und_k_norm_for_gen: bool,
+        attention_backend: str | None = None,
         gen_noisy_gating: bool = False,
         gen_cosine_router_config: CosineRouterConfig | None = None,
         gen_aux_loss_free_load_balancing_config: AuxLossFreeLoadBalancingConfig | None = None,
@@ -1319,6 +1333,7 @@ class Qwen3VLMoeTextModel(Qwen3VLMoePreTrainedModel):
             qk_norm_for_text=qk_norm_for_text,
             qk_norm_for_diffusion=qk_norm_for_diffusion,
             use_und_k_norm_for_gen=use_und_k_norm_for_gen,
+            attention_backend=attention_backend,
             gen_noisy_gating=gen_noisy_gating,
             gen_cosine_router_config=gen_cosine_router_config,
             gen_aux_loss_free_load_balancing_config=gen_aux_loss_free_load_balancing_config,
@@ -1348,6 +1363,7 @@ class Nemotron3DenseVLTextModel(Nemotron3DenseVLPreTrainedModel):
         qk_norm_for_text: bool,
         qk_norm_for_diffusion: bool,
         use_und_k_norm_for_gen: bool,
+        attention_backend: str | None = None,
     ):
         super().__init__(config)
         _impl_init(
@@ -1357,6 +1373,7 @@ class Nemotron3DenseVLTextModel(Nemotron3DenseVLPreTrainedModel):
             qk_norm_for_text=qk_norm_for_text,
             qk_norm_for_diffusion=qk_norm_for_diffusion,
             use_und_k_norm_for_gen=use_und_k_norm_for_gen,
+            attention_backend=attention_backend,
         )
 
     def init_taylorseer(self, cache_dic=None, current=None) -> None:
@@ -2037,6 +2054,7 @@ class Qwen3VLTextForCausalLM(Qwen3VLPreTrainedModel):
             qk_norm_for_text=config.qk_norm_for_text,
             qk_norm_for_diffusion=config.qk_norm_for_diffusion,
             use_und_k_norm_for_gen=getattr(config, "use_und_k_norm_for_gen", False),
+            attention_backend=getattr(config, "attention_backend", None),
         )
         self.vocab_size = text_config.vocab_size
         self.lm_head = nn.Linear(text_config.hidden_size, text_config.vocab_size, bias=False)
@@ -2181,6 +2199,7 @@ class Qwen3VLMoeTextForCausalLM(Qwen3VLMoePreTrainedModel):
             qk_norm_for_text=config.qk_norm_for_text,
             qk_norm_for_diffusion=config.qk_norm_for_diffusion,
             use_und_k_norm_for_gen=getattr(config, "use_und_k_norm_for_gen", False),
+            attention_backend=getattr(config, "attention_backend", None),
             gen_noisy_gating=config.gen_noisy_gating,
             gen_cosine_router_config=getattr(config, "gen_cosine_router_config", None),
             gen_aux_loss_free_load_balancing_config=config.gen_aux_loss_free_load_balancing_config,
@@ -2372,6 +2391,7 @@ class Nemotron3DenseVLTextForCausalLM(Nemotron3DenseVLPreTrainedModel):
             qk_norm_for_text=config.qk_norm_for_text,
             qk_norm_for_diffusion=config.qk_norm_for_diffusion,
             use_und_k_norm_for_gen=getattr(config, "use_und_k_norm_for_gen", False),
+            attention_backend=getattr(config, "attention_backend", None),
         )
         self.vocab_size = text_config.vocab_size
         self.lm_head = nn.Linear(text_config.hidden_size, text_config.vocab_size, bias=False)

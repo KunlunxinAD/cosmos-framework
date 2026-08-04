@@ -183,6 +183,8 @@ class OmniMoTModelConfig:
     # Note "two_way" and "three_way" disallow and remove "End-of-Vision" or other text token in the generation tower.
     # "three_way" must only be used when introducing sparsity
     joint_attn_implementation: str = "two_way"  # "two_way" or "three_way"
+    # Explicit backend for two-way/multi-control attention. None keeps automatic selection.
+    attention_backend: str | None = None
 
     # Per-layer NATTEN parameters
     # Must use "three_way" attention if used.

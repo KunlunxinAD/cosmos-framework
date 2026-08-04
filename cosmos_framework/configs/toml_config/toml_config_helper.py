@@ -72,6 +72,7 @@ PATH_REMAPS: dict[str, dict[tuple[str, ...], "tuple[str, ...] | None"]] = {
         # No VLM analog — skip these leaves
         ("model", "max_num_tokens_after_packing"): None,
         ("model", "joint_attn_implementation"): None,
+        ("model", "attention_backend"): None,
         ("model", "lora_enabled"): None,
         ("model", "lora_rank"): None,
         ("model", "lora_alpha"): None,

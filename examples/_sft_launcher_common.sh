@@ -37,7 +37,8 @@ set -uo pipefail
 : "${TOML_FILE:?TOML_FILE must be set before sourcing _sft_launcher_common.sh}"
 
 # Repo root = parent of the wrapper's directory (examples/).
-WORKDIR="$(cd "$(dirname "${BASH_SOURCE[1]}")/.." && pwd)"
+CALLER_SCRIPT="${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}"
+WORKDIR="$(cd "$(dirname "$CALLER_SCRIPT")/.." && pwd)"
 
 # Anchor relative paths to $WORKDIR.
 [[ "$TOML_FILE" = /* ]] || TOML_FILE="$WORKDIR/$TOML_FILE"

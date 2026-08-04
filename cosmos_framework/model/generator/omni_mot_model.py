@@ -195,6 +195,10 @@ class OmniMoTModel(ImaginaireModel):
             assert self.vlm_config.model_instance is not None, "Model instance should be specified"
 
             language_model = lazy_instantiate(self.vlm_config.model_instance)
+            language_model.config.attention_backend = self.config.attention_backend
+            for module in language_model.modules():
+                if hasattr(module, "attention_backend"):
+                    module.attention_backend = self.config.attention_backend
 
             # NOTE: We pass "RF timesteps" to the network in the same scale as the scheduler
             # (i.e., roughly [0, num_train_timesteps]). The MoT network expects to internally
