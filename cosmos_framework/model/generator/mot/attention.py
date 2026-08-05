@@ -95,19 +95,20 @@ def _is_split_info_compatible(attention_mask: object) -> bool:
 _dotproduct_attention_cache = {}
 
 
+from cosmos_framework.model.generator.mot.flex_attention import FlexMetadata, flex_attention_varlen
 from cosmos_framework.data.generator.sequence_packing.natten import (
     generate_natten_metadata,
     generate_temporal_causal_natten_metadata,
 )
 from cosmos_framework.data.generator.sequence_packing.runtime import (
     SequencePack,
+    SequencePackMetadata,
     from_mode_splits,
     get_all_seq,
     get_causal_seq,
     get_full_only_seq,
     sequence_pack_from_packed_sequence,
 )
-from cosmos_framework.model.generator.mot.flex_attention import FlexMetadata, flex_attention_varlen
 
 
 def two_way_attention(
@@ -586,6 +587,7 @@ def build_packed_sequence(
     num_action_tokens_per_supertoken: int = 0,
     null_action_supertokens: bool = False,
     pad_for_cuda_graphs: bool = False,
+    prepared_metadata: SequencePackMetadata | None = None,
 ) -> tuple[SequencePack, AttentionMaskType, list | None]:
     """
     Build the model input pack and attention meta for joint attention.
@@ -653,6 +655,7 @@ def build_packed_sequence(
         is_image_batch=is_image_batch,
         cp_world_size=cp_world_size,
         pad_for_cuda_graphs=pad_for_cuda_graphs,
+        prepared_metadata=prepared_metadata,
     )
     # Not needed anymore, can cause recompilations.
     input_pack.pop("split_lens", None)
