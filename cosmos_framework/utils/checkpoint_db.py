@@ -50,10 +50,13 @@ load_checkpoint(checkpoint_uri)
 """
 
 import functools
+import hashlib
 import json
 import os
 import shlex
 import subprocess
+import threading
+import time
 import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -62,8 +65,8 @@ from typing import Annotated, Callable, TypeAlias
 import pydantic
 from typing_extensions import Self, override
 
-from cosmos_framework.utils.flags import EXPERIMENTAL_CHECKPOINTS, INTERNAL, StrEnum
 from cosmos_framework.utils import log
+from cosmos_framework.utils.flags import EXPERIMENTAL_CHECKPOINTS, INTERNAL, StrEnum
 
 HF_VERSION = "1.16.4"
 
@@ -139,11 +142,76 @@ class CheckpointDirS3(_CheckpointS3):
 CheckpointS3: TypeAlias = CheckpointFileS3 | CheckpointDirS3
 
 
-def _hf_download(cmd_args: list[str]) -> str:
-    """Run Hugging Face CLI download command and return the local path.
+_HF_DOWNLOAD_SENTINEL_DIR = Path.home() / ".cache" / "cosmos_framework" / "hf_download_locks"
 
-    Uses a newer Hugging Face CLI version to download checkpoint. The dependency
-    version is very old and not robust.
+
+def _hf_hub_cache_dir() -> Path:
+    """Return the huggingface hub cache directory (mirrors huggingface_hub's default lookup)."""
+    if (hub := os.environ.get("HF_HUB_CACHE")):
+        return Path(hub)
+    if (home := os.environ.get("HF_HOME")):
+        return Path(home) / "hub"
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def _log_hf_progress(repo_dir: Path, stop: threading.Event, interval: float = 30.0) -> None:
+    """Periodically log actual byte growth in the HF cache repo directory.
+
+    ``hf@1.16.4`` prints a misleading ``Still waiting to acquire lock ...`` INFO
+    log while a large file is being downloaded, drowning out tqdm output. This
+    monitor writes a plain "N MiB total, +X MiB in Ys (Z MiB/s)" line every
+    ``interval`` seconds so users can see real progress.
+    """
+
+    def _scan_bytes() -> int:
+        total = 0
+        try:
+            for p in repo_dir.rglob("*"):
+                try:
+                    if p.is_file():
+                        total += p.stat().st_size
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        return total
+
+    prev_total = _scan_bytes()
+    prev_time = time.monotonic()
+    while not stop.wait(interval):
+        curr_total = _scan_bytes()
+        curr_time = time.monotonic()
+        delta = curr_total - prev_total
+        elapsed = max(curr_time - prev_time, 1e-6)
+        rate_mib = delta / elapsed / (1024 * 1024)
+        log.info(
+            f"HF download progress [{repo_dir.name}]: "
+            f"{curr_total / (1024**3):.2f} GiB total "
+            f"(+{delta / (1024**2):.1f} MiB in {elapsed:.0f}s, {rate_mib:.2f} MiB/s)"
+        )
+        prev_total, prev_time = curr_total, curr_time
+
+
+def _hf_download(cmd_args: list[str]) -> str:
+    """Download from Hugging Face Hub and return the local path.
+
+    Calls ``huggingface_hub``'s Python API in an isolated ``uvx`` env instead
+    of the ``hf`` CLI, because the CLI's ``main()`` unconditionally forces
+    ``logging.set_verbosity_info()`` and drowns the terminal in the misleading
+    ``Still waiting to acquire lock ...`` INFO log while a large file is
+    downloading. Going through the library lets ``HF_HUB_VERBOSITY=error``
+    actually take effect.
+
+    In distributed launches (``WORLD_SIZE > 1``), only ``LOCAL_RANK == 0`` on
+    each node runs the actual download subprocess; peer local ranks wait on a
+    filesystem sentinel and read the resulting path back. Without this gating,
+    every rank spawns a downloader and they contend on HF hub's per-file locks
+    under ``~/.cache/huggingface/hub/.locks/`` — the source of the "Still
+    waiting to acquire lock on ..." hangs.
+
+    We can't use ``torch.distributed.barrier()`` here because this function is
+    invoked from checkpoint-registry side effects (e.g. guardrail preset
+    imports) that may run before ``dist.init_process_group``.
     """
     # --- local override ---
     # 形如: COSMOS_HF_LOCAL__Wan-AI__Wan2.2-TI2V-5B=/home/daichaonan/Wan2.2-TI2V-5B
@@ -164,26 +232,109 @@ def _hf_download(cmd_args: list[str]) -> str:
         return path
     # --- end override ---
     is_rank0 = os.environ.get("RANK", "0") == "0"
-    cmd = [
-        "uvx",
-        "--with",
-        "click",
-        "--with",
-        "tqdm<4.70",
-        f"hf@{HF_VERSION}",
-        "download",
-        "--format=json",
-        *cmd_args,
-    ]
-    log.info(f"{shlex.join(cmd)}")
-    output = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=None if is_rank0 else subprocess.PIPE,
-        text=True,
-        check=True,
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+
+    # Parse hf-CLI-style args into snapshot_download / hf_hub_download kwargs.
+    kwargs: dict = {}
+    positional: list[str] = []
+    i = 0
+    while i < len(cmd_args):
+        a = cmd_args[i]
+        if a == "--repo-type":
+            kwargs["repo_type"] = cmd_args[i + 1]
+            i += 2
+        elif a == "--revision":
+            kwargs["revision"] = cmd_args[i + 1]
+            i += 2
+        elif a == "--include":
+            kwargs.setdefault("allow_patterns", []).append(cmd_args[i + 1])
+            i += 2
+        elif a == "--exclude":
+            kwargs.setdefault("ignore_patterns", []).append(cmd_args[i + 1])
+            i += 2
+        else:
+            positional.append(a)
+            i += 1
+    kwargs["repo_id"] = positional[0]
+    if len(positional) > 1:
+        kwargs["filename"] = positional[1]
+
+    fn = "hf_hub_download" if "filename" in kwargs else "snapshot_download"
+    py_snippet = (
+        "import json;"
+        f"from huggingface_hub import {fn};"
+        f"print(json.dumps({{'path': {fn}(**{json.dumps(kwargs)})}}))"
     )
-    return json.loads(output.stdout)["path"]
+    cmd = ["uvx", "--from", f"huggingface_hub=={HF_VERSION}", "python", "-c", py_snippet]
+
+    def _run_download() -> str:
+        log.info(f"{shlex.join(cmd)}")
+
+        # HF_HUB_VERBOSITY now actually takes effect (see docstring). Silence
+        # everything below ERROR so the misleading WeakFileLock log doesn't
+        # drown tqdm progress output. Users can override to see it back.
+        env = os.environ.copy()
+        env.setdefault("HF_HUB_VERBOSITY", "error")
+
+        # Resolve the repo's cache dir so the monitor thread reports byte growth
+        # scoped to just this download.
+        repo_type = "datasets" if kwargs.get("repo_type") == "dataset" else "models"
+        repo_dir = _hf_hub_cache_dir() / f"{repo_type}--{kwargs['repo_id'].replace('/', '--')}"
+
+        stop = threading.Event()
+        monitor = threading.Thread(target=_log_hf_progress, args=(repo_dir, stop), daemon=True)
+        monitor.start()
+        try:
+            output = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=None if is_rank0 else subprocess.PIPE,
+                text=True,
+                check=True,
+                env=env,
+            )
+        finally:
+            stop.set()
+            monitor.join(timeout=5)
+        return json.loads(output.stdout)["path"]
+
+    if world_size <= 1:
+        return _run_download()
+
+    # Per-run key so sentinels from prior torchrun launches are never consulted.
+    # torchrun sets TORCHELASTIC_RUN_ID to a UUID shared by all workers of the
+    # same run; fallback covers non-torchrun distributed launches.
+    run_key = (
+        os.environ.get("TORCHELASTIC_RUN_ID")
+        or f"{os.environ.get('MASTER_ADDR', '')}_{os.environ.get('MASTER_PORT', '')}"
+        or "default"
+    )
+    run_key = "".join(c if c.isalnum() or c in "._-" else "_" for c in run_key) or "default"
+
+    sentinel_dir = _HF_DOWNLOAD_SENTINEL_DIR / run_key
+    sentinel_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(json.dumps(cmd_args, sort_keys=True).encode()).hexdigest()[:16]
+    sentinel = sentinel_dir / f"{digest}.path"
+
+    if local_rank == 0:
+        path = _run_download()
+        tmp = sentinel.with_suffix(".tmp")
+        tmp.write_text(path)
+        tmp.replace(sentinel)
+        return path
+
+    log.info(f"local_rank={local_rank}: waiting for local_rank=0 HF download -> {sentinel}")
+    timeout = int(os.environ.get("COSMOS_HF_DOWNLOAD_WAIT_TIMEOUT", "3600"))
+    deadline = time.monotonic() + timeout
+    while not sentinel.exists():
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"local_rank={local_rank}: timed out after {timeout}s waiting for "
+                f"local_rank=0 to finish HF download; command was {shlex.join(cmd)}"
+            )
+        time.sleep(1.0)
+    return sentinel.read_text().strip()
 
 
 class RepositoryType(StrEnum):
