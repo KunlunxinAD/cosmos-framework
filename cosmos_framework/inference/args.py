@@ -6,7 +6,7 @@ import math
 import os
 from functools import cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal, Self, cast, override
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal, Self, Sequence, cast, override
 
 import pydantic
 import torch_xmlir._XMLIRC as XMLIR_C
@@ -165,7 +165,7 @@ class ModelMode(StrEnum):
     # Action
     FORWARD_DYNAMICS = "forward_dynamics"
     INVERSE_DYNAMICS = "inverse_dynamics"
-    POLICY = "policy"
+    WAM = "wam"
 
     REASONER = "reasoner"
 
@@ -187,7 +187,7 @@ _IMAGE_OUTPUT_MODES: frozenset[ModelMode] = frozenset({ModelMode.TEXT2IMAGE, Mod
 
 # Modes that produce action tensors and require a model with ``action_gen=True``.
 ACTION_MODEL_MODES: frozenset[ModelMode] = frozenset(
-    {ModelMode.FORWARD_DYNAMICS, ModelMode.INVERSE_DYNAMICS, ModelMode.POLICY}
+    {ModelMode.FORWARD_DYNAMICS, ModelMode.INVERSE_DYNAMICS, ModelMode.WAM}
 )
 
 REASONER_MODEL_MODES: frozenset[ModelMode] = frozenset({ModelMode.REASONER})
@@ -195,6 +195,11 @@ REASONER_MODEL_MODES: frozenset[ModelMode] = frozenset({ModelMode.REASONER})
 # Modes that condition generation on a real input audio clip (require a model
 # with ``sound_gen=True`` and a ``sound_path``).
 SOUND_CONDITION_MODEL_MODES: frozenset[ModelMode] = frozenset({ModelMode.AUDIO_IMAGE2VIDEO})
+
+
+def is_reasoner_only(sample_overrides: Sequence["OmniSampleOverrides"]) -> bool:
+    """Return whether every requested sample uses the reasoner-only path."""
+    return bool(sample_overrides) and all(sample.sample_meta.model_mode.is_reasoner for sample in sample_overrides)
 
 
 class VisionMode(StrEnum):
@@ -621,7 +626,7 @@ class ActionDataOverrides(OverridesBase):
             case ModelMode.FORWARD_DYNAMICS:
                 if self.action_path is None:
                     raise ValueError(f"'action_path' is required for model_mode={mode.value!r}")
-            case ModelMode.INVERSE_DYNAMICS | ModelMode.POLICY:
+            case ModelMode.INVERSE_DYNAMICS | ModelMode.WAM:
                 pass
             case _:
                 assert_never(mode)
@@ -1223,7 +1228,7 @@ _CHECKPOINTS: dict[str, CheckpointConfig] = {
         s3_uri="s3://bucket1/cosmos3_vfm/cosmos3_ga_text2image_4step/",
         hf=CheckpointDirHf(
             repository="nvidia/Cosmos3-Super-Text2Image-4Step",
-            revision="1ba94110bc118f479bbd5e461e79d685d74b2554",
+            revision="main",
         ),
         experiment_overrides=(
             "model.config.resolution='768'",
@@ -1245,7 +1250,7 @@ _CHECKPOINTS: dict[str, CheckpointConfig] = {
         s3_uri="s3://bucket1/cosmos3_vfm/cosmos3_ga_image2video_4step/",
         hf=CheckpointDirHf(
             repository="nvidia/Cosmos3-Super-Image2Video-4Step",
-            revision="f85d3335d2ad8b352462cecbd637aa980cec9688",
+            revision="main",
         ),
         experiment_overrides=(
             "model.config.resolution='480'",

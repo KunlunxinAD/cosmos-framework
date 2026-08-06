@@ -19,6 +19,7 @@ from cosmos_framework.inference.args import (
     OmniSetupOverrides,
     SoundDataOverrides,
     _get_nvml_device_memory_info,
+    is_reasoner_only,
 )
 from cosmos_framework.inference.common.config import structure_config
 
@@ -29,6 +30,31 @@ _H100_MEMORY_BYTES = 80 * 1024**3
 # Reserved for future use (paired with the reserved memory-based `_get_dp_shard_size`
 # heuristic in args.py); not currently exercised.
 _GB200_MEMORY_BYTES = 192 * 1024**3
+
+
+def test_reasoner_only_detection() -> None:
+    reasoner = OmniSampleOverrides(model_mode=ModelMode.REASONER)
+    generator = OmniSampleOverrides(model_mode=ModelMode.TEXT2VIDEO)
+
+    assert is_reasoner_only([reasoner])
+    assert is_reasoner_only([reasoner, reasoner])
+    assert not is_reasoner_only([reasoner, generator])
+    assert not is_reasoner_only([])
+
+
+def test_reasoner_only_override_disables_vision_tokenizer_in_model_config(tmp_path: Path) -> None:
+    setup_args = OmniSetupOverrides(
+        checkpoint_path=DEFAULT_CHECKPOINT_NAME,
+        output_dir=tmp_path / "outputs",
+    ).build_setup(world_size=1, local_world_size=1, device_memory_bytes=_H100_MEMORY_BYTES)
+
+    model_dict = structure_config(setup_args.load_model_config_dict(), omegaconf.DictConfig)
+    assert model_dict.config.load_vision_tokenizer is True
+
+    setup_args.experiment_overrides.append("model.config.load_vision_tokenizer=false")
+
+    model_dict = structure_config(setup_args.load_model_config_dict(), omegaconf.DictConfig)
+    assert model_dict.config.load_vision_tokenizer is False
 
 
 def test_build_parallelism(monkeypatch: pytest.MonkeyPatch):
@@ -151,14 +177,14 @@ def test_checkpoints():
         (
             "Cosmos3-Super-Text2Image-4Step",
             "nvidia/Cosmos3-Super-Text2Image-4Step",
-            "1ba94110bc118f479bbd5e461e79d685d74b2554",
+            "main",
             "768",
             24,
         ),
         (
             "Cosmos3-Super-Image2Video-4Step",
             "nvidia/Cosmos3-Super-Image2Video-4Step",
-            "f85d3335d2ad8b352462cecbd637aa980cec9688",
+            "main",
             "480",
             16,
         ),
@@ -290,7 +316,7 @@ def test_edge_num_frames_default(tmp_path: Path):
     # the reasoner (which reports VIDEO vision_mode) keeps its inert 1 -- none of
     # these should be rewritten to 121.
     assert _num_frames("Cosmos3-Edge", "edge_t2i", model_mode=ModelMode.TEXT2IMAGE) == 1
-    assert _num_frames("Cosmos3-Edge", "edge_policy", model_mode=ModelMode.POLICY) == 189
+    assert _num_frames("Cosmos3-Edge", "edge_policy", model_mode=ModelMode.WAM) == 189
     assert _num_frames("Cosmos3-Edge", "edge_reasoner", model_mode=ModelMode.REASONER, prompt="Describe.") == 1
 
 
