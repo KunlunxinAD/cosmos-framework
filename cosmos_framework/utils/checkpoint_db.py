@@ -68,7 +68,7 @@ from typing_extensions import Self, override
 from cosmos_framework.utils import log
 from cosmos_framework.utils.flags import EXPERIMENTAL_CHECKPOINTS, INTERNAL, StrEnum
 
-HF_VERSION = "1.16.4"
+_HF_CLI_PROJECT = Path(__file__).resolve().with_name("hf_cli")
 
 
 def _is_uuid(checkpoint_uri: str) -> bool:
@@ -232,39 +232,8 @@ def _hf_download(cmd_args: list[str]) -> str:
         return path
     # --- end override ---
     is_rank0 = os.environ.get("RANK", "0") == "0"
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-
-    # Parse hf-CLI-style args into snapshot_download / hf_hub_download kwargs.
-    kwargs: dict = {}
-    positional: list[str] = []
-    i = 0
-    while i < len(cmd_args):
-        a = cmd_args[i]
-        if a == "--repo-type":
-            kwargs["repo_type"] = cmd_args[i + 1]
-            i += 2
-        elif a == "--revision":
-            kwargs["revision"] = cmd_args[i + 1]
-            i += 2
-        elif a == "--include":
-            kwargs.setdefault("allow_patterns", []).append(cmd_args[i + 1])
-            i += 2
-        elif a == "--exclude":
-            kwargs.setdefault("ignore_patterns", []).append(cmd_args[i + 1])
-            i += 2
-        else:
-            positional.append(a)
-            i += 1
-    kwargs["repo_id"] = positional[0]
-    if len(positional) > 1:
-        kwargs["filename"] = positional[1]
-
-    fn = "hf_hub_download" if "filename" in kwargs else "snapshot_download"
-    py_snippet = (
-        "import json;"
-        f"from huggingface_hub import {fn};"
-        f"print(json.dumps({{'path': {fn}(**{json.dumps(kwargs)})}}))"
+                logger.warning(f"LOCAL_RANK {local_rank} timeout waiting for HF download of {repo}; retrying directly")
+        # Fall through: local rank 0 (or timeout fallback) performs the download.
     )
     cmd = ["uvx", "--from", f"huggingface_hub=={HF_VERSION}", "python", "-c", py_snippet]
 
