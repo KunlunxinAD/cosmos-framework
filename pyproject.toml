@@ -324,6 +324,14 @@ conflicts = [
     {group = "cu130-torch213"},
     {group = "cu130-torch213-train"},
   ],
+  # vllm pins torch==2.10.0, which is satisfied by the cu128/cu130 torch 2.10.0
+  # local builds, so vllm may combine with those. It is incompatible only with
+  # the torch 2.13.0 groups; keep those mutually exclusive with vllm.
+  [
+    {group = "vllm"},
+    {group = "cu130-torch213"},
+    {group = "cu130-torch213-train"},
+  ],
 ]
 override-dependencies = [
   # Lower bound defeats robomimic/robosuite's old numpy 1.x pins; upper bound
