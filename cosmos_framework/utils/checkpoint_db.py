@@ -144,7 +144,6 @@ CheckpointS3: TypeAlias = CheckpointFileS3 | CheckpointDirS3
 
 _HF_DOWNLOAD_SENTINEL_DIR = Path.home() / ".cache" / "cosmos_framework" / "hf_download_locks"
 
-
 def _hf_hub_cache_dir() -> Path:
     """Return the huggingface hub cache directory (mirrors huggingface_hub's default lookup)."""
     if (hub := os.environ.get("HF_HUB_CACHE")):
@@ -195,12 +194,9 @@ def _log_hf_progress(repo_dir: Path, stop: threading.Event, interval: float = 30
 def _hf_download(cmd_args: list[str]) -> str:
     """Download from Hugging Face Hub and return the local path.
 
-    Calls ``huggingface_hub``'s Python API in an isolated ``uvx`` env instead
-    of the ``hf`` CLI, because the CLI's ``main()`` unconditionally forces
-    ``logging.set_verbosity_info()`` and drowns the terminal in the misleading
-    ``Still waiting to acquire lock ...`` INFO log while a large file is
-    downloading. Going through the library lets ``HF_HUB_VERBOSITY=error``
-    actually take effect.
+    Uses the separately locked Hugging Face CLI from ``utils/hf_cli``. By
+    default, each call uses an isolated environment; callers that make repeated
+    downloads can set ``IMAGINAIRE_HF_CLI_ENVIRONMENT`` to reuse one.
 
     In distributed launches (``WORLD_SIZE > 1``), only ``LOCAL_RANK == 0`` on
     each node runs the actual download subprocess; peer local ranks wait on a
@@ -215,10 +211,8 @@ def _hf_download(cmd_args: list[str]) -> str:
     """
     # --- local override ---
     # 形如: COSMOS_HF_LOCAL__Wan-AI__Wan2.2-TI2V-5B=/home/daichaonan/Wan2.2-TI2V-5B
-    repo = cmd_args[0]                          # e.g. "Wan-AI/Wan2.2-TI2V-5B"
-    env_key = "COSMOS_HF_LOCAL__" + (
-            repo.replace("/", "__").replace(".", "_").replace("-", "_")
-            )
+    repo = cmd_args[0]  # e.g. "Wan-AI/Wan2.2-TI2V-5B"
+    env_key = "COSMOS_HF_LOCAL__" + repo.replace("/", "__").replace(".", "_").replace("-", "_")
     local_root = os.environ.get(env_key)
     if local_root:
         # 单文件下载：cmd_args 末尾是 filename
@@ -232,24 +226,38 @@ def _hf_download(cmd_args: list[str]) -> str:
         return path
     # --- end override ---
     is_rank0 = os.environ.get("RANK", "0") == "0"
-                logger.warning(f"LOCAL_RANK {local_rank} timeout waiting for HF download of {repo}; retrying directly")
-        # Fall through: local rank 0 (or timeout fallback) performs the download.
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    hf_cli_environment = os.environ.get("IMAGINAIRE_HF_CLI_ENVIRONMENT")
+    cmd = [
+        "uv",
+        "run",
+    ]
+    if hf_cli_environment is None:
+        cmd.append("--isolated")
+    cmd.extend(
+        [
+            "--project",
+            str(_HF_CLI_PROJECT),
+            "--locked",
+            "--no-default-groups",
+            "hf",
+            "download",
+            "--format=json",
+            *cmd_args,
+        ]
     )
-    cmd = ["uvx", "--from", f"huggingface_hub=={HF_VERSION}", "python", "-c", py_snippet]
+    env = os.environ.copy()
+    if hf_cli_environment is not None:
+        env["UV_PROJECT_ENVIRONMENT"] = hf_cli_environment
 
     def _run_download() -> str:
         log.info(f"{shlex.join(cmd)}")
 
-        # HF_HUB_VERBOSITY now actually takes effect (see docstring). Silence
-        # everything below ERROR so the misleading WeakFileLock log doesn't
-        # drown tqdm progress output. Users can override to see it back.
-        env = os.environ.copy()
-        env.setdefault("HF_HUB_VERBOSITY", "error")
-
         # Resolve the repo's cache dir so the monitor thread reports byte growth
         # scoped to just this download.
-        repo_type = "datasets" if kwargs.get("repo_type") == "dataset" else "models"
-        repo_dir = _hf_hub_cache_dir() / f"{repo_type}--{kwargs['repo_id'].replace('/', '--')}"
+        repo_type = "datasets" if "dataset" in cmd_args else "models"
+        repo_dir = _hf_hub_cache_dir() / f"{repo_type}--{repo.replace('/', '--')}"
 
         stop = threading.Event()
         monitor = threading.Thread(target=_log_hf_progress, args=(repo_dir, stop), daemon=True)
