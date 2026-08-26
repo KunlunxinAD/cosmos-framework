@@ -1,16 +1,41 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# Structured-TOML launch for vision_sft_nano (T2V / I2V / V2V vision-only
+# SFT on Qwen3-VL-8B, 8-GPU FSDP). Drives cosmos_framework.scripts.train against
+# examples/toml/sft_config/vision_sft_nano.toml.
+#
+# Optional env vars (defaults below point under examples/; override to put
+# data or checkpoints on a different filesystem):
+#   DATASET_PATH          default: examples/data/BridgeData2-Subset-Synthetic-Captions/sft_dataset_bridge
+#                         (must contain train/video_dataset_file.jsonl)
+#   BASE_CHECKPOINT_PATH  default: examples/checkpoints/Cosmos3-Nano
+#   WAN_VAE_PATH          default: examples/checkpoints/wan22_vae/Wan2.2_VAE.pth
+#   HF_TOKEN              if any tokenizer download requires gated HF access
+#   OUTPUT_ROOT           default: outputs/train
+#
+# Usage (8-GPU allocation, inside the training container, from the repo root):
+#   bash examples/launch_sft_vision_nano.sh
 
 TOML_FILE="examples/toml/sft_config/vision_sft_nano.toml"
 : "${DATASET_PATH:=/workspace/cosmos-framework/checkpoint/BridgeData2-Subset-Synthetic-Captions/sft_dataset_bridge}"
 : "${BASE_CHECKPOINT_PATH:=/workspace/cosmos-framework/checkpoint/Cosmos3-Nano-DCP}"
 : "${WAN_VAE_PATH:=/workspace/cosmos-framework/checkpoint/Wan2.2_VAE.pth}"
 : "${TOKENIZER_PATH:=/cosmos3/Qwen3-VL-8B-Instruct}"
-: "${TRAIN_PRECISION:=bfloat16}"
-: "${VAE_DTYPE:=float16}"
 : "${OUTPUT_ROOT:=outputs/vision_sft_nano_$(date +%Y%m%d_%H%M%S)}"
 : "${NPROC_PER_NODE:=8}"
 : "${MAX_ITER:=500}"
+#fp16 mlp compute and wan vae
+: "${TRAIN_PRECISION:=bfloat16}"
+: "${VAE_DTYPE:=float16}"
 : "${FP16_COMPUTE_MLP:=1}"
+#packed qkv and gate_up
+: "${PACKED_QKV:=false}"
+: "${PACKED_GATE_UP:=false}"
+#Partial Activation Recomputation
+: "${ACTIVATION_CHECKPOINTING_MODE:=selective}"
+: "${ACTIVATION_CHECKPOINTING_SAVE_OPS_REGEX:=["fmha", "flash_attn", "flash_attention"]}"
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export HF_HUB_OFFLINE=1
@@ -37,6 +62,10 @@ TAIL_OVERRIDES=(
     "model.config.tokenizer.dtype=$VAE_DTYPE"
     "model.config.compile.enabled=false"
     "model.config.fp16_compute_mlp=$FP16_COMPUTE_MLP"
+    # "+model.config.vlm_config.model_instance.config.packed_qkv=$PACKED_QKV"
+    # "+model.config.vlm_config.model_instance.config.packed_gate_up=$PACKED_GATE_UP"
+    "model.config.activation_checkpointing.mode=$ACTIVATION_CHECKPOINTING_MODE"
+    "model.config.activation_checkpointing.save_ops_regex=$ACTIVATION_CHECKPOINTING_SAVE_OPS_REGEX"
     "trainer.seed=42"
     "trainer.callbacks.device_monitor.every_n=0"
     "trainer.callbacks.ofu.every_n=0"

@@ -12,6 +12,7 @@ from typing import Any
 import torch
 from torch import nn
 from torch.distributed import ProcessGroup
+from transformers.activations import ACT2FN
 
 from cosmos_framework.model.attention import attention as imaginaire_attention
 from cosmos_framework.model.attention.masks import CausalType
@@ -248,6 +249,8 @@ class _MoTConfigBase(object):
         gen_moe_shared_expert_intermediate_scale: int = 1,
         gen_moe_top_k: int | None = None,
         text_config_overrides: Mapping[str, Any] | None = None,
+        packed_qkv: bool = False,
+        packed_gate_up: bool = False,
     ) -> None:
         # Defensive copy so downstream materialization can't mutate the
         # caller's input.
@@ -279,6 +282,8 @@ class _MoTConfigBase(object):
         # checkpoint's ``num_experts_per_tok``. The und tower always keeps the
         # pretrained value, so lowering this does not perturb the frozen backbone.
         self.gen_moe_top_k = gen_moe_top_k
+        self.packed_qkv = packed_qkv
+        self.packed_gate_up = packed_gate_up
         # Plain attribute (not a property) so the ``create_vlm_config``
         # post-construction ``setattr`` flow can replace the whole
         # mapping in one shot; default to ``{}`` so the merge in
@@ -505,6 +510,7 @@ class PackedAttentionMoT(nn.Module):
         qk_norm_for_diffusion: bool,
         use_und_k_norm_for_gen: bool = False,
         attention_backend: str | None = None,
+        packed_qkv: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -517,13 +523,22 @@ class PackedAttentionMoT(nn.Module):
         self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
+        self.packed_qkv = packed_qkv
+
+        q_size = self.num_attention_heads * self.head_dim
+        kv_size = self.num_key_value_heads * self.head_dim
+        self.qkv_split_sizes = (q_size, kv_size, kv_size)
 
         eps = config.rms_norm_eps
 
-        # Understanding pathway projections
-        self.q_proj = nn.Linear(self.hidden_size, self.num_attention_heads * self.head_dim, bias=config.attention_bias)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        # Understanding pathway projections. Packed QKV keeps the checkpoint
+        # layout opt-in so existing DCP checkpoints remain loadable.
+        if packed_qkv:
+            self.qkv_proj = nn.Linear(self.hidden_size, sum(self.qkv_split_sizes), bias=config.attention_bias)
+        else:
+            self.q_proj = nn.Linear(self.hidden_size, q_size, bias=config.attention_bias)
+            self.k_proj = nn.Linear(self.hidden_size, kv_size, bias=config.attention_bias)
+            self.v_proj = nn.Linear(self.hidden_size, kv_size, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.num_attention_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
 
         # Understanding pathway QK norm
@@ -556,15 +571,14 @@ class PackedAttentionMoT(nn.Module):
             self.k_norm_und_for_gen = None
 
         # Generation pathway linear projections
-        self.q_proj_moe_gen = nn.Linear(
-            self.hidden_size, self.num_attention_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.k_proj_moe_gen = nn.Linear(
-            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.v_proj_moe_gen = nn.Linear(
-            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
+        if packed_qkv:
+            self.qkv_proj_moe_gen = nn.Linear(
+                self.hidden_size, sum(self.qkv_split_sizes), bias=config.attention_bias
+            )
+        else:
+            self.q_proj_moe_gen = nn.Linear(self.hidden_size, q_size, bias=config.attention_bias)
+            self.k_proj_moe_gen = nn.Linear(self.hidden_size, kv_size, bias=config.attention_bias)
+            self.v_proj_moe_gen = nn.Linear(self.hidden_size, kv_size, bias=config.attention_bias)
         self.o_proj_moe_gen = nn.Linear(
             self.num_attention_heads * self.head_dim, self.hidden_size, bias=config.attention_bias
         )
@@ -573,6 +587,24 @@ class PackedAttentionMoT(nn.Module):
         self.dispatch_attention_fn = dispatch_attention
         self.replicated_attention_io_local_head_o_proj = False
         self.replicated_attention_io_cp_mesh: Any | None = None
+
+    def _project_qkv(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        generation: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.packed_qkv:
+            projection = self.qkv_proj_moe_gen if generation else self.qkv_proj
+            return projection(hidden_states).split(self.qkv_split_sizes, dim=-1)
+
+        if generation:
+            return (
+                self.q_proj_moe_gen(hidden_states),
+                self.k_proj_moe_gen(hidden_states),
+                self.v_proj_moe_gen(hidden_states),
+            )
+        return self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
 
     def _replicated_attention_io_q_feature_slice(self) -> slice:
         cp_mesh = self.replicated_attention_io_cp_mesh
@@ -633,14 +665,8 @@ class PackedAttentionMoT(nn.Module):
             memory_value: Optional read-only tensor container for memory-augmented attention.
         """
 
-        q_und_in = self.q_proj(get_und_seq(pack))  # [N_und,num_heads*head_dim]
-        q_gen_in = self.q_proj_moe_gen(get_gen_seq(pack))  # [N_gen,num_heads*head_dim]
-
-        k_und_in = self.k_proj(get_und_seq(pack))  # [N_und,num_kv_heads*head_dim]
-        k_gen_in = self.k_proj_moe_gen(get_gen_seq(pack))  # [N_gen,num_kv_heads*head_dim]
-
-        v_und_in = self.v_proj(get_und_seq(pack))  # [N_und,num_kv_heads*head_dim]
-        v_gen_in = self.v_proj_moe_gen(get_gen_seq(pack))  # [N_gen,num_kv_heads*head_dim]
+        q_und_in, k_und_in, v_und_in = self._project_qkv(get_und_seq(pack), generation=False)
+        q_gen_in, k_gen_in, v_gen_in = self._project_qkv(get_gen_seq(pack), generation=True)
 
         q_und = q_und_in.view(-1, self.num_attention_heads, self.head_dim)  # [N_und,num_heads,head_dim]
         k_und = k_und_in.view(-1, self.num_key_value_heads, self.head_dim)  # [N_und,num_kv_heads,head_dim]
@@ -811,9 +837,10 @@ class PackedAttentionMoT(nn.Module):
         H_kv = self.num_key_value_heads
         D = self.head_dim
 
-        q = self.q_proj(hidden_states).view(B, T, H, D)  # [B,T,num_heads,head_dim]
-        k = self.k_proj(hidden_states).view(B, T, H_kv, D)  # [B,T,num_kv_heads,head_dim]
-        v = self.v_proj(hidden_states).view(B, T, H_kv, D)  # [B,T,num_kv_heads,head_dim]
+        q, k, v = self._project_qkv(hidden_states, generation=False)
+        q = q.view(B, T, H, D)  # [B,T,num_heads,head_dim]
+        k = k.view(B, T, H_kv, D)  # [B,T,num_kv_heads,head_dim]
+        v = v.view(B, T, H_kv, D)  # [B,T,num_kv_heads,head_dim]
 
         # qk_norm_for_text=False -> q_norm/k_norm are nn.Identity().
         q = self.q_norm(q)
@@ -849,6 +876,23 @@ class PackedAttentionMoT(nn.Module):
         return self.o_proj(out.reshape(B, T, H * D))  # type: ignore[union-attr]  # [B,T,hidden_size]
 
 
+class PackedGateUpMLP(nn.Module):
+    """Qwen gated MLP using one projection for the gate and up branches."""
+
+    def __init__(self, config: Qwen3VLTextConfig | Qwen3VLMoeTextConfig):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_up_proj = nn.Linear(self.hidden_size, 2 * self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate, up = self.gate_up_proj(x).split(self.intermediate_size, dim=-1)
+        return self.down_proj(self.act_fn(gate) * up)
+
+
 def _impl_init(
     self,
     config: Qwen3VLTextConfig | Qwen3VLMoeTextConfig | Nemotron3DenseVLTextConfig,
@@ -865,6 +909,8 @@ def _impl_init(
     gen_moe_shared_expert: bool = False,
     gen_moe_shared_expert_intermediate_scale: int = 1,
     gen_moe_top_k: int | None = None,
+    packed_qkv: bool = False,
+    packed_gate_up: bool = False,
 ) -> None:
     """Shared ``__init__`` body for the three MoT text-model variants.
 
@@ -895,6 +941,8 @@ def _impl_init(
                 gen_moe_shared_expert=gen_moe_shared_expert,
                 gen_moe_shared_expert_intermediate_scale=gen_moe_shared_expert_intermediate_scale,
                 gen_moe_top_k=gen_moe_top_k,
+                packed_qkv=packed_qkv,
+                packed_gate_up=packed_gate_up,
             )
         )
 
@@ -1142,6 +1190,8 @@ class MoTDecoderLayer(nn.Module):
         gen_moe_shared_expert: bool = False,
         gen_moe_shared_expert_intermediate_scale: int = 1,
         gen_moe_top_k: int | None = None,
+        packed_qkv: bool = False,
+        packed_gate_up: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -1153,6 +1203,7 @@ class MoTDecoderLayer(nn.Module):
             qk_norm_for_diffusion=qk_norm_for_diffusion,
             use_und_k_norm_for_gen=use_und_k_norm_for_gen,
             attention_backend=attention_backend,
+            packed_qkv=packed_qkv,
         )
 
         if (
@@ -1173,8 +1224,13 @@ class MoTDecoderLayer(nn.Module):
                 top_k=gen_moe_top_k,
             )
         else:
-            self.mlp = layer_types.mlp(config)
-            self.mlp_moe_gen = layer_types.mlp(config)
+            mlp_type = (
+                PackedGateUpMLP
+                if packed_gate_up and layer_types.variant.startswith("qwen3_vl")
+                else layer_types.mlp
+            )
+            self.mlp = mlp_type(config)
+            self.mlp_moe_gen = mlp_type(config)
 
         self.input_layernorm = layer_types.rms_norm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm_moe_gen = layer_types.rms_norm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1409,6 +1465,8 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         qk_norm_for_diffusion: bool,
         use_und_k_norm_for_gen: bool,
         attention_backend: str | None = None,
+        packed_qkv: bool = False,
+        packed_gate_up: bool = False,
     ):
         super().__init__(config)
         _impl_init(
@@ -1419,6 +1477,8 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             qk_norm_for_diffusion=qk_norm_for_diffusion,
             use_und_k_norm_for_gen=use_und_k_norm_for_gen,
             attention_backend=attention_backend,
+            packed_qkv=packed_qkv,
+            packed_gate_up=packed_gate_up,
         )
 
     def forward(self, *args, **kwargs):
@@ -1450,6 +1510,8 @@ class Qwen3VLMoeTextModel(Qwen3VLMoePreTrainedModel):
         gen_moe_shared_expert: bool = False,
         gen_moe_shared_expert_intermediate_scale: int = 1,
         gen_moe_top_k: int | None = None,
+        packed_qkv: bool = False,
+        packed_gate_up: bool = False,
     ) -> None:
         super().__init__(config)
         _impl_init(
@@ -1467,6 +1529,8 @@ class Qwen3VLMoeTextModel(Qwen3VLMoePreTrainedModel):
             gen_moe_shared_expert=gen_moe_shared_expert,
             gen_moe_shared_expert_intermediate_scale=gen_moe_shared_expert_intermediate_scale,
             gen_moe_top_k=gen_moe_top_k,
+            packed_qkv=packed_qkv,
+            packed_gate_up=packed_gate_up,
         )
 
     def forward(self, *args, **kwargs):
@@ -1491,6 +1555,8 @@ class Nemotron3DenseVLTextModel(Nemotron3DenseVLPreTrainedModel):
         qk_norm_for_diffusion: bool,
         use_und_k_norm_for_gen: bool,
         attention_backend: str | None = None,
+        packed_qkv: bool = False,
+        packed_gate_up: bool = False,
     ):
         super().__init__(config)
         _impl_init(
@@ -1501,6 +1567,8 @@ class Nemotron3DenseVLTextModel(Nemotron3DenseVLPreTrainedModel):
             qk_norm_for_diffusion=qk_norm_for_diffusion,
             use_und_k_norm_for_gen=use_und_k_norm_for_gen,
             attention_backend=attention_backend,
+            packed_qkv=packed_qkv,
+            packed_gate_up=packed_gate_up,
         )
 
     def forward(self, *args, **kwargs):
@@ -2179,6 +2247,8 @@ class Qwen3VLTextForCausalLM(Qwen3VLPreTrainedModel):
             qk_norm_for_diffusion=config.qk_norm_for_diffusion,
             use_und_k_norm_for_gen=getattr(config, "use_und_k_norm_for_gen", False),
             attention_backend=getattr(config, "attention_backend", None),
+            packed_qkv=getattr(config, "packed_qkv", False),
+            packed_gate_up=getattr(config, "packed_gate_up", False),
         )
         self.vocab_size = text_config.vocab_size
         self.lm_head = nn.Linear(text_config.hidden_size, text_config.vocab_size, bias=False)
@@ -2340,6 +2410,8 @@ class Qwen3VLMoeTextForCausalLM(Qwen3VLMoePreTrainedModel):
                 1,
             ),
             gen_moe_top_k=getattr(config, "gen_moe_top_k", None),
+            packed_qkv=getattr(config, "packed_qkv", False),
+            packed_gate_up=getattr(config, "packed_gate_up", False),
         )
         self.vocab_size = text_config.vocab_size
         self.lm_head = nn.Linear(text_config.hidden_size, text_config.vocab_size, bias=False)
@@ -2533,6 +2605,8 @@ class Nemotron3DenseVLTextForCausalLM(Nemotron3DenseVLPreTrainedModel):
             qk_norm_for_diffusion=config.qk_norm_for_diffusion,
             use_und_k_norm_for_gen=getattr(config, "use_und_k_norm_for_gen", False),
             attention_backend=getattr(config, "attention_backend", None),
+            packed_qkv=getattr(config, "packed_qkv", False),
+            packed_gate_up=getattr(config, "packed_gate_up", False),
         )
         self.vocab_size = text_config.vocab_size
         self.lm_head = nn.Linear(text_config.hidden_size, text_config.vocab_size, bias=False)
