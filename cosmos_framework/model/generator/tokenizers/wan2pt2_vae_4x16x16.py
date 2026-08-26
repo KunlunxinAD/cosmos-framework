@@ -1370,6 +1370,7 @@ class Wan2pt2VAEInterface(VideoTokenizerInterface):
         bucket_name: str = "",
         object_store_credential_path_pretrained: str = "",
         vae_path: str = "",
+        dtype: str = "bfloat16",
         chunk_duration: int = 93,
         keep_decoder_cache: bool = False,
         use_streaming_encode: bool = False,
@@ -1417,8 +1418,10 @@ class Wan2pt2VAEInterface(VideoTokenizerInterface):
         # Local-path support: skip the s3:// prefix when bucket_name is empty
         # so OSS users can point vae_path at an absolute local file.
         vae_path_full = f"s3://{bucket_name}/{vae_path}" if bucket_name else vae_path
+        if dtype not in {"bfloat16", "float16", "float32"}:
+            raise ValueError(f"Unsupported Wan2.2 VAE dtype {dtype!r}; expected bfloat16, float16, or float32")
         self.model = WanVAE(
-            dtype=torch.bfloat16,
+            dtype=getattr(torch, dtype),
             vae_pth=vae_path_full,
             object_store_credential_path_pretrained=object_store_credential_path_pretrained,
             temporal_window=encode_chunk_frames,
@@ -1446,7 +1449,9 @@ class Wan2pt2VAEInterface(VideoTokenizerInterface):
         return self.model.dtype
 
     def reset_dtype(self) -> None:
-        pass
+        # Wan2.2 VAE weights are loaded in the configured dtype and should not
+        # be changed to the denoiser dtype by the parent model.
+        return
 
     @property
     def active_decoder(self) -> nn.Module:

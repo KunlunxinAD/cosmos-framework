@@ -206,6 +206,10 @@ class OmniMoTModelConfig:
     # "float16", "float32".
     precision: str = "bfloat16"
 
+    # Optional compute-only FP16 path for dense MLPs. Parameters, residuals,
+    # gradients, and optimizer state remain in the model precision (BF16).
+    fp16_compute_mlp: bool = False
+
     # LoRA (parameter-efficient fine-tuning). When `lora_enabled=True`,
     # `OmniMoTModel.build_net` injects custom LoRA adapters BEFORE FSDP wrap on
     # the meta-device network, then re-initializes lora_A/lora_B after

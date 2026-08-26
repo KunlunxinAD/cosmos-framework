@@ -80,6 +80,7 @@ Wan2pt2VAEConfig: LazyDict = L(Wan2pt2VAEInterface)(
     bucket_name=PLACEHOLDER,
     object_store_credential_path_pretrained=PLACEHOLDER,
     vae_path=PRETRAINED_TOKENIZER_WAN2PT2_VAE_PTH,
+    dtype="bfloat16",
     spatial_compression_factor=16,
     temporal_compression_factor=4,
     causal=True,

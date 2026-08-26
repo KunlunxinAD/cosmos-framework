@@ -125,6 +125,7 @@ SUPER_MODEL_CONFIG = dict(
         object_store_credential_path_pretrained="",
         spatial_compression_factor=16,
         temporal_compression_factor=4,
+        dtype="bfloat16",
         use_streaming_encode=False,
         vae_path="pretrained/tokenizers/video/wan2pt2/Wan2.2_VAE.pth",
     ),

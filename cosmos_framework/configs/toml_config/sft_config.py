@@ -257,6 +257,10 @@ class ModelTokenizerConfig(BaseModel):
             "env interpolation: vae_path = '${oc.env:WAN_VAE_PATH}'."
         ),
     )
+    dtype: str = Field(
+        default="bfloat16",
+        description="Compute/storage dtype for the Wan2.2 VAE, independent of model.precision.",
+    )
 
 
 class BackboneConfig(BaseModel):
@@ -315,6 +319,14 @@ class ModelConfig(BaseModel):
             "(``MixedPrecisionPolicy.param_dtype``). Was "
             "``parallelism.precision`` before the ParallelismConfig split; "
             "lands at ``model.config.precision`` now."
+        ),
+    )
+    fp16_compute_mlp: bool = Field(
+        default=False,
+        description=(
+            "Run dense MLP Linear/activation kernels under FP16 autocast while "
+            "keeping model parameters, residual boundaries, and optimizer state "
+            "in BF16. Requires precision='bfloat16'; experimental."
         ),
     )
     max_num_tokens_after_packing: int = Field(

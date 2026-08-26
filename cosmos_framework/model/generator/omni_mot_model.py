@@ -56,6 +56,12 @@ from cosmos_framework.model.generator.mot.inference_text_kv_memory import (
 )
 from cosmos_framework.model.generator.mot.modeling_utils import has_noisy_tokens
 from cosmos_framework.model.generator.mot.parallelize_vfm_network import parallelize_vfm_network
+from cosmos_framework.model.generator.mot.unified_mot import (
+    Nemotron3DenseVLMLP,
+    Qwen3VLMoeTextMLP,
+    Qwen3VLTextMLP,
+    Qwen3VLMoeTextSparseMoeBlock,
+)
 from cosmos_framework.model.generator.reasoner.qwen3_vl.utils import tokenize_caption
 from cosmos_framework.model.generator.utils.data_and_condition import (
     GenerationDataClean,
@@ -92,6 +98,13 @@ from cosmos_framework.utils.generator.dtensor_helper import DTensorFastEmaModelU
 from cosmos_framework.utils.generator.model_weights_stats import WeightTrainingStat
 from cosmos_framework.utils.generator.parallelism import ParallelDims
 from cosmos_framework.utils.generator.quantization import swap_modelopt_fp8_linears_on_meta
+
+_SELECTIVE_FP16_MLP_TYPES = (
+    Qwen3VLTextMLP,
+    Qwen3VLMoeTextMLP,
+    Nemotron3DenseVLMLP,
+    Qwen3VLMoeTextSparseMoeBlock,
+)
 
 
 def _uses_lidar_primary_tokenizer(data_batch: dict[str, Any]) -> bool:
@@ -145,6 +158,8 @@ class OmniMoTModel(ImaginaireModel):
 
     def set_precision(self) -> None:
         self.precision = PRECISION_TO_TORCH_DTYPE[self.config.precision]
+        if self.config.fp16_compute_mlp and self.precision != torch.bfloat16:
+            raise ValueError("fp16_compute_mlp is a BF16-parameter experiment; set model.config.precision=bfloat16")
         self.tensor_kwargs = {"device": DEVICE, "dtype": self.precision}
         self.tensor_kwargs_fp32 = {"device": DEVICE, "dtype": torch.float32}
         log.warning(f"OmniMoTModel: precision {self.precision}")
@@ -272,6 +287,8 @@ class OmniMoTModel(ImaginaireModel):
         """
         # Build model network and parallelize it.
         lora_enabled = self.config.lora_enabled if lora_enabled is None else lora_enabled
+        if self.config.fp16_compute_mlp and dtype == torch.float16:
+            raise ValueError("fp16_compute_mlp is a BF16-parameter experiment; set model.config.precision=bfloat16")
         with torch.device("meta"):
             assert self.vlm_config.model_instance is not None, "Model instance should be specified"
 
@@ -344,6 +361,17 @@ class OmniMoTModel(ImaginaireModel):
                 config=network_config,
             )
             net.pad_for_cuda_graphs = self.config.compile.use_cuda_graphs
+            
+            if self.config.fp16_compute_mlp and dtype == torch.bfloat16:
+                enabled_mlp_count = 0
+                for module in net.language_model.modules():
+                    # The language model contains dense text MLPs. Sparse MoE
+                    # blocks intentionally stay BF16 until their grouped-MM
+                    # kernels have a dedicated mixed-precision validation.
+                    if isinstance(module, _SELECTIVE_FP16_MLP_TYPES):
+                        module._fp16_compute = True
+                        enabled_mlp_count += 1
+                log.warning(f"Selective FP16 compute enabled for {enabled_mlp_count} dense MLP modules")
 
             # Inject LoRA BEFORE FSDP wrap, while still on meta device. The
             # injector must see unsharded Linear shapes; injecting post-FSDP causes
