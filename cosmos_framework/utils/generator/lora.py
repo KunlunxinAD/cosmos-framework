@@ -22,6 +22,19 @@ import torch.nn.functional as F
 from cosmos_framework.utils import log
 
 
+# Packed attention replaces the three independent projections with one linear
+# module. Keep the public/default target names backward compatible, while
+# resolving them to the packed module only when the original name is absent.
+_PACKED_QKV_TARGET_ALIASES = {
+    "q_proj": "qkv_proj",
+    "k_proj": "qkv_proj",
+    "v_proj": "qkv_proj",
+    "q_proj_moe_gen": "qkv_proj_moe_gen",
+    "k_proj_moe_gen": "qkv_proj_moe_gen",
+    "v_proj_moe_gen": "qkv_proj_moe_gen",
+}
+
+
 class LoraInjectedLinear(nn.Linear):
     """nn.Linear with sibling lora_A and lora_B that preserves the original ``.weight`` key.
 
@@ -143,8 +156,8 @@ def inject_lora_pre_fsdp(
     if lora_alpha <= 0:
         raise ValueError(f"LoRA alpha must be positive, got {lora_alpha}")
 
-    target_modules_list = [m.strip() for m in lora_target_modules.split(",") if m.strip()]
-    if not target_modules_list:
+    requested_targets = [m.strip() for m in lora_target_modules.split(",") if m.strip()]
+    if not requested_targets:
         raise ValueError("LoRA target_modules cannot be empty")
 
     all_module_paths = [name for name, _ in network.named_modules()]
@@ -157,11 +170,39 @@ def inject_lora_pre_fsdp(
             return any(p == t or p.endswith("." + t) for p in all_module_paths)
         return t in leaf_names
 
-    invalid_modules = [t for t in target_modules_list if not _target_exists(t)]
-    if invalid_modules:
-        log.warning(f"LoRA target modules not found in model: {invalid_modules}")
+    def _packed_alias(t: str) -> str | None:
+        prefix, separator, leaf = t.rpartition(".")
+        alias = _PACKED_QKV_TARGET_ALIASES.get(leaf)
+        if alias is None:
+            return None
+        return f"{prefix}{separator}{alias}" if separator else alias
 
-    log.info(f"Injecting LoRA on meta device: rank={lora_rank}, alpha={lora_alpha}, targets={target_modules_list}")
+    target_modules_list: list[str] = []
+    resolved_aliases: dict[str, str] = {}
+    invalid_modules: list[str] = []
+    for target in requested_targets:
+        resolved_target = target
+        if not _target_exists(target):
+            alias = _packed_alias(target)
+            if alias is not None and _target_exists(alias):
+                resolved_target = alias
+                resolved_aliases[target] = alias
+            else:
+                invalid_modules.append(target)
+        if resolved_target not in target_modules_list:
+            target_modules_list.append(resolved_target)
+
+    if resolved_aliases:
+        log.info(f"Resolved packed QKV LoRA targets: {resolved_aliases}")
+    if invalid_modules:
+        raise ValueError(
+            f"LoRA target modules not found in model: {invalid_modules}. "
+            f"Requested targets: {requested_targets}; resolved targets: {target_modules_list}"
+        )
+
+    log.info(
+        f"Injecting LoRA on meta device: rank={lora_rank}, alpha={lora_alpha}, targets={target_modules_list}"
+    )
 
     try:
         replaced = _inject_lora_inplace(network, target_modules_list, lora_rank, lora_alpha)

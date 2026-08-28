@@ -321,14 +321,6 @@ class ModelConfig(BaseModel):
             "lands at ``model.config.precision`` now."
         ),
     )
-    fp16_compute_mlp: bool = Field(
-        default=False,
-        description=(
-            "Run dense MLP Linear/activation kernels under FP16 autocast while "
-            "keeping model parameters, residual boundaries, and optimizer state "
-            "in BF16. Requires precision='bfloat16'; experimental."
-        ),
-    )
     max_num_tokens_after_packing: int = Field(
         default=13312,
         description=(

@@ -164,12 +164,6 @@ def _dummy_recipe_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class TestEndToEndLoader:
-    def test_shipped_recipe_disables_selective_fp16_by_default(self, _dummy_recipe_env: None) -> None:
-        repo_root = Path(__file__).parents[3]
-        config = _load_or_skip(repo_root / "examples/toml/sft_config/vision_sft_nano.toml")
-
-        assert config.model.config.fp16_compute_mlp is False
-
     def test_load_with_custom_section(self, tmp_path: Path, _dummy_recipe_env: None) -> None:
         toml_path = tmp_path / "with_custom.toml"
         toml_path.write_text(_BASE_TOML + _CUSTOM_TOML_BLOCK)

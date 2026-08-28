@@ -19,18 +19,17 @@
 #   bash examples/launch_sft_vision_nano.sh
 
 TOML_FILE="examples/toml/sft_config/vision_sft_nano.toml"
-: "${DATASET_PATH:=/workspace/cosmos-framework/checkpoint/BridgeData2-Subset-Synthetic-Captions/sft_dataset_bridge}"
-: "${BASE_CHECKPOINT_PATH:=/workspace/cosmos-framework/checkpoint/Cosmos3-Nano-DCP}"
-: "${WAN_VAE_PATH:=/workspace/cosmos-framework/checkpoint/Wan2.2_VAE.pth}"
-: "${TOKENIZER_PATH:=/cosmos3/Qwen3-VL-8B-Instruct}"
+: "${DATASET_PATH:=examples/data/BridgeData2-Subset-Synthetic-Captions/sft_dataset_bridge}"
+: "${BASE_CHECKPOINT_PATH:=examples/checkpoints/Cosmos3-Nano}"
+: "${WAN_VAE_PATH:=examples/checkpoints/wan22_vae/Wan2.2_VAE.pth}"
+: "${TOKENIZER_PATH:=examples/Qwen3-VL-8B-Instruct}"
 : "${OUTPUT_ROOT:=outputs/vision_sft_nano_$(date +%Y%m%d_%H%M%S)}"
 : "${NPROC_PER_NODE:=8}"
 : "${MAX_ITER:=500}"
-#fp16 mlp compute and wan vae
 : "${TRAIN_PRECISION:=bfloat16}"
 : "${VAE_DTYPE:=float16}"
-: "${FP16_COMPUTE_MLP:=1}"
-#packed qkv and gate_up
+: "${FSDP_MASTER_DTYPE:=bfloat16}"
+#Packed QKV And Gate_Up
 : "${PACKED_QKV:=false}"
 : "${PACKED_GATE_UP:=false}"
 #Partial Activation Recomputation
@@ -60,12 +59,12 @@ TAIL_OVERRIDES=(
     "model.config.vlm_config.tokenizer.pretrained_model_name=$TOKENIZER_PATH"
     "model.config.precision=$TRAIN_PRECISION"
     "model.config.tokenizer.dtype=$VAE_DTYPE"
+    "model.config.parallelism.fsdp_master_dtype=$FSDP_MASTER_DTYPE"
     "model.config.compile.enabled=false"
-    "model.config.fp16_compute_mlp=$FP16_COMPUTE_MLP"
     # "+model.config.vlm_config.model_instance.config.packed_qkv=$PACKED_QKV"
     # "+model.config.vlm_config.model_instance.config.packed_gate_up=$PACKED_GATE_UP"
-    "model.config.activation_checkpointing.mode=$ACTIVATION_CHECKPOINTING_MODE"
-    "model.config.activation_checkpointing.save_ops_regex=$ACTIVATION_CHECKPOINTING_SAVE_OPS_REGEX"
+    # "model.config.activation_checkpointing.mode=$ACTIVATION_CHECKPOINTING_MODE"
+    # "model.config.activation_checkpointing.save_ops_regex=$ACTIVATION_CHECKPOINTING_SAVE_OPS_REGEX"
     "trainer.seed=42"
     "trainer.callbacks.device_monitor.every_n=0"
     "trainer.callbacks.ofu.every_n=0"

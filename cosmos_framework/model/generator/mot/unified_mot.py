@@ -4,7 +4,6 @@
 import json
 import time
 from collections.abc import Mapping
-from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -1112,36 +1111,24 @@ def _run_mlp(
     """
     if sample_ids is not None:
         assert sample_ids.shape == (input.shape[0],)
-    # Keep the parameter/gradient boundary in the model dtype. The optional
-    # autocast region is deliberately limited to dense MLPs; attention, MoE
-    # routing, norms, and residual additions remain outside this experiment.
-    use_fp16_compute = bool(getattr(mlp, "_fp16_compute", False)) and input.device.type == "cuda"
-    autocast_context = (
-        torch.autocast(device_type=input.device.type, dtype=torch.float16)
-        if use_fp16_compute
-        else nullcontext()
-    )
-    with autocast_context:
-        if isinstance(mlp, Qwen3VLMoeTextSparseMoeBlock):
-            (
-                output_tensor,
-                lbl_metadata,
-            ) = mlp(
-                input,
-                token_mask=token_mask,
-                sample_ids=sample_ids,
-                num_samples=num_samples,
-            )
-        else:
-            if token_mask is not None:
-                # A dense MLP has no statistics to protect, but zeroing the padding rows still keeps a
-                # non-finite value left there by an upstream masked attention out of its weight
-                # gradients, which the rows would otherwise reach now that they are no longer sliced off.
-                input = torch.where(token_mask.unsqueeze(1), input, input.new_zeros(()))
-            output_tensor = mlp(input)
-            lbl_metadata = None
-    if use_fp16_compute:
-        output_tensor = output_tensor.to(dtype=input.dtype)
+    if isinstance(mlp, Qwen3VLMoeTextSparseMoeBlock):
+        (
+            output_tensor,
+            lbl_metadata,
+        ) = mlp(
+            input,
+            token_mask=token_mask,
+            sample_ids=sample_ids,
+            num_samples=num_samples,
+        )
+    else:
+        if token_mask is not None:
+            # A dense MLP has no statistics to protect, but zeroing the padding rows still keeps a
+            # non-finite value left there by an upstream masked attention out of its weight
+            # gradients, which the rows would otherwise reach now that they are no longer sliced off.
+            input = torch.where(token_mask.unsqueeze(1), input, input.new_zeros(()))
+        output_tensor = mlp(input)
+        lbl_metadata = None
     return output_tensor, lbl_metadata
 
 
