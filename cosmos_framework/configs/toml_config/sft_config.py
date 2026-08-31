@@ -257,6 +257,10 @@ class ModelTokenizerConfig(BaseModel):
             "env interpolation: vae_path = '${oc.env:WAN_VAE_PATH}'."
         ),
     )
+    dtype: str = Field(
+        default="bfloat16",
+        description="Compute/storage dtype for the Wan2.2 VAE, independent of model.precision.",
+    )
 
 
 class BackboneConfig(BaseModel):

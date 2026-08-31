@@ -9,6 +9,7 @@ import json
 import os
 import random
 import tempfile
+import warnings
 from pathlib import Path
 from typing import Any, Optional
 
@@ -36,6 +37,19 @@ from cosmos_framework.utils.lazy_config import instantiate as lazy_instantiate
 _MAX_CAPTION_TOKENS = 1024
 _DURATION_TEMPLATE = "The video is {duration:.1f} seconds long and is of {fps:.0f} FPS."
 _RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolution."
+
+# SFTDataset is intentionally an infinite stream (see ``__iter__`` below), while
+# its finite metadata length is still exposed for loader bookkeeping.  PyTorch's
+# DataLoader warns every time the stream passes that metadata length.  Suppress
+# only this exact, expected warning; unrelated DataLoader warnings remain visible.
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    message=(
+        r"Length of IterableDataset .*SFTDataset object at .* was reported to be "
+        r"\d+\(when accessing len\(dataloader\)\), but \d+ samples have been fetched\."
+    ),
+)
 
 # Caption types available in the SFT JSONL.
 # Format: {model}_{style}
