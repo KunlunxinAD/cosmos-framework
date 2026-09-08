@@ -256,12 +256,13 @@ class PackedSequenceBuilder:
         input_vision_tokens: torch.Tensor,
         condition_frame_indexes_vision: list[int],
         input_timestep: float | torch.Tensor,
-        latent_patch_size: int = 1,
-        vision_fps: float | None = None,
-        enable_fps_modulation: bool = False,
-        base_fps: float = 24.0,
-        temporal_compression_factor: int = 4,
-        vision_temporal_positions: torch.Tensor | None = None,
+        latent_patch_size: int,
+        vision_fps: float | None,
+        enable_fps_modulation: bool,
+        base_fps: float,
+        temporal_compression_factor: int,
+        vision_temporal_positions: torch.Tensor | None,
+        temporal_position_period: int | None,
     ) -> int:
         """Pack vision tokens into the sequence.
 
@@ -274,12 +275,13 @@ class PackedSequenceBuilder:
             latent_patch_size: Patch size for latent patchification.
             vision_fps: Frames per second of the video. Used when enable_fps_modulation=True.
             enable_fps_modulation: If True, scale temporal position IDs based on video FPS.
-            base_fps: Base FPS for normalization (default 24.0).
+            base_fps: Base FPS for normalization.
             temporal_compression_factor: Temporal compression factor defining the mRoPE time
                 unit for the whole stream, i.e. the camera VAE's. Positions advance at
                 ``base_fps / temporal_compression_factor`` units per second.
             vision_temporal_positions: Optional explicit temporal coordinate per latent
                 frame, shape ``(T,)``. Used by UniAE to account for kept boundary latents.
+            temporal_position_period: Optional period for latent-index temporal coordinates.
 
         Returns:
             Vision split length.
@@ -294,8 +296,9 @@ class PackedSequenceBuilder:
             enable_fps_modulation=enable_fps_modulation,
             base_fps=base_fps,
             temporal_compression_factor=temporal_compression_factor,
+            base_temporal_compression_factor=temporal_compression_factor,
             temporal_positions=vision_temporal_positions,
-            actual_temporal_compression_factor=None,
+            temporal_position_period=temporal_position_period,
         )
 
     def pack_lidar_tokens(
@@ -303,19 +306,19 @@ class PackedSequenceBuilder:
         input_lidar_tokens: torch.Tensor,
         condition_frame_indexes_lidar: list[int],
         input_timestep: float | torch.Tensor,
-        latent_patch_size: int = 1,
-        lidar_fps: float | None = None,
-        enable_fps_modulation: bool = False,
-        base_fps: float = 24.0,
-        temporal_compression_factor: int = 4,
-        actual_temporal_compression_factor: int | None = None,
+        latent_patch_size: int,
+        lidar_fps: float,
+        enable_fps_modulation: bool,
+        base_fps: float,
+        temporal_compression_factor: int,
+        base_temporal_compression_factor: int,
     ) -> int:
         """Pack LiDAR range-view tokens into the sequence.
 
         A range clip is a grid latent like a video clip, so it is packed by the same routine;
-        what differs is the clock. ``lidar_fps`` and ``actual_temporal_compression_factor``
+        what differs is the clock. ``fps`` and ``temporal_compression_factor``
         describe how much real time one LiDAR latent frame spans, while
-        ``temporal_compression_factor`` keeps naming the stream's shared mRoPE unit, so a
+        ``base_temporal_compression_factor`` keeps naming the stream's shared mRoPE unit, so a
         10 Hz uncompressed sweep and a 30 Hz 4x-compressed camera frame land on one axis.
 
         Args:
@@ -325,11 +328,11 @@ class PackedSequenceBuilder:
             latent_patch_size: Patch size for latent patchification.
             lidar_fps: Sweep rate of the LiDAR data. Used when enable_fps_modulation=True.
             enable_fps_modulation: If True, scale temporal position IDs based on FPS.
-            base_fps: Base FPS for normalization (default 24.0).
-            temporal_compression_factor: Temporal compression factor defining the mRoPE time
+            base_fps: Base FPS for normalization.
+            temporal_compression_factor: Temporal compression factor of the LiDAR VAE,
+                typically 1.
+            base_temporal_compression_factor: Temporal compression factor defining the mRoPE time
                 unit shared with the vision stream.
-            actual_temporal_compression_factor: Temporal compression factor of the LiDAR VAE,
-                typically 1. Defaults to ``temporal_compression_factor``.
 
         Returns:
             LiDAR split length.
@@ -344,8 +347,9 @@ class PackedSequenceBuilder:
             enable_fps_modulation=enable_fps_modulation,
             base_fps=base_fps,
             temporal_compression_factor=temporal_compression_factor,
+            base_temporal_compression_factor=base_temporal_compression_factor,
             temporal_positions=None,
-            actual_temporal_compression_factor=actual_temporal_compression_factor,
+            temporal_position_period=None,
         )
 
     def _pack_grid_tokens(
@@ -360,8 +364,9 @@ class PackedSequenceBuilder:
         enable_fps_modulation: bool,
         base_fps: float,
         temporal_compression_factor: int,
+        base_temporal_compression_factor: int,
         temporal_positions: torch.Tensor | None,
-        actual_temporal_compression_factor: int | None,
+        temporal_position_period: int | None,
     ) -> int:
         """Pack one ``(C, T, H, W)`` latent clip into ``modality``, frame by frame.
 
@@ -403,17 +408,10 @@ class PackedSequenceBuilder:
         if temporal_positions is not None:
             temporal_positions = temporal_positions.to(device="cpu", dtype=torch.float32)  # [T]
 
-        item_temporal_compression_factor = (
-            temporal_compression_factor
-            if actual_temporal_compression_factor is None
-            else int(actual_temporal_compression_factor)
-        )
         # Real-world seconds between two consecutive latent frames of this item, independent
-        # of enable_fps_modulation (which only gates whether mRoPE positions use it). Falls
-        # back to 1.0 -- an index-derived "instant" -- when the item's fps is unknown, matching
-        # MaskItem's own default so an unknown-fps item behaves like today's single-stream case.
-        item_seconds_per_frame = item_temporal_compression_factor / fps if fps else 1.0
-        modality.seconds_per_frame.append(item_seconds_per_frame)
+        # of enable_fps_modulation (which only gates whether mRoPE positions use it).
+        seconds_per_frame = temporal_compression_factor / fps if fps else 1.0
+        modality.seconds_per_frame.append(seconds_per_frame)
         mrope_ids, self._mrope_temporal_offset = get_3d_mrope_ids_vae_tokens(
             grid_t=latent_t,
             grid_h=patch_h,
@@ -422,10 +420,10 @@ class PackedSequenceBuilder:
             reset_spatial_indices=self._mrope_reset_spatial,
             fps=effective_fps,
             base_fps=base_fps,
-            temporal_compression_factor=item_temporal_compression_factor,
-            base_temporal_compression_factor=temporal_compression_factor,
+            temporal_compression_factor=temporal_compression_factor,
+            base_temporal_compression_factor=base_temporal_compression_factor,
             temporal_positions=temporal_positions,
-            actual_temporal_compression_factor=item_temporal_compression_factor,
+            temporal_position_period=temporal_position_period,
         )  # mrope_ids: [3,N_tokens]
         mrope_ids = mrope_ids.reshape(3, latent_t, frame_token_stride)  # [3,T,H*W]
 
@@ -926,7 +924,45 @@ class PackedSequenceBuilder:
         action_domain_id = None
         if self.action is not None:
             if gen_data_clean.action_domain_id is not None:
-                action_domain_id = gen_data_clean.action_domain_id
+                if len(gen_data_clean.action_domain_id) != len(self.action.token_shapes):
+                    raise ValueError(
+                        "Action-domain metadata must have one entry per packed action item; "
+                        f"got {len(gen_data_clean.action_domain_id)} domain entries for "
+                        f"{len(self.action.token_shapes)} action items."
+                    )
+                action_domain_id = []
+                for item_index, (domain_ids, token_shape) in enumerate(
+                    zip(gen_data_clean.action_domain_id, self.action.token_shapes)
+                ):
+                    flat_domain_ids = domain_ids.reshape(-1)
+                    packed_token_count = int(token_shape[0])
+                    if flat_domain_ids.numel() == 1:
+                        # A scalar domain applies to the whole action item and is
+                        # expanded per token by the network.
+                        action_domain_id.append(flat_domain_ids)
+                        continue
+
+                    if self.null_action_supertokens:
+                        null_token_count = self.num_action_tokens_per_supertoken
+                        expected_real_count = packed_token_count - null_token_count
+                        if null_token_count < 1 or flat_domain_ids.numel() != expected_real_count:
+                            raise ValueError(
+                                f"Framewise action-domain entry {item_index} must cover the real action rows "
+                                "before the temporal-causal null prefix; "
+                                f"got {flat_domain_ids.numel()} IDs, expected {expected_real_count} for "
+                                f"{packed_token_count} packed tokens ({null_token_count} null)."
+                            )
+                        # Null actions use the first forthcoming real action's
+                        # domain, matching autoregressive inference semantics.
+                        null_domain_ids = flat_domain_ids[:1].expand(null_token_count)
+                        action_domain_id.append(torch.cat([null_domain_ids, flat_domain_ids]).contiguous())
+                    else:
+                        if flat_domain_ids.numel() != packed_token_count:
+                            raise ValueError(
+                                f"Framewise action-domain entry {item_index} must have one ID per packed action "
+                                f"token; got {flat_domain_ids.numel()} IDs for {packed_token_count} tokens."
+                            )
+                        action_domain_id.append(flat_domain_ids)
             else:
                 default_action_domain_id = torch.zeros(1, dtype=torch.long)  # [1]
                 action_domain_id = [default_action_domain_id] * len(self.action.token_shapes)

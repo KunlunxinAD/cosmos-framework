@@ -104,8 +104,34 @@ from cosmos_framework.utils.generator.parallelism import ParallelDims
 from cosmos_framework.utils.generator.quantization import swap_modelopt_fp8_linears_on_meta
 
 
+def _all_group_ranks_allow(
+    local_eligible: bool,
+    process_group: torch.distributed.ProcessGroup | None,
+    device: torch.device | str | None,
+) -> bool:
+    """Return whether every rank in ``process_group`` is locally eligible."""
+    if process_group is None:
+        return local_eligible
+    eligible = torch.tensor([local_eligible], device=device, dtype=torch.uint8)
+    torch.distributed.all_reduce(eligible, op=torch.distributed.ReduceOp.MIN, group=process_group)
+    return bool(eligible.item())
+
+
+def _any_dp_shard_rank_needs_guidance_path(
+    local_needs_guidance_path: bool,
+    dp_shard_group: torch.distributed.ProcessGroup | None,
+    device: torch.device | str | None,
+) -> bool:
+    """Enter the guidance path on every FSDP shard rank when any rank needs it."""
+    if dp_shard_group is None:
+        return local_needs_guidance_path
+    needed = torch.tensor([local_needs_guidance_path], device=device, dtype=torch.uint8)
+    torch.distributed.all_reduce(needed, op=torch.distributed.ReduceOp.MAX, group=dp_shard_group)
+    return bool(needed.item())
+
+
 def _uses_lidar_primary_tokenizer(data_batch: dict[str, Any]) -> bool:
-    """Return whether the primary ``video`` stream carries metric LiDAR V1 clips."""
+    """Return whether the primary ``video`` stream carries LiDAR clips (V0 or V1)."""
     value = data_batch.get("vision_tokenizer_type")
     while isinstance(value, (list, tuple)):
         if not value:
@@ -114,6 +140,19 @@ def _uses_lidar_primary_tokenizer(data_batch: dict[str, Any]) -> bool:
     if isinstance(value, bytes):
         value = value.decode("utf-8", errors="replace")
     return value == "lidar"
+
+
+def _vision_condition_masks(packed_sequence: PackedSequence) -> list[torch.Tensor]:
+    """Per-vision-item condition masks, empty when the batch generates no camera stream.
+
+    Packing represents an absent modality as ``None``. The LiDAR-only recipe is the first
+    batch to generate without a camera, so the walks over vision items read their masks
+    here and simply walk nothing, rather than each testing for the absent stream.
+    """
+    if packed_sequence.vision is None:
+        return []
+    assert isinstance(packed_sequence.vision.condition_mask, list), "Vision condition mask must be a list of tensors"
+    return packed_sequence.vision.condition_mask
 
 
 def _densify_action_family(
@@ -279,6 +318,15 @@ class OmniMoTModel(ImaginaireModel):
             assert self.tokenizer_sound_gen.latent_ch == self.config.sound_dim, (
                 f"sound tokenizer latent_ch {self.tokenizer_sound_gen.latent_ch} != sound_dim {self.config.sound_dim}"
             )
+            # The augmentor derives the synchronized sound prefix from config.sound_latent_fps (dataloader
+            # workers never see the tokenizer); pin it to the tokenizer so training and inference agree.
+            assert (
+                self.config.sound_latent_fps * self.tokenizer_sound_gen.temporal_compression_factor
+                == self.tokenizer_sound_gen.sample_rate
+            ), (
+                f"sound_latent_fps {self.config.sound_latent_fps} != sample_rate/hop "
+                f"{self.tokenizer_sound_gen.sample_rate}/{self.tokenizer_sound_gen.temporal_compression_factor}"
+            )
             if hasattr(self.tokenizer_sound_gen, "reset_dtype"):
                 self.tokenizer_sound_gen.reset_dtype()
             log.info(f"Sound tokenizer initialized: {type(self.tokenizer_sound_gen).__name__}")
@@ -357,6 +405,7 @@ class OmniMoTModel(ImaginaireModel):
                 use_multiview_flex_attention=self.config.flex_attention.enabled,
                 flex_attention_backend=self.config.flex_attention.backend,
                 attention_scope=self.config.flex_attention.mask.attention_scope,
+                control_attends_sensor=self.config.flex_attention.mask.control_attends_sensor,
                 decomposed_temporal_window_seconds=self.config.flex_attention.mask.decomposed_temporal_window_seconds,
                 timestep_scale=1.0 / float(num_train_timesteps) * self.config.diffusion_expert_config.timestep_range,
                 action_dim=self.config.max_action_dim,
@@ -789,6 +838,9 @@ class OmniMoTModel(ImaginaireModel):
                 self.tokenizer_lidar_gen.temporal_compression_factor if self.tokenizer_lidar_gen is not None else None
             ),
             vision_temporal_position_mode=self.config.diffusion_expert_config.vision_temporal_position_mode,
+            align_temporal_positions_across_views=(
+                self.config.diffusion_expert_config.align_temporal_positions_across_views
+            ),
             video_temporal_causal=self.config.video_temporal_causal,
             action_dim=self.config.max_action_dim,
             initial_mrope_temporal_offset=initial_mrope_temporal_offset,
@@ -1025,7 +1077,7 @@ class OmniMoTModel(ImaginaireModel):
 
         # image_size[i] may be (1, 4) from IterativeJointDataLoader or (4,) from custom_collate_fn.
         if "image_size" in data_batch:
-            data_resolutions: list[str] | None = []
+            data_resolutions: list[str] | str | None = []
             for i in range(gen_data_clean.batch_size):
                 img_size = data_batch["image_size"][i]
                 if img_size.dim() == 2:
@@ -1033,6 +1085,11 @@ class OmniMoTModel(ImaginaireModel):
                 target_h = int(img_size[0].item())
                 target_w = int(img_size[1].item())
                 data_resolutions.append(get_vision_data_resolution((target_h, target_w)))
+        elif sequence_plans and not any(plan.has_vision for plan in sequence_plans):
+            # A vision-less batch -- the LiDAR-only recipe -- still samples the per-sample vision
+            # timestep, because that is the clock LiDAR borrows. There is no camera frame to
+            # bucket, so the noise-schedule shift comes from the run's configured resolution.
+            data_resolutions = self.config.resolution
         else:
             data_resolutions = None
 
@@ -1047,7 +1104,7 @@ class OmniMoTModel(ImaginaireModel):
         sequence_plans: list[SequencePlan],
         gen_data_clean: GenerationDataClean,
         memory_info: dict,
-        data_resolutions: list[str] | None,
+        data_resolutions: list[str] | str | None,
         vae_pixel_shapes: list[tuple[int, int, int]],
     ) -> dict[str, Any]:
         """Convert typed training inputs into a plain tree for CP broadcast."""
@@ -1426,9 +1483,39 @@ class OmniMoTModel(ImaginaireModel):
         raw_action_dim: list[torch.Tensor] | None = None,
         action_valid_mask: list[torch.Tensor] | None = None,
         normalize_by_active: bool = False,
+        exclude_fully_conditioned_items: bool = False,
         action_slot_stats: ActionSlotLossStats | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Preserve the instance API used by posttrain and interactive subclasses."""
+        """Compute flow matching loss for a modality.
+
+        Args:
+            pred: Predicted velocity field (list of tensors, one per sample).
+            target: Target velocity field (list of tensors, one per sample).
+                Under rectified flow the target is ``v = eps - x0``.
+            condition_mask: Mask where 1 = clean/conditioning, 0 = noisy/generation (list of tensors).
+            timesteps: Diffusion timesteps for time weighting. Shape [B,1] for
+                base/teacher_forcing (all frames share one timestep) or [B,T_max]
+                for diffusion_forcing (per-frame independent timesteps). Time weights
+                are applied per-frame before averaging, so non-uniform weight functions
+                are handled correctly.
+            has_valid_tokens: Whether this modality has valid noisy tokens.
+            rectified_flow: The rectified flow object for time weighting.
+            normalize_by_active: When True, normalize per-instance loss by the count of
+                active (noisy) elements rather than all elements. Preserves the
+                ``sum / active_count`` semantics needed for distillation critics where
+                conditioned frames contribute no signal and should not dilute the
+                denominator.
+            exclude_fully_conditioned_items: When True, omit items with no noisy
+                tokens from the final scalar mean while retaining their per-instance
+                zero entries.
+            action_slot_stats: Optional collector for detached normalized per-sample
+                losses over the canonical unified Action slots.
+
+        Returns:
+            tuple: A tuple containing two elements:
+                - Flow matching loss (or dummy loss for gradient consistency).
+                - Per-instance loss (or dummy loss for gradient consistency).
+        """
         return compute_flow_matching_loss(
             pred=pred,
             target=target,
@@ -1440,6 +1527,7 @@ class OmniMoTModel(ImaginaireModel):
             raw_action_dim=raw_action_dim,
             action_valid_mask=action_valid_mask,
             normalize_by_active=normalize_by_active,
+            exclude_fully_conditioned_items=exclude_fully_conditioned_items,
             action_slot_stats=action_slot_stats,
         )
 
@@ -1543,30 +1631,40 @@ class OmniMoTModel(ImaginaireModel):
         rf_cfg = self.config.rectified_flow_training_config
         normalize_by_active = rf_cfg.normalize_loss_by_active
         if self.config.vision_gen:
-            assert data_batch_packed.vision is not None, "Vision packed data required when vision_gen is True"
-            assert isinstance(data_batch_packed.vision.condition_mask, list), (
-                "Vision condition mask must be a list of tensors for loss computation"
+            # Only a batch that generates no camera stream, as the LiDAR-only recipe does, may
+            # arrive with vision unpacked; for anything else that would silently sink the vision
+            # loss into the dummy loss below.
+            assert data_batch_packed.vision is not None or not gen_data_noised.vt_target_vision, (
+                "Vision packed data required when the batch carries camera items"
             )
             rectified_flow_vision = self.rectified_flow_image if is_image_batch else self.rectified_flow_video
 
+            # With no camera stream there are no noisy vision tokens, so this returns its dummy
+            # loss over the network's zero-weighted vision predictions. That is what keeps
+            # vae2llm and llm2vae in the backward graph on every rank, which FSDP requires.
+            # Transfer teacher forcing flattens clean controls and the generated target into
+            # one vision-item list. Keep the per-item vector aligned for logging, but do not
+            # let zero-loss controls dilute the scalar training objective.
             fm_loss_vision, fm_loss_vision_per_instance = compute_flow_matching_loss(
                 pred=out_net["preds_vision"],
                 target=gen_data_noised.vt_target_vision,
-                condition_mask=data_batch_packed.vision.condition_mask,
+                condition_mask=_vision_condition_masks(data_batch_packed),
                 timesteps=timesteps,
                 has_valid_tokens=has_noisy_tokens(data_batch_packed.vision),
                 rectified_flow=rectified_flow_vision,
                 tensor_kwargs_fp32=self.tensor_kwargs_fp32,
                 normalize_by_active=normalize_by_active,
+                exclude_fully_conditioned_items=getattr(self.config, "causal_training_strategy", None)
+                == "teacher_forcing",
             )
             loss_scale = (
                 rf_cfg.image_loss_scale if is_image_batch and rf_cfg.image_loss_scale is not None else rf_cfg.loss_scale
             )
-            total_loss += fm_loss_vision * loss_scale
-            losses_dict["flow_matching_loss_vision"] = fm_loss_vision
-            losses_dict["flow_matching_loss_vision_per_instance"] = fm_loss_vision_per_instance
+            total_loss += fm_loss_vision * loss_scale  # []
+            losses_dict["flow_matching_loss_vision"] = fm_loss_vision  # []
+            losses_dict["flow_matching_loss_vision_per_instance"] = fm_loss_vision_per_instance  # [N]
         else:
-            losses_dict["flow_matching_loss_vision"] = torch.tensor(0.0, **self.tensor_kwargs_fp32)
+            losses_dict["flow_matching_loss_vision"] = torch.tensor(0.0, **self.tensor_kwargs_fp32)  # []
 
         # Same condition the network builds its LiDAR projections under, so the two cannot
         # disagree about whether this run has a LiDAR stream to supervise.
@@ -1587,15 +1685,27 @@ class OmniMoTModel(ImaginaireModel):
                     normalize_by_active=normalize_by_active,
                 )
                 lidar_loss_scale = rf_cfg.lidar_loss_scale if rf_cfg.lidar_loss_scale is not None else rf_cfg.loss_scale
-                total_loss += fm_loss_lidar * lidar_loss_scale
-                losses_dict["flow_matching_loss_lidar"] = fm_loss_lidar
+                total_loss += fm_loss_lidar * lidar_loss_scale  # []
+                losses_dict["flow_matching_loss_lidar"] = fm_loss_lidar  # []
             else:
                 # No LiDAR data in this batch. Connect the network's dummy preds_lidar to the
                 # loss so lidar2llm / llm2lidar stay in the backward graph, or FSDP's gradient
                 # reduce hangs against the ranks that did draw LiDAR.
-                dummy_loss = 0.0 * sum(p.sum() for p in out_net["preds_lidar"])
-                total_loss += dummy_loss
-                losses_dict["flow_matching_loss_lidar"] = dummy_loss
+                #
+                # _decode_grid_stream returns [probe] for an absent stream -- one tensor that
+                # has already been through both projections -- which is what makes the sum
+                # below a tensor rather than the int that `sum` returns for an empty list.
+                # That int would multiply to a plain float, dropping the projections from the
+                # graph and producing exactly the hang above, so assert the guarantee here
+                # rather than rely on a reader knowing the other file.
+                preds_lidar = out_net["preds_lidar"]
+                assert preds_lidar, (
+                    "preds_lidar must carry the network's zero-weighted probe so lidar2llm / "
+                    "llm2lidar stay in the backward graph on a batch with no LiDAR"
+                )
+                dummy_loss = 0.0 * sum(p.sum() for p in preds_lidar)  # []
+                total_loss += dummy_loss  # []
+                losses_dict["flow_matching_loss_lidar"] = dummy_loss  # []
 
         if self.config.action_gen:
             if data_batch_packed.action is not None:
@@ -1708,16 +1818,25 @@ class OmniMoTModel(ImaginaireModel):
         return total_loss, losses_dict
 
     def _update_train_stats(self, data_batch: dict[str, torch.Tensor]) -> None:
+        if not isinstance(self.net, WeightTrainingStat):
+            return
+
         is_image = self.is_image_batch(data_batch)
-        input_key = self.input_image_key if is_image else self.input_video_key
-        if isinstance(self.net, WeightTrainingStat):
-            val = data_batch[input_key]
+        if self._has_vision_stream(data_batch):
+            input_key = self.input_image_key if is_image else self.input_video_key
+            value = data_batch[input_key]
             # For image editing data_batch[input_key] is a list-of-lists, not a tensor.
-            sample_count = len(val) if isinstance(val, list) else val.shape[0]
-            if is_image:
-                self.net.accum_image_sample_counter += sample_count
-            else:
-                self.net.accum_video_sample_counter += sample_count
+            sample_count = len(value) if isinstance(value, list) else value.shape[0]
+        else:
+            # The LiDAR-only stream still contributes samples on the video clock. Prefer
+            # per-sample item counts after encoding has flattened the LiDAR item list.
+            lidar_counts = data_batch.get("num_lidar_items_per_sample")
+            sample_count = len(lidar_counts) if lidar_counts is not None else len(data_batch["lidar"])
+
+        if is_image:
+            self.net.accum_image_sample_counter += sample_count
+        else:
+            self.net.accum_video_sample_counter += sample_count
 
     def _update_train_stats_from_processed_batch(self, gen_data_clean: GenerationDataClean) -> None:
         """Update rank-zero sample counters from the CP-shared processed payload."""
@@ -1730,7 +1849,7 @@ class OmniMoTModel(ImaginaireModel):
 
     def _load_and_tokenize_text_data(
         self,
-        data_batch: dict[str, torch.Tensor],
+        data_batch: dict[str, Any],
         iteration: int,
     ) -> list[list[int]]:
         """
@@ -1743,6 +1862,11 @@ class OmniMoTModel(ImaginaireModel):
         Returns:
             list[torch.Tensor]: The input text tokens.
         """
+        if "text_token_lengths" in data_batch:
+            raise NotImplementedError(
+                "Per-view text tokenization requires grouped sequence-packing and attention support. "
+                "Disable separate_view_text_tokenization until that follow-up lands."
+            )
         input_text_tokens = data_batch["text_token_ids"]
         if isinstance(input_text_tokens, list):
             # Convert text tokens to list of lists of ints
@@ -1802,11 +1926,20 @@ class OmniMoTModel(ImaginaireModel):
             shift_dict = dict(shift_config)
             if not is_image_batch and "dynamic_shift_base_num_tokens_video" in shift_dict:
                 # Dynamic shift based on token count
-                assert num_tokens is not None and len(num_tokens) == batch_size
+                if num_tokens is None or len(num_tokens) != batch_size:
+                    raise ValueError(
+                        "dynamic_shift_base_num_tokens_video requires one vision token count per sample; "
+                        f"got {0 if num_tokens is None else len(num_tokens)} counts for batch size {batch_size}. "
+                        "A vision-less LiDAR batch cannot use a vision-token-based dynamic shift."
+                    )
                 base_num_tokens = shift_dict["dynamic_shift_base_num_tokens_video"]
                 shifts = torch.sqrt(torch.tensor(num_tokens, dtype=torch.float32) / base_num_tokens)
             elif is_image_batch and "dynamic_shift_base_num_tokens_image" in shift_dict:
-                assert num_tokens is not None and len(num_tokens) == batch_size
+                if num_tokens is None or len(num_tokens) != batch_size:
+                    raise ValueError(
+                        "dynamic_shift_base_num_tokens_image requires one vision token count per sample; "
+                        f"got {0 if num_tokens is None else len(num_tokens)} counts for batch size {batch_size}."
+                    )
                 base_num_tokens = shift_dict["dynamic_shift_base_num_tokens_image"]
                 shifts = torch.sqrt(torch.tensor(num_tokens, dtype=torch.float32) / base_num_tokens)
             else:
@@ -1996,11 +2129,7 @@ class OmniMoTModel(ImaginaireModel):
         context_parallel_broadcast_tensor_list(epsilon_vision, self.parallel_dims)
 
         # Derive noisy mask (1 for noised, 0 for clean) for sigmas computation
-        assert packed_sequence.vision is not None, "Packed vision data required for noise scheduling"
-        assert packed_sequence.vision.condition_mask is not None, "Vision condition mask required for noise scheduling"
-        assert isinstance(packed_sequence.vision.condition_mask, list), (
-            "Vision condition mask must be a list of tensors for noise scheduling"
-        )
+        condition_mask_vision = _vision_condition_masks(packed_sequence)
 
         # Compute sigmas per vision item (supports variable shapes).
         # For image editing, x0_tokens_vision is a flat list with multiple items per sample
@@ -2009,8 +2138,8 @@ class OmniMoTModel(ImaginaireModel):
         # view(-1,1,1)[:T_latent]: for base/TF sigmas[i] is (1,), view gives (1,1,1) and the slice is a no-op;
         # for DF sigmas[i] is (T_max,) — one sigma per video latent frame — view gives (T_max,1,1)
         # and [:T_latent] slices to (T_latent,1,1) matching the per-item latent frame count.
-        num_vision_items = len(packed_sequence.vision.condition_mask)
-        noisy_mask_vision = [1.0 - cond_mask for cond_mask in packed_sequence.vision.condition_mask]
+        num_vision_items = len(condition_mask_vision)
+        noisy_mask_vision = [1.0 - cond_mask for cond_mask in condition_mask_vision]
         sigmas_vision = [
             sigmas[i].view(-1, 1, 1)[: x0_vision[i].shape[2]] * noisy_mask_vision[i] for i in range(num_vision_items)
         ]
@@ -2322,11 +2451,7 @@ class OmniMoTModel(ImaginaireModel):
         )
 
         # 5. Initialize vision noise with conditioning
-        assert packed_sequence.vision is not None, "Packed vision data required for inference noise"
-        assert packed_sequence.vision.condition_mask is not None, "Vision condition mask required for inference noise"
-        assert isinstance(packed_sequence.vision.condition_mask, list), (
-            "Vision condition mask must be a list of tensors for inference noise"
-        )
+        condition_mask_vision = _vision_condition_masks(packed_sequence)
         assert gen_data_clean.x0_tokens_vision is not None, "Vision data required for inference noise"
         n_sample = (
             len(gen_data_clean.x0_tokens_vision)
@@ -2353,7 +2478,7 @@ class OmniMoTModel(ImaginaireModel):
         # get_data_and_condition). The cast to model dtype happens inside velocity_fn.
         noise_vision_list: list[torch.Tensor] = []
         for i, (x0_token, cond_mask) in enumerate(
-            zip(gen_data_clean.x0_tokens_vision, packed_sequence.vision.condition_mask, strict=True)
+            zip(gen_data_clean.x0_tokens_vision, condition_mask_vision, strict=True)
         ):
             pure_noise_i = misc.arch_invariant_rand(
                 tuple(x0_token.shape),
@@ -2580,12 +2705,17 @@ class OmniMoTModel(ImaginaireModel):
         reuse_pack_templates: bool,
         has_velocity_postprocess: bool,
     ) -> bool:
-        """Return whether text K/V can be cached within a single diffusion request."""
+        """Return rank-local eligibility for request-local text K/V reuse.
+
+        The caller must MIN-reduce this result over every participating FSDP
+        and CFG-parallel group before installing the cache.
+        """
         if has_velocity_postprocess or not reuse_pack_templates:
             return False
-        if self.parallel_dims is not None and (
-            self.parallel_dims.cp_enabled or self.parallel_dims.cfgp_enabled or self.parallel_dims.dp_shard_enabled
-        ):
+        # CFG parallelism and FSDP are safe when the caller synchronizes
+        # eligibility: caches stay rank-local. CP changes the attention layout
+        # and remains excluded pending separate validation.
+        if self.parallel_dims is not None and self.parallel_dims.cp_enabled:
             return False
         if self.config.joint_attn_implementation != "two_way":
             return False
@@ -2642,6 +2772,40 @@ class OmniMoTModel(ImaginaireModel):
             self._copy_timestep_to_template(packed_sequence.sound.timesteps, timestep)
 
         return packed_sequence
+
+    @staticmethod
+    def _duplicate_gen_data_clean(gd: GenerationDataClean) -> GenerationDataClean:
+        """Return a GenerationDataClean with every per-sample field duplicated.
+
+        Used by ``use_batched_cfg`` to feed (cond + uncond) through one forward
+        of size 2N instead of two sequential forwards of size N. Field handling
+        is generic (driven by the dataclass fields) so it stays correct if
+        GenerationDataClean gains/loses fields: ``batch_size`` is doubled,
+        scalar flags are copied, per-sample lists are concatenated, and batched
+        tensors are duplicated along dim 0. Tensor/list references are reused
+        (the forward path is read-only on these fields) so this is O(N) with no
+        deep copies.
+        """
+
+        def _dup(value: Any) -> Any:
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                return torch.cat([value, value], dim=0)
+            if isinstance(value, list):
+                return value + value
+            return value
+
+        kwargs: dict[str, Any] = {}
+        for field in dataclasses.fields(gd):
+            val = getattr(gd, field.name)
+            if field.name == "batch_size":
+                kwargs[field.name] = val * 2
+            elif field.name == "is_image_batch":
+                kwargs[field.name] = val
+            else:
+                kwargs[field.name] = _dup(val)
+        return GenerationDataClean(**kwargs)
 
     def _get_velocity(
         self,
@@ -2836,15 +3000,12 @@ class OmniMoTModel(ImaginaireModel):
 
         # --- Apply velocity masks ---
         # Zero out velocity for conditioned parts (they don't change during sampling)
-        assert packed_sequence.vision is not None, "packed_sequence.vision must exist for velocity masking"
-        assert packed_sequence.vision.condition_mask is not None, "Vision condition mask required for masking"
-        assert isinstance(packed_sequence.vision.condition_mask, list), (
-            "Vision condition mask must be a list of tensors for masking"
-        )
         # Compute noisy_mask per sample (supports variable shapes)
-        noisy_mask_vision = [1.0 - cond_mask for cond_mask in packed_sequence.vision.condition_mask]
+        noisy_mask_vision = [1.0 - cond_mask for cond_mask in _vision_condition_masks(packed_sequence)]
 
-        # Apply velocity mask per element - check if each sample has noisy tokens
+        # Apply velocity mask per element - check if each sample has noisy tokens. A batch with
+        # no camera stream has no mask to pair with the network's zero-weighted vision
+        # prediction, so the zip stops immediately and leaves the velocity list empty.
         velocity_vision: list[torch.Tensor] = []
         for i, (pred, noisy_mask) in enumerate(zip(out["preds_vision"], noisy_mask_vision)):
             # pred: [C,T,H,W], noisy_mask: [T,1,1]
@@ -3073,6 +3234,7 @@ class OmniMoTModel(ImaginaireModel):
         sigma_max: float = 80.0,
         skip_text_tokens_for_cfg: bool = False,
         normalize_cfg: bool = False,
+        use_batched_cfg: bool = False,
         upsample_task: str | None = None,
         upsample_max_new_tokens: int = 2048,
         upsample_temperature: float | None = 0.7,
@@ -3115,6 +3277,12 @@ class OmniMoTModel(ImaginaireModel):
             sigma_max (float): Maximum sigma for the EDM sampler.
             skip_text_tokens_for_cfg (bool): If True, skip text tokens in unconditional branch.
             normalize_cfg (bool): If True, normalize the CFG output.
+            use_batched_cfg (bool): If True, run cond + uncond as one batched forward of
+                size 2N (mutually exclusive with cfg-parallel). Opt-in; default False
+                keeps this API conservative for saturated or memory-constrained workloads.
+                ``OmniInference`` explicitly passes the configured
+                ``SetupOverrides.use_batched_cfg`` policy.
+                Reuses a doubled pack template and a shared text K/V cache when eligible.
             upsample_task (str | None): Canonical V4.2 task resolved by the
                 inference caller. ``None`` disables native prompt upsampling.
                 Otherwise, the conditional captions in
@@ -3224,31 +3392,21 @@ class OmniMoTModel(ImaginaireModel):
 
         assert n_sample == len(seed), f"Number of samples {n_sample} must match number of seeds {len(seed)}"
 
-        reuse_pack_templates = self._can_reuse_inference_pack_templates(sequence_plans, gen_data_clean)
-        cond_packed_sequence_template: PackedSequence | None = None
-        uncond_packed_sequence_template: PackedSequence | None = None
-        if reuse_pack_templates:
-            include_end_of_generation_token = self._derive_include_end_of_generation_token()
-            zero_timesteps = torch.zeros((gen_data_clean.batch_size,), dtype=torch.float32)  # [B]
-            cond_packed_sequence_template = self._pack_input_sequence(
-                sequence_plans,
-                cond_tokens,
-                gen_data_clean,
-                zero_timesteps,
-                include_end_of_generation_token=include_end_of_generation_token,
-                skip_text_tokens=False,
-            )
-            cond_packed_sequence_template.to_cuda()
-            if guidance != 1.0 or velocity_postprocess_builder is not None:
-                uncond_packed_sequence_template = self._pack_input_sequence(
-                    sequence_plans,
-                    uncond_tokens,
-                    gen_data_clean,
-                    zero_timesteps,
-                    include_end_of_generation_token=include_end_of_generation_token,
-                    skip_text_tokens=skip_text_tokens_for_cfg,
-                )
-                uncond_packed_sequence_template.to_cuda()
+        # Batched CFG: pre-compute the doubled (cond + uncond) context
+        # once so velocity_fn can run both guidance branches as a single forward
+        # of size 2N instead of two sequential forwards of size N. The forward
+        # path is read-only on these fields, so tensor refs are reused (no copy).
+        if use_batched_cfg:
+            cfgp_on = self.parallel_dims is not None and self.parallel_dims.cfgp_enabled
+            if cfgp_on:
+                log.warning("CFG parallelism takes precedence over batched CFG; disabling batched CFG.")
+                use_batched_cfg = False
+        if use_batched_cfg:
+            sequence_plans_doubled = list(sequence_plans) + list(sequence_plans)
+            gen_data_clean_doubled = self._duplicate_gen_data_clean(gen_data_clean)
+        else:
+            sequence_plans_doubled = None
+            gen_data_clean_doubled = None
 
         # Optional per-step velocity postprocess hook. Built once via a builder
         # that receives the prepared inference state. The returned callable (if
@@ -3268,32 +3426,10 @@ class OmniMoTModel(ImaginaireModel):
                 gen_data_clean=gen_data_clean,
             )
 
-        # Create a velocity function for a single sample (for use with self.sampler).
-        # FSDP collective-sequence alignment (throughput-preset inference).
-        #
-        # In throughput-preset inference each rank holds a different sample,
-        # and different samples can diverge on (a) the CFG decision per
-        # step — ``guidance != 1.0`` (and the optional ``guidance_interval``
-        # gate) determines whether ``velocity_fn`` issues 1 or 2 model
-        # forwards — and (b) ``num_steps``. Either divergence makes the
-        # FSDP allgather sequence misalign across ranks, deadlocking NCCL
-        # at the 30-min watchdog timeout.
-        #
-        # We align in two places:
-        #   1. Inside velocity_fn (per call): all_reduce the local CFG
-        #      decision; if ANY rank needs CFG, every rank does both
-        #      forwards (cond + uncond). Ranks whose local decision was
-        #      "no CFG" return ``cond_v`` directly — bit-identical to the
-        #      original no-CFG path (no guidance blend, no normalize_cfg).
-        #   2. Around the sampler call: all_reduce the local num_steps;
-        #      ranks with local < max issue a dummy sampler call with the
-        #      remaining steps to pad the FSDP allgather stream. The
-        #      dummy call's output is discarded; ``latents`` is never
-        #      re-bound.
-        #
-        # Both collectives are scoped to the FSDP shard group (the only
-        # process group whose collective sequence is at risk), so they're
-        # safe under non-trivial parallel layouts.
+        # In throughput-preset inference, each FSDP rank can hold a different
+        # sample. Resolve the shard group before selecting the fast path so a
+        # rank-local postprocess/packing difference cannot make peers issue a
+        # different number of model forwards and deadlock collectives.
         if (
             self.parallel_dims is not None
             and self.parallel_dims.dp_shard_mesh is not None
@@ -3306,14 +3442,117 @@ class OmniMoTModel(ImaginaireModel):
             _dp_shard_group = None
             _align_device = None
 
+        if (
+            self.parallel_dims is not None
+            and self.parallel_dims.cfgp_enabled
+            and self.parallel_dims.cfgp_mesh is not None
+            and torch.distributed.is_initialized()
+            and self.parallel_dims.cfgp_mesh.size() > 1
+        ):
+            _cfgp_group = self.parallel_dims.cfgp_mesh.get_group()
+            _align_device = self.tensor_kwargs["device"]
+        else:
+            _cfgp_group = None
+
+        # Static eligibility for the fused cond+uncond fast path (velocity_fn also
+        # requires ``_any_needs_guidance_path`` per step). Keep pack / text-KV alloc in
+        # sync with this predicate so we do not build unused 2N resources.
+        batched_cfg_fast_path = _all_group_ranks_allow(
+            use_batched_cfg and velocity_postprocess is None and not skip_text_tokens_for_cfg,
+            _dp_shard_group,
+            _align_device,
+        )
+
+        reuse_pack_templates = self._can_reuse_inference_pack_templates(sequence_plans, gen_data_clean)
+        cond_packed_sequence_template: PackedSequence | None = None
+        uncond_packed_sequence_template: PackedSequence | None = None
+        batched_packed_sequence_template: PackedSequence | None = None
+        if reuse_pack_templates:
+            include_end_of_generation_token = self._derive_include_end_of_generation_token()
+            zero_timesteps = torch.zeros((gen_data_clean.batch_size,), dtype=torch.float32)  # [B]
+            cond_packed_sequence_template = self._pack_input_sequence(
+                sequence_plans,
+                cond_tokens,
+                gen_data_clean,
+                zero_timesteps,
+                include_end_of_generation_token=include_end_of_generation_token,
+                skip_text_tokens=False,
+            )
+            cond_packed_sequence_template.to_cuda()
+            if not batched_cfg_fast_path and (guidance != 1.0 or velocity_postprocess is not None):
+                uncond_packed_sequence_template = self._pack_input_sequence(
+                    sequence_plans,
+                    uncond_tokens,
+                    gen_data_clean,
+                    zero_timesteps,
+                    include_end_of_generation_token=include_end_of_generation_token,
+                    skip_text_tokens=skip_text_tokens_for_cfg,
+                )
+                uncond_packed_sequence_template.to_cuda()
+
+        if (
+            reuse_pack_templates
+            and batched_cfg_fast_path
+            and sequence_plans_doubled is not None
+            and gen_data_clean_doubled is not None
+        ):
+            zero_timesteps_doubled = torch.zeros((gen_data_clean_doubled.batch_size,), dtype=torch.float32)  # [2B]
+            batched_packed_sequence_template = self._pack_input_sequence(
+                sequence_plans_doubled,
+                list(cond_tokens) + list(uncond_tokens),
+                gen_data_clean_doubled,
+                zero_timesteps_doubled,
+                include_end_of_generation_token=include_end_of_generation_token,
+                skip_text_tokens=False,
+            )
+            batched_packed_sequence_template.to_cuda()
+
+        # Create a velocity function for a single sample (for use with self.sampler).
+        # FSDP collective-sequence alignment (throughput-preset inference).
+        #
+        # In throughput-preset inference each rank holds a different sample,
+        # and different samples can diverge on (a) whether text CFG or a
+        # velocity postprocess hook requires a second forward, (b) whether
+        # the fused batched path is locally eligible, and (c) ``num_steps``.
+        # Any divergence makes the FSDP allgather sequence misalign across
+        # ranks, deadlocking NCCL at the 30-min watchdog timeout.
+        #
+        # We align in three places:
+        #   1. Before velocity_fn: MIN-reduce fused-path eligibility so every
+        #      rank agrees on batched versus sequential CFG.
+        #   2. Inside velocity_fn (per call): MAX-reduce whether any rank
+        #      needs CFG/postprocessing; if so, every rank performs the same
+        #      forward sequence. Ranks whose local decision was "no CFG" return
+        #      ``cond_v`` directly — bit-identical to the original no-CFG path.
+        #   3. Around the sampler call: all_reduce the local num_steps;
+        #      ranks with local < max issue a dummy sampler call with the
+        #      remaining steps to pad the FSDP allgather stream. The
+        #      dummy call's output is discarded; ``latents`` is never
+        #      re-bound.
+        #
+        # Guidance-path alignment is scoped to the FSDP shard group (the only
+        # process group whose model-forward sequence is at risk). Text-KV
+        # eligibility must additionally agree across CFG-parallel peers before
+        # either peer installs the request-local attention dispatch.
         reuse_text_kv = self._can_reuse_inference_text_kv(
             sequence_plans,
             gen_data_clean,
             reuse_pack_templates=reuse_pack_templates,
             has_velocity_postprocess=velocity_postprocess is not None,
         )
+        reuse_text_kv = _all_group_ranks_allow(
+            reuse_text_kv,
+            _dp_shard_group,
+            _align_device,
+        )
+        reuse_text_kv = _all_group_ranks_allow(
+            reuse_text_kv,
+            _cfgp_group,
+            _align_device,
+        )
         cond_text_kv_cache: list[UndKVCache] | None = None
         uncond_text_kv_cache: list[UndKVCache] | None = None
+        batched_text_kv_cache: list[UndKVCache] | None = None
         # Request-scoped: install only for this generate call and restore afterward so we
         # never permanently shadow another dispatch_attention_fn on the model.
         previous_attention_dispatch = None
@@ -3326,8 +3565,16 @@ class OmniMoTModel(ImaginaireModel):
                         "(pass net= or ensure self.net is built)."
                     )
                 previous_attention_dispatch = install_inference_memory_attention_dispatch(target_net)
+                # Cond cache covers no-CFG steps. When the fused path is eligible,
+                # CFG steps use ``batched_text_kv_cache`` only — skip allocating the
+                # unused uncond stack. Otherwise keep the sequential cond+uncond pair.
                 cond_text_kv_cache = self._make_inference_text_kv_cache(target_net)
-                if guidance != 1.0 or velocity_postprocess_builder is not None:
+                if batched_cfg_fast_path:
+                    # Shared und K/V for the fused cond+uncond (B=2) pack. Filled on
+                    # the first batched forward; later steps run gen-only with
+                    # per-sample isolation in ``_attention_gen_with_cached_text``.
+                    batched_text_kv_cache = self._make_inference_text_kv_cache(target_net)
+                elif guidance != 1.0 or velocity_postprocess_builder is not None:
                     uncond_text_kv_cache = self._make_inference_text_kv_cache(target_net)
 
             def velocity_fn(noise_x: list[torch.Tensor], timestep: torch.Tensor) -> list[torch.Tensor]:
@@ -3376,19 +3623,60 @@ class OmniMoTModel(ImaginaireModel):
                     t_lo, t_hi = guidance_interval
                     needs_text_cfg = t_lo < timestep[0].item() < t_hi
 
-                # FSDP alignment: if ANY rank in the shard group needs text-CFG
-                # this call, every rank must take the CFG path so the allgather
-                # sequence stays aligned across ranks.
-                if _dp_shard_group is not None:
-                    _cfg_t = torch.tensor([1 if needs_text_cfg else 0], device=_align_device, dtype=torch.int32)
-                    torch.distributed.all_reduce(_cfg_t, op=torch.distributed.ReduceOp.MAX, group=_dp_shard_group)
-                    _any_needs_text_cfg = bool(_cfg_t.item())
-                else:
-                    _any_needs_text_cfg = needs_text_cfg
+                # FSDP alignment: if ANY rank in the shard group needs a second
+                # forward for text CFG or a velocity postprocess hook, every rank
+                # must issue two sequential forwards (or one globally eligible
+                # batched forward) so the allgather sequence stays aligned.
+                needs_guidance_path = needs_text_cfg or velocity_postprocess is not None
+                _any_needs_guidance_path = _any_dp_shard_rank_needs_guidance_path(
+                    needs_guidance_path,
+                    _dp_shard_group,
+                    _align_device,
+                )
 
-                # Fast path: no text-CFG anywhere and no postprocess hook — single forward.
-                if not _any_needs_text_cfg and velocity_postprocess is None:
+                # Fast path: no rank needs CFG or postprocessing — single forward.
+                if not _any_needs_guidance_path:
                     return _single_velocity_fn(cond_tokens, skip_text_tokens=False)
+
+                # Batched-CFG fast path (opt-in): run cond + uncond as one forward of
+                # size 2N instead of two sequential N forwards. Removes the per-step
+                # python orchestration between the two forwards. Only taken when there
+                # is no postprocess hook, text-CFG is needed somewhere in the FSDP
+                # shard group this step, and we are not skipping text tokens for the
+                # uncond branch. cfg-parallel was already ruled out at setup. Falls
+                # through to the standard path otherwise.
+                # Under FSDP, every rank takes this path whenever ``_any_needs_guidance_path``
+                # so the allgather sequence stays aligned (same 1-forward-per-step
+                # count); ranks whose local decision was no-CFG still return cond only.
+                if batched_cfg_fast_path and _any_needs_guidance_path:
+                    assert sequence_plans_doubled is not None and gen_data_clean_doubled is not None
+                    n = len(noise_x)
+                    batched_memory: MemoryState | None = (
+                        InferenceTextKVMemoryState(batched_text_kv_cache) if batched_text_kv_cache is not None else None
+                    )
+                    velocities = self._get_velocity(
+                        net=net,
+                        noise_x=noise_x + noise_x,
+                        timestep=torch.cat([timestep, timestep], dim=0),
+                        text_tokens=list(cond_tokens) + list(uncond_tokens),
+                        sequence_plans=sequence_plans_doubled,
+                        gen_data_clean=gen_data_clean_doubled,
+                        skip_text_tokens=False,
+                        packed_sequence_template=batched_packed_sequence_template,
+                        memory=batched_memory,
+                        has_noisy_actions=has_noisy_actions,
+                    )
+                    cond_v = velocities[:n]
+                    uncond_v = velocities[n:]
+                    if not needs_text_cfg:
+                        return cond_v
+                    v_pred = [u_i + guidance * (c_i - u_i) for c_i, u_i in zip(cond_v, uncond_v)]
+                    if normalize_cfg:
+                        v_pred = [
+                            v_i * (torch.norm(c_i) / (torch.norm(v_i) + 1e-8)).clamp(min=0.0, max=1.0)
+                            for v_i, c_i in zip(v_pred, cond_v)
+                        ]
+                    return v_pred
 
                 # Fast path: only text-CFG and no postprocess — preserve the
                 # cfgp-parallel branch so two-rank CFG parallelism stays available.
@@ -4169,6 +4457,42 @@ class OmniMoTModel(ImaginaireModel):
 
         return x0_tokens_vision
 
+    def _encode_sound_x0_tokens(
+        self,
+        raw_state_sound: list[torch.Tensor],
+        sequence_plans: list[SequencePlan],
+    ) -> list[torch.Tensor]:
+        """Encode sound targets, re-encoding VS2VS prefixes from prefix samples only.
+
+        The non-causal tokenizer would leak future context into conditioned prefix latents, so
+        a contiguous proper prefix is re-encoded alone (matching inference); empty and full
+        prefixes keep the single encode. ``raw_state_sound`` is the dense list from
+        ``_normalize_sound_databatch_inplace``; the strict zip enforces its 1:1 alignment with
+        the ``has_sound`` plans that the packer's ``idx_sound`` counter relies on.
+        """
+        x0_tokens_sound = [
+            self.encode_sound(sound).contiguous().float() for sound in raw_state_sound
+        ]  # list of [sound_channels,T_sound]
+        sound_plans = [plan for plan in sequence_plans if plan.has_sound]
+        compression_factor = int(self.tokenizer_sound_gen.temporal_compression_factor)
+        for sound, x0_sound, plan in zip(raw_state_sound, x0_tokens_sound, sound_plans, strict=True):
+            condition_indexes = plan.condition_frame_indexes_sound
+            num_condition_frames = len(condition_indexes)
+            is_proper_prefix = 0 < num_condition_frames < int(x0_sound.shape[1]) and condition_indexes == list(
+                range(num_condition_frames)
+            )
+            if not is_proper_prefix:
+                continue
+            prefix_num_samples = num_condition_frames * compression_factor
+            prefix_tokens = (
+                self.encode_sound(sound[..., :prefix_num_samples]).contiguous().float()
+            )  # [sound_channels,T_prefix]
+            x0_sound[:, :num_condition_frames].copy_(
+                prefix_tokens[:, :num_condition_frames]
+            )  # [sound_channels,num_condition_frames]
+
+        return x0_tokens_sound
+
     def get_data_and_condition(
         self,
         data_batch: dict[str, torch.Tensor],
@@ -4201,10 +4525,12 @@ class OmniMoTModel(ImaginaireModel):
                 over the whole group: only training, which every rank enters in lockstep,
                 may turn it on.
         """
+        if not self._has_vision_stream(data_batch):
+            return self._get_lidar_only_data_and_condition(data_batch)
+
         # Detect whether any sample has multiple vision items (e.g. image editing).
         # If so, track the count per sample before all vision items from this batch are flattened into a list.
         is_image_batch = self.is_image_batch(data_batch)
-        uses_lidar_primary_tokenizer = _uses_lidar_primary_tokenizer(data_batch)
         sample_vision_list = data_batch[self.input_image_key if is_image_batch else self.input_video_key]
 
         # we should always get this information here during training. If we can read this field
@@ -4229,11 +4555,7 @@ class OmniMoTModel(ImaginaireModel):
             if has_multiple_vision_per_sample:
                 media_key = self.input_video_key if not is_image_batch else self.input_image_key
                 data_batch[media_key] = [item.unsqueeze(0) for sublist in sample_vision_list for item in sublist]
-                if (
-                    data_batch[media_key][0].dtype == torch.float32
-                    and not is_image_batch
-                    and not uses_lidar_primary_tokenizer
-                ):
+                if data_batch[media_key][0].dtype == torch.float32 and not is_image_batch:
                     # For video batch, is_preprocessed = True means the video data is normalized.
                     # For the image batch, is_preprocessed = True means the image data is
                     # normalized and augmented with a temporal dimension.
@@ -4256,8 +4578,7 @@ class OmniMoTModel(ImaginaireModel):
         if num_views_per_vision_item is None:
             # Legacy VFM/image path: normalize the complete input when needed and
             # preserve the existing image batch-dimension handling.
-            if not uses_lidar_primary_tokenizer:
-                self._normalize_video_databatch_inplace(data_batch)
+            self._normalize_video_databatch_inplace(data_batch)
             self._augment_image_dim_inplace(data_batch)  # converts each image tensor to [1,C,1,H,W]
             raw_state_vision = data_batch[media_key]
 
@@ -4307,9 +4628,9 @@ class OmniMoTModel(ImaginaireModel):
 
         output_raw_state_vision = raw_state_vision
         if retain_raw_state_vision and num_views_per_vision_item is not None:
-            # Camera pixels arrive as uint8 levels and need the [-1,1] map. A LiDAR
-            # clip arrives float in the units its own tokenizer normalizes from --
-            # metres for V1 -- so the camera map would misread it as levels.
+            # Camera pixels arrive as uint8 levels and need the [-1,1] map. An item that is
+            # already floating point has been normalized by whoever produced it, and running
+            # the level map over it a second time would misread its units.
             output_raw_state_vision = [
                 state if torch.is_floating_point(state) else self._normalize_uint8_vision_item(state)
                 for state in raw_state_vision
@@ -4323,10 +4644,12 @@ class OmniMoTModel(ImaginaireModel):
         action_valid_mask = data_batch.get("action_valid_mask", None)
 
         # Sound/audio - normalize, encode if present and sound_gen is enabled
-        self._normalize_sound_databatch_inplace(data_batch)
-        raw_state_sound = data_batch.get("sound", None)
+        raw_state_sound = self._normalize_sound_databatch_inplace(data_batch)
         if raw_state_sound is not None and self.tokenizer_sound_gen is not None:
-            x0_tokens_sound = [self.encode_sound(s).contiguous().float() for s in raw_state_sound]
+            # Sound batches always carry plans (``build_sequence_plans_from_data_batch`` asserts it
+            # before every training/inference call), so a missing key fails loudly here rather than
+            # silently skipping the VS2VS prefix re-encode.
+            x0_tokens_sound = self._encode_sound_x0_tokens(raw_state_sound, data_batch["sequence_plan"])
         else:
             x0_tokens_sound = None
 
@@ -4391,6 +4714,50 @@ class OmniMoTModel(ImaginaireModel):
             control_weights=control_weights,
         )
 
+    def _has_vision_stream(self, data_batch: dict[str, Any]) -> bool:
+        """Whether the batch carries a camera stream to tokenize.
+
+        The LiDAR-only AV recipe decodes no camera at all, so it arrives with neither the
+        image nor the video key and its sole generated stream is ``lidar``.
+        """
+        return self.input_image_key in data_batch or self.input_video_key in data_batch
+
+    def _get_lidar_only_data_and_condition(self, data_batch: dict[str, Any]) -> GenerationDataClean:
+        """Build the clean payload for a batch whose only generated stream is LiDAR.
+
+        ``batch_size`` comes from the LiDAR stream because there are no vision items to count.
+        The vision fields are empty rather than absent, and every sample is recorded as owning
+        zero vision items, so the packer, the noise schedule and the loss walk the vision
+        stream the same way they walk any other batch -- over nothing, in this case.
+        """
+        lidar_entries = data_batch.get("lidar")
+        if lidar_entries is None:
+            raise ValueError(
+                "A batch with no vision stream must carry a LiDAR stream: found neither "
+                f"{self.input_video_key!r}/{self.input_image_key!r} nor 'lidar'."
+            )
+        num_lidar_items_per_sample = data_batch.get("num_lidar_items_per_sample", None)
+        batch_size = len(num_lidar_items_per_sample) if num_lidar_items_per_sample is not None else len(lidar_entries)
+
+        raw_state_lidar, x0_tokens_lidar, num_lidar_items = self._encode_lidar_stream(data_batch, batch_size)
+        # The sweep rate is a property of the recording rather than of the clip, so it comes
+        # from the config the way the LiDAR VAE's compression does.
+        fps_lidar = torch.full((batch_size,), float(self.config.lidar_fps), dtype=torch.float32).to(
+            **self.tensor_kwargs
+        )
+        return GenerationDataClean(
+            batch_size=batch_size,
+            is_image_batch=False,
+            raw_state_vision=[],
+            x0_tokens_vision=[],
+            num_vision_items_per_sample=[0] * batch_size,
+            raw_state_lidar=raw_state_lidar,
+            x0_tokens_lidar=x0_tokens_lidar,
+            fps_lidar=fps_lidar,
+            num_lidar_items_per_sample=num_lidar_items,
+            control_weights=data_batch.get("control_weights", None),
+        )
+
     def _encode_lidar_stream(
         self,
         data_batch: dict[str, Any],
@@ -4399,9 +4766,10 @@ class OmniMoTModel(ImaginaireModel):
         """Encode the batch's LiDAR range clips into x0 latent tokens.
 
         ``data_batch["lidar"]`` arrives from the loader as one entry per sample — a list of
-        tokenizer-native range clips — and is flattened here the way the vision key is. V0
-        clips are normalized range plus an empty intensity slot; V1 clips are metric range,
-        unit intensity and validity. The tokenizer owns that layout. The per-sample counts
+        tokenizer-native range clips — and is flattened here the way the vision key is. Both
+        tokenizer versions receive the same layout, metric range with unit intensity and a
+        validity mask, and normalize it inside encode; only the azimuth canvas differs. The
+        tokenizer owns that layout. The per-sample counts
         are written back to the batch, both so a second pass over the same batch sees the
         flat form and so the visualization callbacks can regroup the items once the
         training payload is gone.
@@ -4534,8 +4902,8 @@ class OmniMoTModel(ImaginaireModel):
         )
         return dense_action, dense_domain_id, dense_action_family
 
-    def _normalize_sound_databatch_inplace(self, data_batch: dict[str, torch.Tensor]) -> None:
-        """Flatten and densify nested sound lists in-place.
+    def _normalize_sound_databatch_inplace(self, data_batch: dict[str, torch.Tensor]) -> list[torch.Tensor] | None:
+        """Normalize the plans' sound flags in-place and return the dense sound list.
 
         The joint dataloader produces sound data as
         ``[[tensor], [None], [tensor], ...]`` (each sample wrapped in a single-element
@@ -4546,7 +4914,8 @@ class OmniMoTModel(ImaginaireModel):
            (kept aligned by ``custom_collate_fn`` preserving ``None`` placeholders).
         3. Filters out None entries: ``[t, None, t]`` -> ``[t, t]``
         4. Moves tensors to the model device.
-        5. Sets ``data_batch["sound"]`` to ``None`` if no valid sound data remains.
+        5. Returns the dense list, or ``None`` (also stored in ``data_batch["sound"]``)
+           if no valid sound data remains.
 
         Alignment invariant: ``custom_collate_fn`` keeps the ``"sound"`` key
         as a list with ``None`` placeholders for samples that lack audio (e.g.
@@ -4554,6 +4923,9 @@ class OmniMoTModel(ImaginaireModel):
         1:1 with ``sequence_plan``.  ``SoundSequencePlanBuilder`` already sets
         each plan's ``has_sound`` according to that sample's actual sound
         presence, so clearing flags for ``None`` slots here is just defensive.
+        The per-sample slots stay in ``data_batch["sound"]``: the online sampling
+        callbacks call ``get_data_and_condition`` again on the trainer's batch (and
+        on prefix slices of it), which must see the same alignment.
         """
         raw_state_sound = data_batch.get("sound", None)
         sequence_plans = data_batch.get("sequence_plan", None)
@@ -4625,8 +4997,8 @@ class OmniMoTModel(ImaginaireModel):
         if len(raw_state_sound) == 0:
             _disable_sound_on_plans()
             data_batch["sound"] = None
-        else:
-            data_batch["sound"] = raw_state_sound
+            return None
+        return raw_state_sound
 
     def _augment_image_dim_inplace(self, data_batch: dict[str, torch.Tensor]) -> None:
         """
@@ -4840,6 +5212,16 @@ class OmniMoTModel(ImaginaireModel):
         """
         is_image = self.input_image_key in data_batch
         is_video = self.input_video_key in data_batch
+        if not (is_image or is_video):
+            # The LiDAR-only recipe decodes no camera, so it carries neither key and this is not
+            # an image batch. Require its dedicated stream here so a corrupted camera batch that
+            # lost its media key still fails at the original classification boundary.
+            if "lidar" not in data_batch:
+                raise ValueError(
+                    "A batch must carry exactly one camera stream or the dedicated LiDAR stream; "
+                    f"found neither {self.input_image_key!r}, {self.input_video_key!r}, nor 'lidar'."
+                )
+            return False
         assert is_image != is_video, (
             "Only one of the input_image_key or input_video_key should be present in the data_batch."
         )
@@ -5970,7 +6352,9 @@ class OmniMoTModel(ImaginaireModel):
         """Decode LiDAR latents to range pixels with the LiDAR VAE.
 
         The stream keeps its own VAE's channel count end to end, so a latent arrives here
-        at the width its decoder expects.
+        at the width its decoder expects. Both tokenizer versions return metric range,
+        unit intensity, and a resolved mask, so the visualizers downstream never branch
+        on which one is configured.
         """
         return self._require_lidar_tokenizer().decode(latent)
 
