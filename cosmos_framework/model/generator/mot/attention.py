@@ -228,7 +228,13 @@ def two_way_attention(
     # we definitely don't want to complicate the sequence_packing code so that it performs a
     # static check when creating the packed sequence and metadata. Instead, compare
     # offsets by value because Q/K packs may hold distinct tensor objects.
-    use_dont_care_mask = torch.equal(causal_q_offsets, causal_k_offsets)
+    # ``is`` first: both offsets are read straight off the pack's precomputed fields, so when q
+    # and k come from the same pack they are the very same tensor and no comparison is needed.
+    # That matters because ``torch.equal`` returns a Python bool -- it launches a kernel AND
+    # blocks the host on it, once per attention module (72x per micro-step in the DROID recipe),
+    # for a value that is constant for the whole step. The value compare stays as the fallback
+    # for the distinct-object case the note above describes.
+    use_dont_care_mask = causal_q_offsets is causal_k_offsets or torch.equal(causal_q_offsets, causal_k_offsets)
 
     sample_offsets = packed_query_states["sample_offsets"]
     use_varlen = _use_varlen(sample_offsets)

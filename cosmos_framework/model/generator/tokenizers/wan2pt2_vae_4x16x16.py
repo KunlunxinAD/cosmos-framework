@@ -72,6 +72,51 @@ def _update_cache_and_apply(
     return x
 
 
+# Minimum innermost-row size (bytes) for CausalConv3d's single-pass padding path.
+# The fused path writes the feature cache into a strided slice of the padded buffer, so
+# its efficiency is set by the length of the innermost contiguous run (W * itemsize), not
+# by the tensor's size. Measured(fp16, cache_t=2, ~19 MB each so size is held constant): 
+# W=46 +66%, W=92 +59%, W=184 -20%, W=368 -65% against cat-then-pad -- and at W=46 the fused 
+# path stays slower all the way up to 115 MB, confirming the row length is what matters. 
+# 320 B sits between the W=92 loss and the W=184 win, so the two outermost encoder 
+# stages (W=368, 184 at 480p) take it and the downsampled tail does not.
+_FUSED_PAD_MIN_ROW_BYTES = 320
+
+# ``F.normalize(x, dim)`` is ``x / x.norm(2, dim, keepdim=True).clamp_min(eps).expand_as(x)``, and
+# RMS_norm then multiplies the result by a python float and by ``gamma`` -- three full-volume passes
+# over the largest tensors in a training step, one of which is a divide.
+#
+# A divide is not priced like a multiply here. On the outermost encoder stage's
+# [2, 160, 24, 272, 368] fp16 tensor (1.47 GB), per wan2pt2_vae_norm_bench:
+#
+#     x / denom.expand_as(x)   9.62 ms      <- what F.normalize does
+#     x / denom  (broadcast)  16.35 ms
+#     x * inv    (broadcast)   1.93 ms      <- 5.0x the expanded divide
+#     x * scalar               1.71 ms
+#     x.norm(2, 1, keepdim)    0.88 ms
+#
+# The broadcast multiply lands within 12% of a scalar multiply, so carrying a ``[.., 1, ..]`` operand
+# costs almost nothing; the divide is the whole story.
+#
+# So keep the reciprocal on the norm, which has one channel instead of ``dim`` of them, and fold the
+# constant ``self.scale`` into it there. The full-volume tensor then sees two multiplies where it saw
+# a divide plus two multiplies: 2.59x on the whole expression, -659 ms on the profiled step chain. 
+# Same math in a different association order, so the latents move by fp16 rounding only -- 1.7e-3 
+# relative L2 through a whole Encoder3d forward, and neither arm is closer to a float64 reference than 
+# the other (5.27e-4 against 5.66e-4). ``COSMOS_FUSED_VAE_NORM=0`` restores the F.normalize expression 
+# -- that is the baseline arm of a numerical A/B.
+_NORMALIZE_EPS = 1e-12  # torch.nn.functional.normalize's default
+_FUSED_VAE_NORM: bool | None = None
+
+
+def _fused_vae_norm_enabled() -> bool:
+    """Whether :class:`RMS_norm` takes the reciprocal-multiply path. Read once per process."""
+    global _FUSED_VAE_NORM
+    if _FUSED_VAE_NORM is None:
+        _FUSED_VAE_NORM = os.environ.get("COSMOS_FUSED_VAE_NORM", "0").strip().lower() not in {"0", "false", "no"}
+    return _FUSED_VAE_NORM
+
+
 class CausalConv3d(nn.Conv3d):
     """
     Causal 3d convolution.
@@ -93,8 +138,43 @@ class CausalConv3d(nn.Conv3d):
         padding = list(self._padding)
         if cache_x is not None and self._padding[4] > 0:
             cache_x = cache_x.to(x.device)
+            cache_t = cache_x.shape[2]
+            front = self._padding[4] - cache_t  # zero frames left in front of the cache
+            # ``cat`` then ``pad`` walks the whole [cache, x] volume twice: once to
+            # materialize the concatenation and once to read it back into the padded
+            # buffer. Padding x with its FULL temporal front instead leaves exactly a
+            # zero region where the cache belongs, so writing the cache into that slice
+            # gets the same tensor from one pass over x plus one over the cache -- and
+            # the cache is 1-2 frames against x's chunk, so it is nearly free. This is
+            # the single largest copy site in a training step (~700 copies, ~58G
+            # elements per step on the DROID recipe).
+            #
+            # ``front < 0`` means the cache is longer than the temporal pad, which the
+            # original expresses as a negative F.pad that crops into the cache; keep the
+            # old path for that, and for autograd, where writing into the padded buffer
+            # in place would record a mutation the two-copy version never had.
+            fast = (
+                front >= 0
+                and x.shape[-1] * x.element_size() >= _FUSED_PAD_MIN_ROW_BYTES
+                and not (torch.is_grad_enabled() and (x.requires_grad or cache_x.requires_grad))
+            )
+            if fast and os.environ.get("COSMOS_FUSED_CAUSAL_CONV_PAD", "0").strip().lower() not in {
+                "0",
+                "false",
+                "no",
+            }:
+                x = F.pad(x, padding)  # [B,C,T_padded,H_padded,W_padded], zeros in front
+                h_off, w_off = padding[2], padding[0]
+                x[
+                    :,
+                    :,
+                    front : front + cache_t,
+                    h_off : h_off + cache_x.shape[3],
+                    w_off : w_off + cache_x.shape[4],
+                ] = cache_x
+                return super().forward(x)  # [B,out_C,T_out,H_out,W_out]
             x = torch.cat([cache_x, x], dim=2)  # [B,C,T+cache_T,H,W]
-            padding[4] -= cache_x.shape[2]
+            padding[4] -= cache_t
         x = F.pad(x, padding)  # [B,C,T_padded,H_padded,W_padded]
 
         return super().forward(x)  # [B,out_C,T_out,H_out,W_out]
@@ -112,7 +192,11 @@ class RMS_norm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
 
     def forward(self, x):
-        return F.normalize(x, dim=(1 if self.channel_first else -1)) * self.scale * self.gamma + self.bias
+        dim = 1 if self.channel_first else -1
+        if _fused_vae_norm_enabled():
+            inv = self.scale / x.norm(2, dim, keepdim=True).clamp_min(_NORMALIZE_EPS)
+            return x * inv * self.gamma + self.bias
+        return F.normalize(x, dim=dim) * self.scale * self.gamma + self.bias
 
 
 class Upsample(nn.Upsample):

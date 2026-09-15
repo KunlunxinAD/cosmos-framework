@@ -52,6 +52,8 @@ from cosmos_framework.model.generator.reasoner.qwen3_vl.utils import (
 from cosmos_framework.model.generator.reasoner.qwen3_vl.utils import (
     get_rope_index as _get_rope_index,
 )
+from cosmos_framework.model.generator.utils.fused_rope import maybe_fused_rope
+from cosmos_framework.model.generator.utils.fused_rms_norm import maybe_fused_rms_norm
 from cosmos_framework.utils.generator.quantization import _ModelOptFloat8Linear
 
 from .configuration_qwen3_vl import Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig
@@ -387,6 +389,11 @@ class Qwen3VLTextRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # One fused kernel where the backend has one (6x on P800, and closer to a
+        # float64 reference than the eager path below); ``None`` means fall through.
+        fused = maybe_fused_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+        if fused is not None:
+            return fused
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -417,6 +424,14 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
+    # One kernel per tensor where the backend has one; ``None`` covers both "no
+    # fused kernel here" and the unpacked 4-D layout, which stays on the eager
+    # path below. Only the packed (T, H, D) case with 2-D per-token cos/sin --
+    # what the MoT attention passes -- is eligible.
+    if unsqueeze_dim == 1:
+        fused = maybe_fused_rope(q, k, cos, sin)
+        if fused is not None:
+            return fused
     cos = cos.unsqueeze(unsqueeze_dim)  # [B,1,N,head_dim]
     sin = sin.unsqueeze(unsqueeze_dim)  # [B,1,N,head_dim]
     q_embed = (q * cos) + (rotate_half(q) * sin)  # [B,num_heads,N,head_dim]
