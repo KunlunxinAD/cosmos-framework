@@ -628,6 +628,7 @@ class BaseActionLeRobotDataset(Dataset):
                 root=root,
                 delta_timestamps=self._delta_timestamps,
                 tolerance_s=self._tolerance_s,
+                video_backend=getattr(self, "_video_backend", None),
                 dataset_label=label,
                 prefetched_meta=meta,
             )

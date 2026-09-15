@@ -104,6 +104,7 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
         # would shift every later argument for positional callers.
         apply_forward_clamp: bool = False,
         jitter_after_compose: bool = False,
+        video_backend: str | None = "pyav",
     ) -> None:
         """ """
         super().__init__(
@@ -187,6 +188,7 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
 
         self._image_augmentor: T.Compose | None = None
         self._color_augmentor: T.ColorJitter | None = None
+        self._video_backend = video_backend
 
         # Eager source registration. i4 defers this to its own dataloader's
         # ActionUnifiedIterableDataset.assign_worker(); cosmos-framework instead
