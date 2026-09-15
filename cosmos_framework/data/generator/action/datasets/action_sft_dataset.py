@@ -119,6 +119,7 @@ def get_action_droid_sft_dataset(
     iterable_shuffle: bool = False,
     episode_shuffle_seed: int = 42,
     use_success_only: bool = True,
+    video_backend: str | None = "pyav",
 ) -> Dataset:
     """Build the DROID action SFT dataset: ``action_space='joint_pos'`` (8D) +
     ``use_state`` (raw/un-normalized), concat_view, chunk_length 32.
@@ -138,6 +139,7 @@ def get_action_droid_sft_dataset(
         use_filter_dict=use_filter_dict,
         filter_dict_path=filter_dict_path,
         use_success_only=use_success_only,
+        video_backend=video_backend,
     )
     dataset: Dataset = DROIDLeRobotDataset(root=root, **shard_kwargs)
     transform = ActionTransformPipeline(
