@@ -81,6 +81,7 @@ class Cosmos3VFMNetworkConfig(PretrainedConfig):
         temporal_compression_factor_sound=1,
         sound_latent_fps: int = 25,
         enable_input_bias: bool = True,
+        control_attends_sensor: bool = False,
         **kwargs,
     ):
         self.vision_gen = vision_gen
@@ -113,6 +114,7 @@ class Cosmos3VFMNetworkConfig(PretrainedConfig):
         self.use_multiview_flex_attention = use_multiview_flex_attention
         self.flex_attention_backend = flex_attention_backend
         self.attention_scope: AttentionScope = attention_scope
+        self.control_attends_sensor: bool = control_attends_sensor
         self.decomposed_temporal_window_seconds = decomposed_temporal_window_seconds
         self.temporal_compression_factor_vision = temporal_compression_factor_vision
         self.natten_parameter_list = natten_parameter_list
@@ -537,7 +539,8 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         Args:
             tokens_action: List of action tensors, each [T_i, action_dim] (T_i may vary).
             token_shapes_action: List of (T_i,) tuples per sample.
-            domain_id_action: List of domain ID tensors, each of shape [1].
+            domain_id_action: List of scalar domain IDs or framewise tensors
+                with shape [T_i].
 
         Returns:
             Tuple of (packed_tokens, per_token_domain_id):
@@ -549,8 +552,28 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         for tokens, shape, d_id in zip(tokens_action, token_shapes_action, domain_id_action):
             T = shape[0]
             packed.append(tokens[:T])
-            domain_ids.append(d_id.expand(T))
+            domain_ids.append(self._select_action_domain_ids(d_id, token_count=T))
         return torch.cat(packed, dim=0), torch.cat(domain_ids, dim=0)
+
+    @staticmethod
+    def _select_action_domain_ids(
+        domain_id: torch.Tensor,
+        *,
+        token_count: int,
+        token_indexes: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Expand a scalar domain or select aligned IDs from framewise metadata."""
+        flat_domain_id = domain_id.reshape(-1)
+        if flat_domain_id.numel() not in (1, token_count):
+            raise ValueError(
+                "Action-domain metadata must be scalar or have one ID per action token; "
+                f"got {flat_domain_id.numel()} IDs for {token_count} tokens."
+            )
+        if token_indexes is None:
+            return flat_domain_id.expand(token_count)
+        if flat_domain_id.numel() == 1:
+            return flat_domain_id.expand(token_indexes.numel())
+        return flat_domain_id.index_select(0, token_indexes.to(device=flat_domain_id.device))
 
     def unpack_action(
         self,
@@ -992,10 +1015,22 @@ class Cosmos3VFMNetwork(PreTrainedModel):
 
             action_hidden_states = last_hidden_state[action.mse_loss_indexes]  # [total_noisy_action_tokens,hidden_size]
 
-            # Build per-token domain IDs for the noisy tokens (same expansion logic as pack_action)
+            # Build per-token domain IDs for the noisy tokens. Scalar metadata
+            # expands across the sample; framewise metadata follows the same
+            # noisy-token indexes used to gather the hidden states.
             domain_ids: list[torch.Tensor] = []
-            for nfi, d_id in zip(action.noisy_frame_indexes, action.domain_id):
-                domain_ids.append(d_id.expand(len(nfi)))
+            for nfi, d_id, token_shape in zip(
+                action.noisy_frame_indexes,
+                action.domain_id,
+                action.token_shapes,
+            ):
+                domain_ids.append(
+                    self._select_action_domain_ids(
+                        d_id,
+                        token_count=token_shape[0],
+                        token_indexes=nfi,
+                    )
+                )
             per_token_domain_id = torch.cat(domain_ids, dim=0)
 
             preds_action = self.llm2action(
@@ -1233,7 +1268,7 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             is_image_batch=packed_seq.is_image_batch,
             head_dim=self.head_dim,
             num_layers=self.num_hidden_layers,
-            token_shapes=packed_seq.vision.token_shapes,
+            token_shapes=packed_seq.vision.token_shapes if packed_seq.vision is not None else None,
             natten_parameter_list=self.natten_parameter_list,
             cp_world_size=sequence_shard_world_size,
             video_temporal_causal=use_video_temporal_causal,
@@ -1282,6 +1317,7 @@ class Cosmos3VFMNetwork(PreTrainedModel):
                 num_und=causal_seq.shape[0],
                 causal_offsets=causal_offsets,
                 attention_scope=self.config.attention_scope,
+                control_attends_sensor=self.config.control_attends_sensor,
                 decomposed_temporal_window_seconds=self.config.decomposed_temporal_window_seconds,
             )
             # Carried with the mask because its kernels are only valid for the block size the
