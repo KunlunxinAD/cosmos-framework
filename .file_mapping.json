@@ -1,7 +1,7 @@
 {
-  "_source_commit": "aa88627921856c9c83ab8edf42c46e506255d3a6-dirty",
-  "_dest_commit": "fcd1d7eb07ad76dd7f15c61185a2377f15918ac7",
-  "_generated_at": "2026-09-07T05:52:05Z",
+  "_source_commit": "3a3e1e118760abbc484d59807b797157c394635e-dirty",
+  "_dest_commit": "2b6c9a7061ae78dc83e29a4910ec5f8c9fe4b6ce",
+  "_generated_at": "2026-09-14T05:52:22Z",
   "files": {
     "imaginaire/__init__.py": "cosmos_framework/__init__.py",
     "imaginaire/attention/__init__.py": "cosmos_framework/model/attention/__init__.py",
@@ -377,6 +377,7 @@
     "projects/cosmos3/cosmos3/models/mot/modeling_utils.py": "cosmos_framework/model/generator/mot/modeling_utils.py",
     "projects/cosmos3/cosmos3/models/mot/modeling_utils_test.py": "cosmos_framework/model/generator/mot/modeling_utils_test.py",
     "projects/cosmos3/cosmos3/models/mot/parallelize_unified_mot.py": "cosmos_framework/model/generator/mot/parallelize_unified_mot.py",
+    "projects/cosmos3/cosmos3/models/mot/parallelize_unified_mot_test.py": "cosmos_framework/model/generator/mot/parallelize_unified_mot_test.py",
     "projects/cosmos3/cosmos3/models/mot/parallelize_vfm_network.py": "cosmos_framework/model/generator/mot/parallelize_vfm_network.py",
     "projects/cosmos3/cosmos3/models/mot/und_k_norm_example_test.py": "cosmos_framework/model/generator/mot/und_k_norm_example_test.py",
     "projects/cosmos3/cosmos3/models/mot/unified_mot.py": "cosmos_framework/model/generator/mot/unified_mot.py",
@@ -538,6 +539,7 @@
     "projects/cosmos3/interactive/models/mot/post_saturation/static_compile.py": "cosmos_framework/model/generator/mot/post_saturation/static_compile.py",
     "projects/cosmos3/interactive/models/mot/replicated_io.py": "cosmos_framework/model/generator/mot/replicated_io.py",
     "projects/cosmos3/interactive/models/mot/three_way_attention_test.py": "cosmos_framework/model/generator/mot/three_way_attention_test.py",
+    "projects/cosmos3/interactive/models/multiview_transfer_ar.py": "cosmos_framework/model/generator/multiview_transfer_ar.py",
     "projects/cosmos3/interactive/models/omni_mot_causal_model.py": "cosmos_framework/model/generator/omni_mot_causal_model.py",
     "projects/cosmos3/interactive/models/omni_mot_causal_model_test.py": "cosmos_framework/model/generator/omni_mot_causal_model_test.py",
     "projects/cosmos3/interactive/models/teacher_forcing.py": "cosmos_framework/model/generator/teacher_forcing.py",

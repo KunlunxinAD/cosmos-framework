@@ -20,9 +20,10 @@ from cosmos_framework.configs.base.defaults.flex_attention import (
 from cosmos_framework.model.generator.mot import flex_attention as flex_attention_module
 from cosmos_framework.model.generator.mot.attention import build_packed_sequence
 from cosmos_framework.model.generator.mot.flex_attention import (
+    CaptionMaskItem,
     FlexBackend,
     FlexMetadata,
-    MaskItem,
+    SensorMaskItem,
     _build_stream_sample_ids,
     _from_flex_layout,
     _get_triton_flex_backend,
@@ -78,6 +79,29 @@ def test_control_attends_sensor_defaults_off() -> None:
     assert not FlexAttentionMaskConfig().control_attends_sensor
 
 
+# The mask builders take no defaults: every knob changes what a token may attend, so the library
+# makes a caller state all of them (see FlexMetadata). Tests state only the knob under test and
+# take these neutral values for the rest, which keeps each case about the one thing it varies.
+_NEUTRAL_MASK_ARGS: dict = dict(
+    num_und=0,
+    causal_offsets=None,
+    attention_scope="all_views",
+    decomposed_temporal_window_seconds=None,
+    control_attends_sensor=False,
+    caption_mask_items=None,
+)
+
+
+def _build_metadata(**overrides) -> FlexMetadata:
+    """:func:`build_multiview_flex_metadata` with neutral values for un-varied knobs."""
+    return build_multiview_flex_metadata(**{**_NEUTRAL_MASK_ARGS, **overrides})
+
+
+def _build_block_mask(**overrides) -> BlockMask:
+    """:func:`build_multiview_block_mask` with neutral values for un-varied knobs."""
+    return build_multiview_block_mask(**{**_NEUTRAL_MASK_ARGS, **overrides})
+
+
 def _metadata_from_tokens(
     tokens: list[dict],
     seq_len: int | None = None,
@@ -86,18 +110,28 @@ def _metadata_from_tokens(
     attention_scope: str = "all_views",
     decomposed_temporal_window_seconds: float | None = None,
     control_attends_sensor: bool = False,
+    und_caption_views: list[int] | None = None,
 ) -> FlexMetadata:
     """Build a :class:`FlexMetadata` from an explicit list of GEN token descriptors.
 
     Each token dict has ``s`` (sample), ``t`` (frame), ``v`` (view), ``noisy`` (bool),
     and optionally ``control`` (bool, defaults ``False``) marking a control (e.g. WSM)
     token and ``ts`` (float, defaults to ``t``) marking its real capture time. Positions
-    beyond ``len(tokens)`` are padding and get the ``-1`` / ``-1.0`` / ``False`` sentinels.
+    beyond ``len(tokens)`` are padding and get the ``-1`` / ``-1.0`` / ``False`` sentinels --
+    except ``sample_id``, where padding takes the first id past the real samples, as
+    :func:`_build_stream_sample_ids` does, so padding forms its own pseudo-sample.
 
     ``und_samples`` prepends the UND half of the fused key stream: one sample id per
-    UND token, ``-1`` for UND padding. That id is the only field the gen->und rule
+    UND token, and that same pseudo-sample id for UND padding. That id is the only field the
+    gen->und rule
     reads, so the multiview fields are sentinels there. Left ``None``, the metadata is
     GEN-only and the mask it drives is square.
+
+    ``und_caption_views`` gives the per-view caption layout: one caption view id per UND
+    token, ``-1`` for a sample-level caption and for UND padding. Left ``None``, every UND
+    token is a sample-level caption, which is the layout without per-view captions. A GEN
+    token opts into reading every caption of its sample -- what a LiDAR sweep does -- with
+    ``every_caption`` in its descriptor.
 
     ``attention_scope`` is typed loosely here so the case below that hands it an
     unrecognised scope can reach the metadata's own check.
@@ -126,13 +160,27 @@ def _metadata_from_tokens(
         dtype=torch.float32,
         device=device,
     )
+    if und_caption_views is None:
+        und_caption_views = [-1] * num_und
+    assert len(und_caption_views) == num_und
+    reads_every_caption = torch.tensor(
+        [False] * num_und + [tok.get("every_caption", False) for tok in tokens] + [False] * pad,
+        dtype=torch.bool,
+        device=device,
+    )  # [num_und+seq_len]
     return FlexMetadata(
         seq_len=num_und + seq_len,
         sample_id=torch.tensor(
-            und_samples + [tok["s"] for tok in tokens] + [-1] * pad, dtype=torch.long, device=device
+            und_samples + [tok["s"] for tok in tokens] + [max((tok["s"] for tok in tokens), default=-1) + 1] * pad,
+            dtype=torch.long,
+            device=device,
         ),
         frame_id=col("t"),
-        view_id=col("v"),
+        # The UND half of view_id names the view each caption describes; the GEN half names
+        # the view each token belongs to. See FlexMetadata.
+        view_id=torch.tensor(
+            und_caption_views + [tok["v"] for tok in tokens] + [-1] * pad, dtype=torch.long, device=device
+        ),
         is_noisy=is_noisy,
         is_control=is_control,
         timestamp=timestamp,
@@ -140,18 +188,22 @@ def _metadata_from_tokens(
         attention_scope=cast(AttentionScope, attention_scope),
         control_attends_sensor=control_attends_sensor,
         decomposed_temporal_window_seconds=decomposed_temporal_window_seconds,
+        reads_every_caption=reads_every_caption,
     )
 
 
 def _und_samples(*sample_lens: int, length: int) -> list[int]:
-    """One padded UND prefix: ``sample_lens[i]`` tokens of sample ``i``, then ``-1`` padding.
+    """One padded UND prefix: ``sample_lens[i]`` tokens of sample ``i``, then padding.
+
+    Padding takes the first id past the real samples, matching :func:`_build_stream_sample_ids`,
+    so UND padding and GEN padding share one pseudo-sample and reach each other.
 
     ``length`` is the key block the prefix answers to, so that the UND/GEN boundary lands on a
     block boundary of whichever backend runs the mask.
     """
     ids = [sample for sample, count in enumerate(sample_lens) for _ in range(count)]
     assert len(ids) <= length
-    return ids + [-1] * (length - len(ids))
+    return ids + [len(sample_lens)] * (length - len(ids))
 
 
 def _make_multiview_tokens() -> list[dict]:
@@ -206,7 +258,8 @@ def _reference_visibility(
     """Ground-truth ``[seq_len, num_und + seq_len]`` bool ``M[q, k] = q attends to k``.
 
     Encodes exactly the documented multiview rules; padding positions (index >=
-    len(tokens)) share the ``-1`` sample so they only attend to each other. With
+    len(tokens)) share one pseudo-sample id past the real ones so they only attend to each
+    other. With
     ``und_samples`` the matrix gains the gen->und columns on the left, where the rule is
     "same sample" alone, and is rectangular as the fused mask is.
 
@@ -224,11 +277,15 @@ def _reference_visibility(
     """
     und_samples = list(und_samples or [])
     num_und = len(und_samples)
+    # Padding takes the first id past the real samples, as _build_stream_sample_ids does, so
+    # padded queries and keys share a pseudo-sample and reach only each other. The UND ids handed
+    # in come from the same rule, which is what lets padding match across the two streams.
+    pad_sample = max((token["s"] for token in tokens), default=-1) + 1
 
     def desc(i: int) -> dict:
         if i < len(tokens):
             return tokens[i]
-        return dict(s=-1, t=-1, v=-1, ts=-1.0, noisy=False, control=False)
+        return dict(s=pad_sample, t=-1, v=-1, ts=-1.0, noisy=False, control=False)
 
     def in_scope(dq: dict, dk: dict) -> bool:
         if attention_scope == "all_views":
@@ -566,9 +623,10 @@ def test_build_block_mask_rejects_unaligned_seq_len(backend: FlexBackend) -> Non
 
 @pytest.mark.L0
 def test_build_stream_sample_ids_marks_padding() -> None:
+    """Padding lands on an id no real sample holds, so it forms its own pseudo-sample."""
     offsets = torch.tensor([0, 3, 7], dtype=torch.long)
     sample_id = _build_stream_sample_ids(offsets, seq_len=10, device=torch.device("cpu"))
-    expected = torch.tensor([0, 0, 0, 1, 1, 1, 1, -1, -1, -1], dtype=torch.long)
+    expected = torch.tensor([0, 0, 0, 1, 1, 1, 1, 2, 2, 2], dtype=torch.long)
     assert torch.equal(sample_id, expected)
 
 
@@ -885,7 +943,9 @@ def test_multiview_mask_mod_padding_isolated() -> None:
 # right half, and the left half is the gen->und pass, where the only rule is "same
 # sample". The three UND tokens of sample 0, two of sample 1 and one padding row below
 # are the miniature of what the packer's padded causal stream holds.
-_UND_SAMPLES = [0, 0, 0, 1, 1, -1]
+# Two real samples, so the trailing UND padding takes id 2 -- the same pseudo-sample the GEN
+# padding gets, which is what keeps a padded query's softmax non-empty.
+_UND_SAMPLES = [0, 0, 0, 1, 1, 2]
 
 
 @pytest.mark.L0
@@ -921,6 +981,121 @@ def test_fused_mask_mod_gives_every_gen_token_the_und_stream_of_its_own_sample()
     # Padded GEN queries keep the UND padding to attend to, so their softmax is non-empty.
     assert m[len(tokens) :, 5].all()
     assert not m[len(tokens) :, :5].any()
+
+
+# One sample, two cameras (views 0 and 1) and a LiDAR sweep on view 2, against a UND stream
+# holding one caption per camera: tokens 0-1 describe view 0, tokens 2-3 describe view 1, and
+# token 4 is UND padding.
+_PER_VIEW_CAPTION_UND = [0, 0, 1, 1, -1]
+_PER_VIEW_CAPTION_TOKENS = [
+    {"s": 0, "t": 0, "v": 0, "noisy": True},  # 0: camera on view 0
+    {"s": 0, "t": 0, "v": 1, "noisy": True},  # 1: camera on view 1
+    {"s": 0, "t": 0, "v": 1, "noisy": False},  # 2: conditioning camera token on view 1
+    {"s": 0, "t": 0, "v": 2, "noisy": True, "every_caption": True},  # 3: LiDAR sweep
+]
+
+
+@pytest.mark.L0
+def test_per_view_captions_keep_each_camera_to_its_own_caption() -> None:
+    """A camera reads the caption written for its view, and none of the others."""
+    metadata = _metadata_from_tokens(
+        _PER_VIEW_CAPTION_TOKENS,
+        und_samples=[0, 0, 0, 0, -1],
+        und_caption_views=_PER_VIEW_CAPTION_UND,
+    )
+    m = _mask_mod_to_dense(metadata)
+
+    view_0_camera, view_1_camera, view_1_conditioning = 0, 1, 2
+    assert m[view_0_camera, 0:2].all(), "view 0's camera reads view 0's caption"
+    assert not m[view_0_camera, 2:4].any(), "and not view 1's"
+    assert m[view_1_camera, 2:4].all(), "view 1's camera reads view 1's caption"
+    assert not m[view_1_camera, 0:2].any(), "and not view 0's"
+    # Conditioning tokens are scoped by view exactly like noisy ones.
+    assert m[view_1_conditioning, 2:4].all()
+    assert not m[view_1_conditioning, 0:2].any()
+
+
+@pytest.mark.L0
+def test_per_view_captions_let_lidar_read_every_caption() -> None:
+    """A LiDAR sweep is not one of the rig's cameras, so every camera's caption describes it."""
+    metadata = _metadata_from_tokens(
+        _PER_VIEW_CAPTION_TOKENS,
+        und_samples=[0, 0, 0, 0, -1],
+        und_caption_views=_PER_VIEW_CAPTION_UND,
+    )
+    m = _mask_mod_to_dense(metadata)
+
+    lidar = 3
+    assert m[lidar, 0:4].all(), "LiDAR reads every caption of its sample"
+    assert not m[lidar, 4], "but not the UND padding"
+
+
+@pytest.mark.L0
+def test_per_view_captions_are_still_blocked_across_samples() -> None:
+    """View scoping narrows within a sample; it never reaches another sample's matching view."""
+    tokens = [
+        {"s": 0, "t": 0, "v": 0, "noisy": True},
+        {"s": 1, "t": 0, "v": 0, "noisy": True},
+    ]
+    # Sample 0's view-0 caption is tokens 0-1; sample 1's view-0 caption is tokens 2-3.
+    metadata = _metadata_from_tokens(
+        tokens,
+        und_samples=[0, 0, 1, 1],
+        und_caption_views=[0, 0, 0, 0],
+    )
+    m = _mask_mod_to_dense(metadata)
+
+    assert m[0, 0:2].all() and not m[0, 2:4].any()
+    assert m[1, 2:4].all() and not m[1, 0:2].any()
+
+
+@pytest.mark.L0
+def test_sample_level_caption_stays_reachable_from_every_view() -> None:
+    """The default layout: one caption for the rig, which every view and LiDAR alike reads."""
+    metadata = _metadata_from_tokens(
+        _PER_VIEW_CAPTION_TOKENS,
+        und_samples=[0, 0, 0, 0, -1],
+        und_caption_views=None,  # every UND token is a sample-level caption
+    )
+    m = _mask_mod_to_dense(metadata)
+    assert m[:, 0:4].all(), "every GEN token reads the whole sample-level caption"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("attention_scope", ["all_views", "same_view", "decomposed"])
+def test_per_view_captions_hold_under_every_attention_scope(attention_scope: str) -> None:
+    """View scoping of captions is a property of the gen->und rule, not of the sensor scope.
+
+    ``"all_views"`` is the case that regressed before the sensor rules were made to exclude
+    UND keys: ``reaches_every_view`` alone satisfies ``in_scope``, so a UND key came in
+    through ``sensor_to_sensor`` and every view read every caption regardless.
+    """
+    metadata = _metadata_from_tokens(
+        _PER_VIEW_CAPTION_TOKENS,
+        und_samples=[0, 0, 0, 0, -1],
+        und_caption_views=_PER_VIEW_CAPTION_UND,
+        attention_scope=attention_scope,
+    )
+    m = _mask_mod_to_dense(metadata)
+    assert not m[0, 2:4].any(), f"view 0 read view 1's caption under {attention_scope!r}"
+    assert not m[1, 0:2].any(), f"view 1 read view 0's caption under {attention_scope!r}"
+
+
+@pytest.mark.L0
+def test_metadata_groups_separate_captions_describing_different_views() -> None:
+    """Two captions sharing every other field still need their own runs.
+
+    The block collapsing and the dense-split path both evaluate the predicate on one
+    representative per run, so a run holding captions for two views would answer for both.
+    """
+    metadata = _metadata_from_tokens(
+        _PER_VIEW_CAPTION_TOKENS,
+        und_samples=[0, 0, 0, 0, -1],
+        und_caption_views=_PER_VIEW_CAPTION_UND,
+    )
+    group_id, _representatives = _metadata_groups(metadata, torch.device("cpu"))
+    assert group_id[0] == group_id[1], "one caption is one run"
+    assert group_id[0] != group_id[2], "captions for different views are different runs"
 
 
 @pytest.mark.L0
@@ -1041,11 +1216,87 @@ def _condition_mask(latent_t: int, condition_frames: list[int]) -> torch.Tensor:
     return mask
 
 
-def _multiview_mask_items_for_test(packed_seq: PackedSequence) -> list[list[MaskItem]]:
+def _multiview_mask_items_for_test(packed_seq: PackedSequence) -> list[list[SensorMaskItem]]:
     pytest.importorskip("transformers", reason="cosmos3_vfm_network requires the Cosmos3 network dependencies.")
-    from cosmos_framework.model.generator.mot.cosmos3_vfm_network import _multiview_mask_items
+    from cosmos_framework.model.generator.mot.cosmos3_vfm_network import _multiview_sensor_mask_items
 
-    return _multiview_mask_items(packed_seq)
+    return _multiview_sensor_mask_items(packed_seq)
+
+
+def _multiview_caption_items_for_test(packed_seq: PackedSequence) -> list[list[CaptionMaskItem]] | None:
+    pytest.importorskip("transformers", reason="cosmos3_vfm_network requires the Cosmos3 network dependencies.")
+    from cosmos_framework.model.generator.mot.cosmos3_vfm_network import _multiview_caption_mask_items
+
+    return _multiview_caption_mask_items(packed_seq)
+
+
+@pytest.mark.L0
+def test_mask_items_mark_lidar_as_reading_every_caption() -> None:
+    """A sweep is not one of the rig's cameras, so no caption is written for its view."""
+    items = _multiview_mask_items_for_test(_mask_items_pack(num_views=2, with_lidar=True))
+
+    # The sample reads [camera, camera, lidar, lidar], the order the packer lays down.
+    assert [item.reads_every_caption for item in items[0]] == [False, False, True, True]
+
+
+@pytest.mark.L0
+def test_caption_items_are_none_for_the_usual_single_caption_pack() -> None:
+    """One caption per sample leaves the mask on its unrestricted gen->und pass."""
+    pack = _mask_items_pack(num_views=2, with_lidar=False)
+    pack.text_caption_lens = [[7]]
+    pack.text_caption_view_ids = [[-1]]
+
+    assert _multiview_caption_items_for_test(pack) is None
+
+
+@pytest.mark.L0
+def test_caption_items_carry_the_packed_caption_layout() -> None:
+    """The packer's two parallel lists become the items the mask validates and stamps."""
+    pack = _mask_items_pack(num_views=2, with_lidar=False)
+    pack.text_caption_lens = [[4, 3]]
+    pack.text_caption_view_ids = [[0, 1]]
+
+    caption_items = _multiview_caption_items_for_test(pack)
+    assert caption_items == [[CaptionMaskItem(view_id=0, num_tokens=4), CaptionMaskItem(view_id=1, num_tokens=3)]]
+
+
+@pytest.mark.L0
+def test_per_view_captions_end_to_end_from_a_packed_sequence() -> None:
+    """Pack -> sensor items -> caption items -> metadata, the chain the network runs.
+
+    Two cameras and a LiDAR sweep, one caption per camera: each camera reads its own caption,
+    the sweep reads both, and no camera reads its neighbour's.
+    """
+    pack = _mask_items_pack(num_views=2, with_lidar=True)
+    pack.text_caption_lens = [[4, 3]]
+    pack.text_caption_view_ids = [[0, 1]]
+
+    items = _multiview_mask_items_for_test(pack)
+    caption_items = _multiview_caption_items_for_test(pack)
+    num_gen = sum(item.num_tokens for item in items[0])
+    num_und = 8  # 7 caption tokens plus one padding row
+
+    metadata = _build_metadata(
+        seq_len=num_gen,
+        full_q_offsets=torch.tensor([0, num_gen]),
+        sensor_mask_items=items,
+        caption_mask_items=caption_items,
+        device=torch.device("cpu"),
+        num_und=num_und,
+        causal_offsets=torch.tensor([0, 7]),
+    )
+    m = _mask_mod_to_dense(metadata)
+
+    # GEN rows are the camera items (views 0 and 1) then the LiDAR items (view 2).
+    view_id = metadata.view_id[num_und:]
+    caption_0, caption_1 = slice(0, 4), slice(4, 7)
+    for row in range(m.shape[0]):
+        if view_id[row] == 0:
+            assert m[row, caption_0].all() and not m[row, caption_1].any(), "view 0 keeps its own caption"
+        elif view_id[row] == 1:
+            assert m[row, caption_1].all() and not m[row, caption_0].any(), "view 1 keeps its own caption"
+        elif view_id[row] == 2:
+            assert m[row, 0:7].all(), "the LiDAR sweep reads every caption"
 
 
 def _mask_items_pack(*, num_views: int, with_lidar: bool, with_view_metadata: bool = True) -> PackedSequence:
@@ -1193,8 +1444,8 @@ def _expected_tokens(case: dict) -> list[dict]:
     return tokens
 
 
-def _case_items(case: dict) -> list[list[MaskItem]]:
-    """The case's flat per-item columns as the nested ``MaskItem`` lists the builder takes.
+def _case_items(case: dict) -> list[list[SensorMaskItem]]:
+    """The case's flat per-item columns as the nested ``SensorMaskItem`` lists the builder takes.
 
     The cases stay column-shaped because that reads better as table data; this is the one
     place that transposes them, so a case omitting ``view_offsets_per_item`` or
@@ -1204,7 +1455,7 @@ def _case_items(case: dict) -> list[list[MaskItem]]:
     view_offsets = case.get("view_offsets_per_item") or [0] * num_items
     is_control = case.get("is_control_per_item") or [False] * num_items
     items = [
-        MaskItem(
+        SensorMaskItem(
             token_shape=case["token_shapes"][idx],
             condition_mask=_condition_mask(case["token_shapes"][idx][0], case["condition_frames"][idx]),
             num_views=case["num_views_per_item"][idx],
@@ -1213,12 +1464,12 @@ def _case_items(case: dict) -> list[list[MaskItem]]:
         )
         for idx in range(num_items)
     ]
-    items_per_sample: list[list[MaskItem]] = []
+    sensor_mask_items: list[list[SensorMaskItem]] = []
     first_item = 0
     for sample_num_items in case["num_items_per_sample"]:
-        items_per_sample.append(items[first_item : first_item + sample_num_items])
+        sensor_mask_items.append(items[first_item : first_item + sample_num_items])
         first_item += sample_num_items
-    return items_per_sample
+    return sensor_mask_items
 
 
 def _build_case_metadata(
@@ -1230,10 +1481,10 @@ def _build_case_metadata(
     """Run the builder on a case; returns the metadata and the real token count."""
     offsets = _case_offsets(case)
     num_real = int(offsets[-1])
-    metadata = build_multiview_flex_metadata(
+    metadata = _build_metadata(
         seq_len=num_real + case["pad"],
         full_q_offsets=offsets,
-        items_per_sample=_case_items(case),
+        sensor_mask_items=_case_items(case),
         device=torch.device("cpu"),
         attention_scope=attention_scope,
         control_attends_sensor=control_attends_sensor,
@@ -1257,13 +1508,137 @@ def test_build_multiview_flex_metadata_camera_major_layout() -> None:
     )
     # A single-item sample has no control item: is_control is all False.
     assert not metadata.is_control.any()
-    assert torch.equal(metadata.sample_id, torch.tensor([0] * 8 + [-1] * 4))
+    # One real sample, so its padding takes id 1.
+    assert torch.equal(metadata.sample_id, torch.tensor([0] * 8 + [1] * 4))
 
     assert metadata.sample_id.dtype == torch.long
     assert metadata.frame_id.dtype == torch.long
     assert metadata.view_id.dtype == torch.long
     assert metadata.is_noisy.dtype == torch.bool
     assert metadata.is_control.dtype == torch.bool
+
+
+def _caption_metadata(
+    caption_mask_items: list[list[CaptionMaskItem]] | None,
+    *,
+    num_views: int = 2,
+    with_lidar: bool = False,
+    num_und: int = 8,
+) -> FlexMetadata:
+    """Metadata for one sample of ``num_views`` cameras, optionally beside a LiDAR sweep.
+
+    Each camera item is ``num_views`` views x 1 frame x 1 spatial token, so the GEN stream is
+    one token per view; a LiDAR item adds one more on the view past the cameras.
+    """
+    items = [SensorMaskItem(token_shape=(num_views, 1, 1), condition_mask=torch.ones(num_views), num_views=num_views)]
+    if with_lidar:
+        items.append(
+            SensorMaskItem(
+                token_shape=(1, 1, 1),
+                condition_mask=torch.ones(1),
+                num_views=1,
+                view_offset=num_views,
+                reads_every_caption=True,
+            )
+        )
+    num_gen = sum(item.num_tokens for item in items)
+    return _build_metadata(
+        seq_len=num_gen,
+        full_q_offsets=torch.tensor([0, num_gen]),
+        sensor_mask_items=[items],
+        device=torch.device("cpu"),
+        num_und=num_und,
+        causal_offsets=torch.tensor([0, num_und]),
+        caption_mask_items=caption_mask_items,
+    )
+
+
+@pytest.mark.L0
+def test_build_multiview_flex_metadata_labels_the_und_stream_by_caption_view() -> None:
+    """Each caption's UND run carries the view it describes; the trailing pad stays -1."""
+    metadata = _caption_metadata([[CaptionMaskItem(view_id=0, num_tokens=3), CaptionMaskItem(view_id=1, num_tokens=2)]])
+
+    assert torch.equal(metadata.view_id[:8], torch.tensor([0, 0, 0, 1, 1, -1, -1, -1]))
+
+
+@pytest.mark.L0
+def test_build_multiview_flex_metadata_defaults_every_und_token_to_a_sample_level_caption() -> None:
+    """Without caption_mask_items the field is all -1, i.e. the unrestricted gen->und pass."""
+    metadata = _caption_metadata(None)
+
+    assert (metadata.view_id[: metadata.num_und] == -1).all(), "every caption is sample-level"
+    assert not metadata.reads_every_caption.any()
+
+
+@pytest.mark.L0
+def test_build_multiview_flex_metadata_marks_lidar_as_reading_every_caption() -> None:
+    """The LiDAR item's tokens opt out of view scoping; the camera item's do not."""
+    metadata = _caption_metadata(
+        [[CaptionMaskItem(view_id=0, num_tokens=2), CaptionMaskItem(view_id=1, num_tokens=2)]],
+        with_lidar=True,
+    )
+
+    gen = metadata.reads_every_caption[metadata.num_und :]
+    assert torch.equal(gen, torch.tensor([False, False, True])), "two camera views, then the sweep"
+
+
+@pytest.mark.L0
+def test_build_multiview_flex_metadata_rejects_a_caption_count_that_is_not_the_view_count() -> None:
+    """Requirement: one caption per camera view. Three cameras need three captions."""
+    with pytest.raises(ValueError, match="must cover each camera view exactly once"):
+        _caption_metadata(
+            [[CaptionMaskItem(view_id=0, num_tokens=2), CaptionMaskItem(view_id=1, num_tokens=2)]],
+            num_views=3,
+        )
+
+
+@pytest.mark.L0
+def test_build_multiview_flex_metadata_rejects_two_captions_naming_the_same_view() -> None:
+    """A repeated view leaves another view with no caption at all -- an empty gen->und row."""
+    with pytest.raises(ValueError, match="must cover each camera view exactly once"):
+        _caption_metadata([[CaptionMaskItem(view_id=0, num_tokens=2), CaptionMaskItem(view_id=0, num_tokens=2)]])
+
+
+@pytest.mark.L0
+def test_build_multiview_flex_metadata_rejects_a_caption_naming_no_view() -> None:
+    """``-1`` names no camera, so it leaves one of the sample's views without a caption.
+
+    The sample-level layout is spelled ``caption_mask_items=None``, never caption by caption.
+    """
+    with pytest.raises(ValueError, match="must cover each camera view exactly once"):
+        _caption_metadata([[CaptionMaskItem(view_id=0, num_tokens=2), CaptionMaskItem(view_id=-1, num_tokens=2)]])
+
+
+@pytest.mark.L0
+def test_build_multiview_flex_metadata_rejects_captions_that_overrun_the_und_stream() -> None:
+    with pytest.raises(ValueError, match="exceeding the UND stream"):
+        _caption_metadata(
+            [[CaptionMaskItem(view_id=0, num_tokens=6), CaptionMaskItem(view_id=1, num_tokens=6)]],
+            num_und=8,
+        )
+
+
+@pytest.mark.L0
+def test_build_multiview_flex_metadata_rejects_captions_without_an_und_stream() -> None:
+    """A GEN-only metadata has no UND tokens for a caption to label."""
+    with pytest.raises(ValueError, match="GEN-only"):
+        _build_metadata(
+            seq_len=2,
+            full_q_offsets=torch.tensor([0, 2]),
+            sensor_mask_items=[[SensorMaskItem(token_shape=(2, 1, 1), condition_mask=torch.ones(2), num_views=2)]],
+            caption_mask_items=[[CaptionMaskItem(view_id=0, num_tokens=1), CaptionMaskItem(view_id=1, num_tokens=1)]],
+            device=torch.device("cpu"),
+        )
+
+
+@pytest.mark.L0
+def test_build_multiview_flex_metadata_lidar_view_needs_no_caption_of_its_own() -> None:
+    """The sweep's view is not a camera view, so the captions still cover only the cameras."""
+    metadata = _caption_metadata(
+        [[CaptionMaskItem(view_id=0, num_tokens=2), CaptionMaskItem(view_id=1, num_tokens=2)]],
+        with_lidar=True,
+    )
+    assert torch.equal(metadata.view_id[:4], torch.tensor([0, 0, 1, 1]))
 
 
 @pytest.mark.L0
@@ -1311,7 +1686,10 @@ def test_build_multiview_flex_metadata_pads_with_sentinels() -> None:
     tail = slice(num_real, metadata.seq_len)
 
     sentinel = torch.full((pad,), -1)
-    assert torch.equal(metadata.sample_id[tail], sentinel)
+    # sample_id is the exception: padding is its own pseudo-sample, one past the real ids, which
+    # is what lets padded queries reach each other instead of forming an empty softmax.
+    num_samples = int(metadata.sample_id[:num_real].max()) + 1
+    assert torch.equal(metadata.sample_id[tail], torch.full((pad,), num_samples))
     assert torch.equal(metadata.frame_id[tail], sentinel)
     assert torch.equal(metadata.view_id[tail], sentinel)
     assert not metadata.is_noisy[tail].any()
@@ -1395,12 +1773,12 @@ def test_build_multiview_flex_metadata_accepts_flat_bool_condition_mask() -> Non
     case = _MULTIVIEW_CASES["two_views_first_frame_cond"]
     metadata, _ = _build_case_metadata(case)
 
-    from_bool = build_multiview_flex_metadata(
+    from_bool = _build_metadata(
         seq_len=metadata.seq_len,
         full_q_offsets=_case_offsets(case),
-        items_per_sample=[
+        sensor_mask_items=[
             [
-                MaskItem(
+                SensorMaskItem(
                     token_shape=case["token_shapes"][0],
                     condition_mask=torch.tensor([True, False, True, False]),
                     num_views=case["num_views_per_item"][0],
@@ -1418,14 +1796,14 @@ def test_build_multiview_flex_metadata_accepts_flat_bool_condition_mask() -> Non
 def test_mask_item_rejects_bad_view_count(num_views: int) -> None:
     """An item whose latent axis does not divide into its views is malformed on its own."""
     with pytest.raises(ValueError, match="not divisible by num_views"):
-        MaskItem(token_shape=(4, 1, 2), condition_mask=_condition_mask(4, []), num_views=num_views)
+        SensorMaskItem(token_shape=(4, 1, 2), condition_mask=_condition_mask(4, []), num_views=num_views)
 
 
 @pytest.mark.L0
 def test_mask_item_rejects_condition_mask_length() -> None:
     """A mask that does not cover the item's latent axis is malformed on its own."""
     with pytest.raises(ValueError, match="expected 4"):
-        MaskItem(token_shape=(4, 1, 2), condition_mask=_condition_mask(3, []), num_views=2)
+        SensorMaskItem(token_shape=(4, 1, 2), condition_mask=_condition_mask(3, []), num_views=2)
 
 
 @pytest.mark.L0
@@ -1435,15 +1813,15 @@ def test_build_multiview_flex_metadata_rejects_items_disagreeing_on_seconds_per_
     shape = (2, 1, 1)
     items = [
         [
-            MaskItem(token_shape=shape, condition_mask=_condition_mask(2, []), seconds_per_frame=1.0 / 7.5),
-            MaskItem(token_shape=shape, condition_mask=_condition_mask(2, []), seconds_per_frame=1.0 / 10.0),
+            SensorMaskItem(token_shape=shape, condition_mask=_condition_mask(2, []), seconds_per_frame=1.0 / 7.5),
+            SensorMaskItem(token_shape=shape, condition_mask=_condition_mask(2, []), seconds_per_frame=1.0 / 10.0),
         ]
     ]
     with pytest.raises(ValueError, match="seconds_per_frame"):
-        build_multiview_flex_metadata(
+        _build_metadata(
             seq_len=4,
             full_q_offsets=torch.tensor([0, 4], dtype=torch.int32),
-            items_per_sample=items,
+            sensor_mask_items=items,
             device=torch.device("cpu"),
         )
 
@@ -1454,14 +1832,14 @@ def test_build_multiview_flex_metadata_tolerates_float_noise_in_seconds_per_fram
     shape = (2, 1, 1)
     items = [
         [
-            MaskItem(token_shape=shape, condition_mask=_condition_mask(2, []), seconds_per_frame=1.0 / 7.5),
-            MaskItem(token_shape=shape, condition_mask=_condition_mask(2, []), seconds_per_frame=4.0 / 30.0),
+            SensorMaskItem(token_shape=shape, condition_mask=_condition_mask(2, []), seconds_per_frame=1.0 / 7.5),
+            SensorMaskItem(token_shape=shape, condition_mask=_condition_mask(2, []), seconds_per_frame=4.0 / 30.0),
         ]
     ]
-    metadata = build_multiview_flex_metadata(
+    metadata = _build_metadata(
         seq_len=4,
         full_q_offsets=torch.tensor([0, 4], dtype=torch.int32),
-        items_per_sample=items,
+        sensor_mask_items=items,
         device=torch.device("cpu"),
     )
     assert metadata.seq_len == 4
@@ -1470,10 +1848,12 @@ def test_build_multiview_flex_metadata_tolerates_float_noise_in_seconds_per_fram
 @pytest.mark.L0
 def test_build_multiview_flex_metadata_rejects_packed_token_count_mismatch() -> None:
     with pytest.raises(ValueError, match="packed full-attention splits disagree"):
-        build_multiview_flex_metadata(
+        _build_metadata(
             seq_len=16,
             full_q_offsets=torch.tensor([0, 7], dtype=torch.int32),  # item contributes 8
-            items_per_sample=[[MaskItem(token_shape=(4, 1, 2), condition_mask=_condition_mask(4, []), num_views=2)]],
+            sensor_mask_items=[
+                [SensorMaskItem(token_shape=(4, 1, 2), condition_mask=_condition_mask(4, []), num_views=2)]
+            ],
             device=torch.device("cpu"),
         )
 
@@ -1481,14 +1861,14 @@ def test_build_multiview_flex_metadata_rejects_packed_token_count_mismatch() -> 
 @pytest.mark.L0
 def test_build_multiview_flex_metadata_rejects_mixed_grids_in_a_sample() -> None:
     with pytest.raises(ValueError, match=r"same \(num_views, frames_per_view\) grid"):
-        build_multiview_flex_metadata(
+        _build_metadata(
             seq_len=32,
             full_q_offsets=torch.tensor([0, 16], dtype=torch.int32),
             # Same token count, but 2 views x 2 frames against 1 view x 4 frames.
-            items_per_sample=[
+            sensor_mask_items=[
                 [
-                    MaskItem(token_shape=(4, 1, 2), condition_mask=_condition_mask(4, [0]), num_views=2),
-                    MaskItem(token_shape=(4, 1, 2), condition_mask=_condition_mask(4, [0, 1, 2, 3]), num_views=1),
+                    SensorMaskItem(token_shape=(4, 1, 2), condition_mask=_condition_mask(4, [0]), num_views=2),
+                    SensorMaskItem(token_shape=(4, 1, 2), condition_mask=_condition_mask(4, [0, 1, 2, 3]), num_views=1),
                 ]
             ],
             device=torch.device("cpu"),
@@ -1504,15 +1884,17 @@ def test_build_multiview_flex_metadata_rejects_mixed_grids_within_one_view_range
     so a control item on another grid would condition the wrong moments silently.
     """
     with pytest.raises(ValueError, match=r"same \(num_views, frames_per_view\) grid"):
-        build_multiview_flex_metadata(
+        _build_metadata(
             seq_len=64,
             full_q_offsets=torch.tensor([0, 48], dtype=torch.int32),
             # The first two share view offset 0 and disagree: 2 views x 2 frames against 1 x 4.
-            items_per_sample=[
+            sensor_mask_items=[
                 [
-                    MaskItem(token_shape=(4, 1, 2), condition_mask=_condition_mask(4, [0]), num_views=2),
-                    MaskItem(token_shape=(4, 1, 2), condition_mask=_condition_mask(4, [0, 1, 2, 3]), num_views=1),
-                    MaskItem(token_shape=(4, 1, 2), condition_mask=_condition_mask(4, []), num_views=1, view_offset=2),
+                    SensorMaskItem(token_shape=(4, 1, 2), condition_mask=_condition_mask(4, [0]), num_views=2),
+                    SensorMaskItem(token_shape=(4, 1, 2), condition_mask=_condition_mask(4, [0, 1, 2, 3]), num_views=1),
+                    SensorMaskItem(
+                        token_shape=(4, 1, 2), condition_mask=_condition_mask(4, []), num_views=1, view_offset=2
+                    ),
                 ]
             ],
             device=torch.device("cpu"),
@@ -1603,17 +1985,19 @@ def test_build_multiview_flex_metadata_prepends_the_und_stream() -> None:
     gen_only, num_real = _build_case_metadata(case)
     num_und = 8
 
-    fused = build_multiview_flex_metadata(
+    fused = _build_metadata(
         seq_len=gen_only.seq_len,
         full_q_offsets=_case_offsets(case),
-        items_per_sample=_case_items(case),
+        sensor_mask_items=_case_items(case),
         device=torch.device("cpu"),
         num_und=num_und,
         causal_offsets=torch.tensor([0, 3, 5], dtype=torch.int32),  # 3 + 2 real UND tokens, 3 padded
     )
 
     assert (fused.num_und, fused.q_len, fused.seq_len) == (num_und, gen_only.seq_len, num_und + gen_only.seq_len)
-    assert torch.equal(fused.sample_id[:num_und], torch.tensor([0, 0, 0, 1, 1, -1, -1, -1]))
+    # Two real samples, so UND padding takes id 2 -- the same pseudo-sample GEN padding gets,
+    # which is what lets padded GEN queries reach the padded UND keys.
+    assert torch.equal(fused.sample_id[:num_und], torch.tensor([0, 0, 0, 1, 1, 2, 2, 2]))
     for field in (fused.frame_id, fused.view_id):
         assert torch.equal(field[:num_und], torch.full((num_und,), -1))
     assert not fused.is_noisy[:num_und].any()
@@ -1632,10 +2016,12 @@ def test_build_multiview_flex_metadata_prepends_the_und_stream() -> None:
 @pytest.mark.L0
 def test_build_multiview_flex_metadata_requires_causal_offsets_for_a_fused_stream() -> None:
     with pytest.raises(ValueError, match="needs causal_offsets"):
-        build_multiview_flex_metadata(
+        _build_metadata(
             seq_len=16,
             full_q_offsets=torch.tensor([0, 8], dtype=torch.int32),
-            items_per_sample=[[MaskItem(token_shape=(4, 1, 2), condition_mask=_condition_mask(4, []), num_views=2)]],
+            sensor_mask_items=[
+                [SensorMaskItem(token_shape=(4, 1, 2), condition_mask=_condition_mask(4, []), num_views=2)]
+            ],
             device=torch.device("cpu"),
             num_und=8,
         )
@@ -1644,10 +2030,12 @@ def test_build_multiview_flex_metadata_requires_causal_offsets_for_a_fused_strea
 @pytest.mark.L0
 def test_build_multiview_flex_metadata_rejects_overlong_metadata() -> None:
     with pytest.raises(ValueError, match="exceeding GEN sequence length"):
-        build_multiview_flex_metadata(
+        _build_metadata(
             seq_len=4,  # smaller than the 8 tokens the item contributes
             full_q_offsets=torch.tensor([0, 8], dtype=torch.int32),
-            items_per_sample=[[MaskItem(token_shape=(4, 1, 2), condition_mask=_condition_mask(4, []), num_views=2)]],
+            sensor_mask_items=[
+                [SensorMaskItem(token_shape=(4, 1, 2), condition_mask=_condition_mask(4, []), num_views=2)]
+            ],
             device=torch.device("cpu"),
         )
 
@@ -2011,10 +2399,10 @@ def test_build_multiview_block_mask_covers_the_padded_gen_stream(backend: FlexBa
     case = _MULTIVIEW_CASES["transfer_two_items_two_samples"]
     seq_len = backend.full_seq_alignment
 
-    block_mask = build_multiview_block_mask(
+    block_mask = _build_block_mask(
         seq_len=seq_len,
         full_q_offsets=_case_offsets(case).to(device),
-        items_per_sample=_case_items(case),
+        sensor_mask_items=_case_items(case),
         device=device,
         block_size=backend.block_size,
     )
@@ -2052,9 +2440,9 @@ def test_build_multiview_block_mask_matches_create_block_mask_on_a_camera_pack(
     kwargs = dict(
         seq_len=seq_len,
         full_q_offsets=torch.tensor([0, 2 * item_tokens], dtype=torch.int32),
-        items_per_sample=[
+        sensor_mask_items=[
             [
-                MaskItem(
+                SensorMaskItem(
                     token_shape=(latent_t, spatial_tokens, 1),
                     condition_mask=_condition_mask(latent_t, frames),
                     num_views=num_views,
@@ -2066,8 +2454,8 @@ def test_build_multiview_block_mask_matches_create_block_mask_on_a_camera_pack(
         attention_scope=attention_scope,
     )
 
-    got = build_multiview_block_mask(**kwargs, block_size=backend.block_size)  # type: ignore[arg-type]
-    expected = _eager_block_mask(build_multiview_flex_metadata(**kwargs), backend.block_size)  # type: ignore[arg-type]
+    got = _build_block_mask(**kwargs, block_size=backend.block_size)  # type: ignore[arg-type]
+    expected = _eager_block_mask(_build_metadata(**kwargs), backend.block_size)  # type: ignore[arg-type]
 
     assert expected.full_kv_num_blocks is not None and got.full_kv_num_blocks is not None
     assert torch.equal(
@@ -2110,12 +2498,12 @@ def test_a_noisy_scope_reaches_the_block_mask_as_sparsity(
         "decomposed": (frames_per_view + num_views - 1) / (num_views * frames_per_view),
     }[attention_scope]
 
-    block_mask = build_multiview_block_mask(
+    block_mask = _build_block_mask(
         seq_len=item_tokens,
         full_q_offsets=torch.tensor([0, item_tokens], dtype=torch.int32),
-        items_per_sample=[
+        sensor_mask_items=[
             [
-                MaskItem(
+                SensorMaskItem(
                     token_shape=(latent_t, spatial_tokens, 1),
                     condition_mask=_condition_mask(latent_t, []),
                     num_views=num_views,
@@ -2152,7 +2540,8 @@ _WIRING_NUM_VIEWS = [4, 3]
 
 def _reference_stream_sample_ids(offsets: torch.Tensor, length: int) -> torch.Tensor:
     """Per-token sample ids for one padded stream, derived independently of the builder."""
-    ids = torch.full((length,), -1, dtype=torch.long)
+    # Padding takes the first id past the real samples, matching the builder's searchsorted.
+    ids = torch.full((length,), len(offsets) - 1, dtype=torch.long)
     for sample in range(len(offsets) - 1):
         ids[int(offsets[sample]) : int(offsets[sample + 1])] = sample
     return ids
@@ -2200,13 +2589,13 @@ def test_build_multiview_block_mask_propagates_control_attends_sensor_option(bac
     target_condition = torch.tensor([1.0, 0.0, 0.0]).view(latent_t, 1, 1)  # [T,1,1]
     items = [
         [
-            MaskItem(
+            SensorMaskItem(
                 token_shape=(latent_t, cell_tokens, 1),
                 condition_mask=control_condition,
                 num_views=1,
                 is_control=True,
             ),
-            MaskItem(
+            SensorMaskItem(
                 token_shape=(latent_t, cell_tokens, 1),
                 condition_mask=target_condition,
                 num_views=1,
@@ -2216,13 +2605,13 @@ def test_build_multiview_block_mask_propagates_control_attends_sensor_option(bac
     kwargs = dict(
         seq_len=seq_len,
         full_q_offsets=offsets,
-        items_per_sample=items,
+        sensor_mask_items=items,
         device=torch.device("cpu"),
         block_size=backend.block_size,
     )
 
-    disabled = build_multiview_block_mask(**kwargs)  # type: ignore[arg-type]
-    enabled = build_multiview_block_mask(  # type: ignore[arg-type]
+    disabled = _build_block_mask(**kwargs)  # type: ignore[arg-type]
+    enabled = _build_block_mask(  # type: ignore[arg-type]
         **kwargs, control_attends_sensor=True
     )
     disabled_dense = _effective_token_mask(disabled)  # [S,S], bool
@@ -2279,13 +2668,13 @@ def _wiring_block_mask(
     """Build the GEN mask from ``pack`` exactly as ``cosmos3_vfm_network`` does."""
     full_only_seq, full_q_offsets = get_full_only_seq(pack)
     causal_seq, causal_offsets = get_causal_seq(pack)
-    return build_multiview_block_mask(
+    return _build_block_mask(
         seq_len=full_only_seq.shape[0],
         full_q_offsets=full_q_offsets,
-        items_per_sample=[
+        sensor_mask_items=[
             # One item per sample, which is what the wiring pack carries.
             [
-                MaskItem(
+                SensorMaskItem(
                     token_shape=token_shape,
                     condition_mask=_condition_mask(token_shape[0], frames),
                     num_views=num_views,
@@ -2316,11 +2705,11 @@ def test_network_wiring_gives_the_dense_same_sample_mask_without_conditioning(ba
     _, full_q_offsets = get_full_only_seq(pack)
     causal_seq, causal_offsets = get_causal_seq(pack)
 
-    # The pack keeps its padding in separate `_pad_segment` offsets, so these hold one
-    # entry per sample boundary. Were a trailing pad entry to appear here, the reference
-    # below would silently start treating padding as a real sample.
-    assert len(causal_offsets) == len(_WIRING_UND_LENS) + 1
-    assert len(full_q_offsets) == len(_WIRING_UND_LENS) + 1
+    # The towers carry the padding as one trailing segment, so one entry per sample boundary plus
+    # the terminator plus that segment. The builder indexes by sample count, so it reads the real
+    # boundary out of these unchanged.
+    assert len(causal_offsets) == len(_WIRING_UND_LENS) + 2
+    assert len(full_q_offsets) == len(_WIRING_UND_LENS) + 2
 
     block_mask = _wiring_block_mask(pack, block_size=backend.block_size, condition_frames=[[], []])
     q_len, kv_len = block_mask.shape[-2:]
