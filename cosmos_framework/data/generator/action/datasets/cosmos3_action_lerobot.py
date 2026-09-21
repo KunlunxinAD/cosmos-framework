@@ -17,6 +17,7 @@ import logging as _logging
 import math
 import os as _os
 import random
+import warnings
 from bisect import bisect_right
 from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Sequence
@@ -31,6 +32,19 @@ import numpy as np
 import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from torch.utils.data import Dataset
+
+# LeRobot decodes video through ``torchvision.io.VideoReader`` even on the
+# ``video_backend="pyav"`` path these datasets use (lerobot
+# ``video_utils.decode_video_frames`` routes "pyav" to ``decode_video_frames_torchvision``),
+# and torchvision 0.22+ raises a deprecation UserWarning for its video io on every
+# decode -- once per worker process, so it floods the log. Suppress only this exact
+# warning here, where the LeRobot decode path is imported (so it applies in dataloader
+# workers too); unrelated warnings stay visible.
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    message=r".*video decoding and encoding.*",
+)
 
 _hf_offline_applied = False
 

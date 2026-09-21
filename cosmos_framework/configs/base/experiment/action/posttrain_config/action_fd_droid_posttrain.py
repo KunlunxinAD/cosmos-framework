@@ -128,7 +128,7 @@ action_fd_droid_posttrain = LazyDict(
                 device_monitor=dict(every_n=200, log_memory_detail=True, save_s3=False, step_size=1),
                 grad_clip=dict(clip_norm=1.0, force_finite=True),
                 heart_beat=dict(every_n=200, save_s3=False, step_size=1, update_interval_in_minute=20),
-                iter_speed=dict(every_n=50, hit_thres=50, save_s3=False, save_s3_every_log_n=500),
+                iter_speed=dict(every_n=1, hit_thres=50, save_s3=False, save_s3_every_log_n=500),
                 low_precision=dict(update_iter=1),
                 manual_gc=dict(every_n=200, gc_level=1, warm_up=1),
                 norm_monitor=dict(every_n=100),

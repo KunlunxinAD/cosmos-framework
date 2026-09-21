@@ -316,6 +316,7 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
                 self._video_path(episode, key),
                 [from_ts + ts for ts in timestamps],
                 self._tolerance_s,
+                backend="pyav",
             )  # [T, C, H, W] in [0, 1]
             frames = self._resize(frames)
             frames_by_view[key] = frames

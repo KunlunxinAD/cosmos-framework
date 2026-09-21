@@ -62,6 +62,12 @@ class ActionIterableShuffleDataset(IterableDataset):
     ``shard_world_size`` / ``shard_rank`` are set by ``RankPartitionedDataLoader``.
     """
 
+    # The iterator intentionally cycles forever; the trainer, rather than an epoch
+    # boundary, decides when to stop.  Keep DataLoader/JointDataLoader length
+    # bookkeeping usable with a large sentinel, as done by the generic packing
+    # iterable dataset, without making PyTorch think the stream ends at one pass.
+    _LENGTH_SENTINEL = 10**12
+
     def __init__(self, dataset: "ActionSFTDataset", seed: int = 42):
         super().__init__()
         self._dataset = dataset
@@ -70,7 +76,8 @@ class ActionIterableShuffleDataset(IterableDataset):
         self.shard_rank = 0
 
     def __len__(self) -> int:  # informational only; iteration is infinite
-        return len(self._dataset)
+        # return len(self._dataset)
+        return self._LENGTH_SENTINEL
 
     def __iter__(self):
         import torch
