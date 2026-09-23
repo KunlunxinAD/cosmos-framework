@@ -9,12 +9,14 @@ from cosmos_framework.utils.lazy_config import LazyDict
 from cosmos_framework.configs.base.defaults.activation_checkpointing import ActivationCheckpointingConfig
 from cosmos_framework.configs.base.defaults.compile import CompileConfig
 from cosmos_framework.configs.base.defaults.ema import EMAConfig
-from cosmos_framework.configs.base.defaults.flex_attention import FlexAttentionConfig
+from cosmos_framework.configs.base.defaults.joint_attention import JointAttnImplementation
+from cosmos_framework.configs.base.defaults.multiview_attention import MultiviewAttentionConfig
 from cosmos_framework.configs.base.defaults.parallelism import ParallelismConfig
 from cosmos_framework.configs.base.defaults.quantization import QuantizationConfig
 from cosmos_framework.configs.base.defaults.reasoner import VLMConfig
 from cosmos_framework.model.generator.mot.action_io_projector import ACTION_IO_PROJECTOR_TYPES
 from cosmos_framework.model.generator.utils.load_balancing_stats import LBLConfig
+from cosmos_framework.model.generator.utils.sr_latent_noise import SRLatentConditionNoiseConfig
 
 # Mirrors ``cosmos3.common.args.AttentionIOLayout``. Defined locally on purpose: importing
 # the ``cosmos3`` workspace package at module scope makes the whole cosmos3 config tree
@@ -174,6 +176,14 @@ class OmniMoTModelConfig:
     projections in the network, so ``lidar_state_ch`` must be set to the same value.
     """
 
+    radar_tokenizer: LazyDict | None = None
+    """VAE for the radar/map polar-grid stream, alongside the camera VAE in ``tokenizer``.
+
+    Radar and map share this tokenizer: both are 6-channel range×azimuth clips.
+    There is no published checkpoint yet, so the Hydra default keeps
+    ``load_checkpoint=False`` until a trained iterate is exported.
+    """
+
     lidar_state_ch: int | None = None
     """LiDAR VAE latent channel count, i.e. the width of the network's LiDAR heads."""
 
@@ -192,6 +202,9 @@ class OmniMoTModelConfig:
 
     # Tensor layout at the attention boundary when context parallelism is enabled.
     attention_io_layout: AttentionIOLayout = "sequence_sharded"
+
+    # Opt in to summed CP output gradients; keep legacy scaling for existing optimizer state.
+    correct_cp_gradients: bool = False
 
     # torch.compile knobs (enabled, compiled_region, dynamic, ...).
     compile: CompileConfig = CompileConfig()
@@ -242,16 +255,28 @@ class OmniMoTModelConfig:
     resolution: str = "512"
     max_num_tokens_after_packing: int = 13312  # Final num tokens after sequence packing
 
-    # Attention implementation for joint understanding + generation
-    # Note "two_way" and "three_way" disallow and remove "End-of-Vision" or other text token in the generation tower.
-    # "three_way" must only be used when introducing sparsity
-    joint_attn_implementation: str = "two_way"  # "two_way" or "three_way"
+    # Which joint understanding + generation attention pathway a run takes. Note that every
+    # value disallows and removes "End-of-Vision" or other text tokens in the generation tower.
+    #
+    # * "two_way": the ordinary dense within-sample GEN attention.
+    # * "three_way": the split the NATTEN sparsity path needs; use it only for that.
+    # * "multiview": the multiview-aware GEN attention, whose UND pass is shared and whose GEN
+    #   pass runs as ``multiview_attention.backend`` selects -- a masked FlexAttention call or
+    #   the maskless folds. This is what turns multiview attention on; there is no second flag.
+    #
+    # Naming the *pathway* is not the same as naming the pack shape, and the two are read
+    # separately: "multiview" packs exactly as "two_way" does, which ``packing_layout`` below is
+    # what says so. Compare against this field where the pathway is the question, and go through
+    # ``packing_layout`` where the packing or the context-parallel shard is.
+    joint_attn_implementation: JointAttnImplementation = "two_way"
     # Explicit backend for two-way/multi-control attention. None keeps automatic selection.
+    # Kunlun/P800 (XPU) relies on this to route to its own attention backend; upstream leaves it
+    # unset and lets ``choose_backend`` pick automatically.
     attention_backend: str | None = None
 
-    # Whether the within-sample GEN attention runs as one masked FlexAttention call, and under
-    # what mask and kernels.
-    flex_attention: FlexAttentionConfig = FlexAttentionConfig()
+    # Whether the within-sample GEN attention is multiview-aware, which attention it runs as
+    # (the maskless decomposition or a masked FlexAttention call), and under what mask.
+    multiview_attention: MultiviewAttentionConfig = MultiviewAttentionConfig()
 
     # Per-layer NATTEN parameters
     # Must use "three_way" attention if used.
@@ -330,6 +355,10 @@ class OmniMoTModelConfig:
     sound_tokenizer: LazyDict | None = None  # Sound tokenizer config (e.g., AVAE)
     sound_dim: int | None = None  # Sound latent channel size (e.g., 64 for AVAE 48kHz)
     sound_latent_fps: int = 25  # Sound tokenizer's latent rate (e.g., 48kHz / 1920 hop = 25 Hz)
+
+    # Super-resolution: Gaussian noise on the LR conditioning latent of SR samples during training (L1).
+    # None disables it. See cosmos_framework/model/generator/utils/sr_latent_noise.py.
+    sr_latent_condition_noise: SRLatentConditionNoiseConfig | None = None
 
     # When False, removes bias from vae2llm, sound2llm, and the two Linear layers inside
     # time_embedder.  These biases seem to inject token-constant DC offsets that dominate

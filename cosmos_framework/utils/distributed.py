@@ -36,6 +36,16 @@ if TYPE_CHECKING:
     from cosmos_framework.utils.config import DDPConfig
 
 
+def _set_gpu_cpu_affinity(device: Device) -> None:
+    """Prefer GPU-local CPUs within the process's existing allocation."""
+    allocated_cpus = os.sched_getaffinity(0)
+    preferred_cpus = allocated_cpus.intersection(device.get_cpu_affinity())
+    if preferred_cpus:
+        os.sched_setaffinity(0, preferred_cpus)
+    else:
+        log.warning("No GPU-local CPU is available in the current CPU affinity; retaining the allocated set.")
+
+
 def init(store: dist.Store | None = None, backend: str | None = None) -> int | None:
     """Initialize distributed training.
 
@@ -48,13 +58,14 @@ def init(store: dist.Store | None = None, backend: str | None = None) -> int | N
     # if hasattr(os, "sched_setaffinity"):
     try:
         device = Device(local_rank)
-        affinity_mask = set(device.get_cpu_affinity())
-        if affinity_mask:
-            os.sched_setaffinity(0, affinity_mask)
-            log.info(f"Set CPU affinity for device {local_rank} to cores {affinity_mask}")
+        _set_gpu_cpu_affinity(device)
     except Exception as e:
+        # Deliberately broad: P800/torch_xmlir hosts have no pynvml, so upstream's
+        # ``except pynvml.NVMLError`` would raise NameError here (pynvml is not imported).
         log.warning(f"Failed to set CPU affinity: {e}")
 
+    # Set up distributed communication. CPU checkpoint conversion needs Gloo
+    # because NCCL cannot synchronize CPU-resident tokenizer or model tensors.
     os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "0"
     os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
     if dist.is_available():
