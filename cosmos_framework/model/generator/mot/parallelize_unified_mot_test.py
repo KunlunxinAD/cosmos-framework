@@ -34,6 +34,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from torch.distributed.fsdp import CPUOffloadPolicy, OffloadPolicy
 
 from cosmos_framework.configs.base.defaults.compile import CompileConfig
 from cosmos_framework.model.generator.mot.parallelize_unified_mot import (
@@ -41,6 +42,9 @@ from cosmos_framework.model.generator.mot.parallelize_unified_mot import (
     _mark_pack_unbacked,
     _wrap_forward_with_unbacked_pack,
     apply_compile,
+    apply_fsdp,
+    materialize_non_offloaded_state,
+    parallelize_unified_mot,
 )
 
 pytestmark = [pytest.mark.L0, pytest.mark.CPU]
@@ -261,3 +265,186 @@ class TestMarkUnbackedFlag:
         # context-parallel config goes through, so it is opted into per configuration after
         # verifying that configuration compiles under it. See CompileConfig.mark_unbacked.
         assert CompileConfig().mark_unbacked is False
+
+
+class TestFSDPCPUOffload:
+    @staticmethod
+    def _model_with_two_layers() -> torch.nn.Module:
+        layers = torch.nn.Module()
+        layers.register_module("0", torch.nn.Linear(4, 4))
+        layers.register_module("1", torch.nn.Linear(4, 4))
+        inner = torch.nn.Module()
+        inner.layers = layers
+        model = torch.nn.Module()
+        model.model = inner
+        return model
+
+    @pytest.mark.parametrize(
+        ("cpu_offload", "expected_policy"),
+        [(False, OffloadPolicy), (True, CPUOffloadPolicy)],
+    )
+    def test_wraps_every_complete_block_with_selected_offload_policy(
+        self,
+        cpu_offload: bool,
+        expected_policy: type[OffloadPolicy],
+    ) -> None:
+        model = self._model_with_two_layers()
+        parallel_dims = SimpleNamespace(fsdp_cpu_offload=cpu_offload)
+        mesh = object()
+
+        with (
+            patch(
+                "cosmos_framework.model.generator.mot.parallelize_unified_mot.fsdp_mesh",
+                return_value=mesh,
+            ),
+            patch("cosmos_framework.model.generator.mot.parallelize_unified_mot.fully_shard") as mock_shard,
+            patch(
+                "cosmos_framework.model.generator.mot.parallelize_unified_mot.register_fsdp_forward_method"
+            ) as mock_register,
+        ):
+            apply_fsdp(model, parallel_dims)
+
+        blocks = list(model.model.layers.children())
+        assert mock_shard.call_count == len(blocks)
+        assert mock_register.call_count == len(blocks)
+        for block, call in zip(blocks, mock_shard.call_args_list, strict=True):
+            assert call.kwargs["module"] is block
+            assert call.kwargs["mesh"] is mesh
+            assert isinstance(call.kwargs["offload_policy"], expected_policy)
+            assert call.kwargs["reshard_after_forward"] is True
+            assert getattr(block, "_fsdp_cpu_offloaded") is cpu_offload
+
+    def test_materializes_meta_blocks_before_fsdp_wrapping(self) -> None:
+        with torch.device("meta"):
+            model = self._model_with_two_layers()
+        first_block = model.model.layers.get_submodule("0")
+        first_block.register_buffer("positions", torch.arange(3))  # [3]
+        parallel_dims = SimpleNamespace(fsdp_cpu_offload=True)
+        mesh = SimpleNamespace(device_type="cpu")
+        blocks = list(model.model.layers.children())
+        wrapped_blocks: list[torch.nn.Module] = []
+
+        def record_wrap_order(*, module: torch.nn.Module, **_: object) -> None:
+            block_index = len(wrapped_blocks)
+            assert module is blocks[block_index]
+            assert all(not parameter.is_meta for parameter in module.parameters())
+            for future_block in blocks[block_index + 1 :]:
+                assert all(parameter.is_meta for parameter in future_block.parameters())
+            wrapped_blocks.append(module)
+
+        with (
+            patch(
+                "cosmos_framework.model.generator.mot.parallelize_unified_mot.fsdp_mesh",
+                return_value=mesh,
+            ),
+            patch(
+                "cosmos_framework.model.generator.mot.parallelize_unified_mot.fully_shard",
+                side_effect=record_wrap_order,
+            ),
+            patch("cosmos_framework.model.generator.mot.parallelize_unified_mot.register_fsdp_forward_method"),
+        ):
+            apply_fsdp(model, parallel_dims)
+
+        assert wrapped_blocks == blocks
+        for block in blocks:
+            assert all(parameter.device.type == "cpu" for parameter in block.parameters())
+        assert torch.equal(first_block.positions, torch.arange(3))
+
+    def test_materializes_remaining_state_without_revisiting_offloaded_blocks(self) -> None:
+        root = torch.nn.Module()
+        root.register_parameter("root_weight", torch.nn.Parameter(torch.empty(2, 2, device="meta")))
+        block = torch.nn.Module()
+        block.register_parameter("weight", torch.nn.Parameter(torch.ones(3, 2)))  # [3,2]
+        block.register_buffer("positions", torch.arange(3))  # [3]
+        setattr(block, "_fsdp_cpu_offloaded", True)
+        root.register_module("block", block)
+
+        materialize_non_offloaded_state(root, device="cpu")
+
+        assert root.root_weight.device.type == "cpu"
+        assert block.weight.device.type == "cpu"
+        assert torch.equal(block.weight, torch.ones(3, 2))
+        assert torch.equal(block.positions, torch.arange(3))
+
+    def test_compile_runs_before_fsdp_wrapping(self) -> None:
+        calls: list[str] = []
+        model = torch.nn.Module()
+        compile_config = SimpleNamespace(enabled=True)
+        parallel_dims = SimpleNamespace(cp_enabled=False, dp_enabled=True)
+
+        with (
+            patch(
+                "cosmos_framework.model.generator.mot.parallelize_unified_mot.apply_ac",
+                side_effect=lambda *_: calls.append("ac"),
+            ),
+            patch(
+                "cosmos_framework.model.generator.mot.parallelize_unified_mot.apply_compile",
+                side_effect=lambda *_: calls.append("compile"),
+            ),
+            patch(
+                "cosmos_framework.model.generator.mot.parallelize_unified_mot.apply_fsdp",
+                side_effect=lambda *_: calls.append("fsdp"),
+            ),
+        ):
+            parallelize_unified_mot(model, parallel_dims, compile_config, SimpleNamespace())
+
+        assert calls == ["ac", "compile", "fsdp"]
+
+
+class TestCudaGraphScope:
+    """``cuda_graph_scope`` decides whether inductor's CUDA-graph trees wrap each block.
+
+    With scope "forward" the AR loop captures one explicit graph around the whole forward, and a
+    capture cannot nest the per-block graph trees, so the blocks must compile with ``mode=None``.
+    """
+
+    @staticmethod
+    def _model_with_one_layer() -> torch.nn.Module:
+        block = torch.nn.Identity()
+        layers = torch.nn.Module()
+        layers.register_module("0", block)
+        inner = torch.nn.Module()
+        inner.layers = layers
+        model = torch.nn.Module()
+        model.model = inner
+        return model
+
+    @pytest.mark.parametrize(
+        ("use_cuda_graphs", "scope", "expected_mode"),
+        [(True, "block", "reduce-overhead"), (True, "forward", None), (False, "block", None), (False, "forward", None)],
+    )
+    def test_block_scope_alone_uses_reduce_overhead(self, use_cuda_graphs: bool, scope: str, expected_mode) -> None:
+        model = self._model_with_one_layer()
+        seen_modes: list[object] = []
+
+        def fake_compile(block, **kwargs):
+            seen_modes.append(kwargs["mode"])
+            return block
+
+        with patch("cosmos_framework.model.generator.mot.parallelize_unified_mot.torch.compile", fake_compile):
+            apply_compile(model, CompileConfig(enabled=True, use_cuda_graphs=use_cuda_graphs, cuda_graph_scope=scope))
+
+        assert seen_modes == [expected_mode]
+
+    @pytest.mark.parametrize("scope", ["block", "forward"])
+    def test_forward_scope_forces_static_shapes(self, scope: str) -> None:
+        model = self._model_with_one_layer()
+        seen_dynamic: list[object] = []
+
+        def fake_compile(block, **kwargs):
+            seen_dynamic.append(kwargs["dynamic"])
+            return block
+
+        with patch("cosmos_framework.model.generator.mot.parallelize_unified_mot.torch.compile", fake_compile):
+            apply_compile(
+                model, CompileConfig(enabled=True, use_cuda_graphs=True, cuda_graph_scope=scope, compile_dynamic=True)
+            )
+
+        # Symbolic shapes stage Python floats through pinned host memory inside the compiled wrapper,
+        # which a whole-forward capture would replay from freed memory; forward scope pins static shapes.
+        assert seen_dynamic == [scope == "block"]
+
+    def test_scope_is_validated_and_defaults_to_block(self) -> None:
+        assert CompileConfig().cuda_graph_scope == "block"
+        with pytest.raises(ValueError):
+            CompileConfig(cuda_graph_scope="whole")  # type: ignore[arg-type]

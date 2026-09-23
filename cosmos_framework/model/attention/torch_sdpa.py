@@ -35,6 +35,11 @@ def torch_sdpa_attention_check(
     causal_type: CausalType | None,
     is_varlen: bool,
     deterministic: bool = False,
+    # Part of the backend-check protocol upstream extended: ``choose_backend`` now passes
+    # these on every call. Accepted for signature compatibility; this backend's lse is a
+    # placeholder (see ``_sdpa_one``), so neither changes the verdict here.
+    return_lse: bool = False,
+    is_compiling: bool = False,
     raise_error: bool = False,
 ) -> bool:
     # SDPA accepts any reasonable shape on any device. We do not gate on dtype

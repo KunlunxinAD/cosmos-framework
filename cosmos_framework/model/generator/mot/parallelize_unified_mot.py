@@ -20,7 +20,13 @@ from torch._dynamo.decorators import mark_unbacked
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
 )
-from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard, register_fsdp_forward_method
+from torch.distributed.fsdp import (
+    CPUOffloadPolicy,
+    MixedPrecisionPolicy,
+    OffloadPolicy,
+    fully_shard,
+    register_fsdp_forward_method,
+)
 from torch.utils.checkpoint import (
     CheckpointPolicy,
     create_selective_checkpoint_contexts,
@@ -28,12 +34,45 @@ from torch.utils.checkpoint import (
 
 from cosmos_framework.configs.base.defaults.activation_checkpointing import ActivationCheckpointingConfig
 from cosmos_framework.configs.base.defaults.compile import CompileConfig
+from cosmos_framework.model.generator.mot.activation_marks import enable_marking, is_mark_op
 from cosmos_framework.model.generator.mot.attention import SplitInfo, dispatch_attention
 from cosmos_framework.model.generator.mot.context_parallel_utils import context_parallel_attention
 from cosmos_framework.model.generator.utils.memory import KVToStore, MemoryValue
 from cosmos_framework.data.generator.sequence_packing.runtime import SequencePack
 from cosmos_framework.utils.generator.parallelism import ParallelDims, fsdp_mesh
 from cosmos_framework.model.generator.mot.replicated_io import apply_replicated_attention_io_cp
+
+
+def _to_empty_preserving_buffers(
+    module: nn.Module,
+    *,
+    device: torch.device | str,
+    recurse: bool,
+) -> None:
+    """Materialize a module without discarding buffers that already hold valid values."""
+    descendants = module.modules() if recurse else (module,)
+    buffers = [
+        (descendant, name, buffer)
+        for descendant in descendants
+        for name, buffer in descendant.named_buffers(recurse=False)
+        if not buffer.is_meta
+    ]
+    module.to_empty(device=device, recurse=recurse)  # parameters and buffers: [*shape]
+    for descendant, name, buffer in buffers:
+        setattr(descendant, name, buffer)
+
+
+def materialize_non_offloaded_state(module: nn.Module, *, device: torch.device | str) -> None:
+    """Materialize remaining meta state without revisiting CPU-offloaded FSDP units."""
+    if getattr(module, "_fsdp_cpu_offloaded", False):
+        # Each marked decoder block was materialized as one bounded CUDA unit
+        # before fully_shard() converted it into FSDP-owned CPU DTensor shards.
+        # A later device conversion would disturb that established placement.
+        return
+
+    _to_empty_preserving_buffers(module, device=device, recurse=False)
+    for child in module.children():
+        materialize_non_offloaded_state(child, device=device)
 
 
 class ContextParallelDispatch(nn.Module):
@@ -91,25 +130,60 @@ class ContextParallelDispatch(nn.Module):
         )
 
 
+def make_selective_ac_policy(save_ops_regex: "list[re.Pattern]", save_only_marked_ops: bool = False):
+    """The policy selective AC consults for every op inside a checkpointed block.
+
+    ``save_ops_regex`` says which ops are eligible to be kept. With
+    ``save_only_marked_ops``, an eligible op is kept only where the model asked for it
+    with :func:`~cosmos_framework.model.generator.mot.activation_marks.mark_next_activation`
+    -- which is how four calls running the same kernel can be told apart, since a
+    name cannot tell them apart. Without it every eligible op is kept, which is
+    what every existing config does.
+
+    A pending mark is consumed by the next *eligible* op rather than the next op.
+    At the real call site, the gathers for Q and V and the clone made by the attention
+    frontend all dispatch between the marker and the kernel; consuming the mark on
+    the next op of any kind puts the mark on a gather, not the kernel.
+    """
+    # Per region: ``context_fn`` is called once per checkpointed forward, so a
+    # mark cannot leak from one block into the next.
+    marked = {"armed": False}
+
+    def wrapped_policy(ctx, func, *args, **kwargs) -> CheckpointPolicy:
+        op_name = getattr(func, "__name__", str(func))
+        if is_mark_op(op_name):
+            marked["armed"] = True
+            # The marker is a copy, not something worth keeping.
+            return CheckpointPolicy.MUST_RECOMPUTE
+        if not any(pattern.search(op_name) for pattern in save_ops_regex):
+            return CheckpointPolicy.MUST_RECOMPUTE
+        if not save_only_marked_ops:
+            return CheckpointPolicy.MUST_SAVE
+        if marked["armed"]:
+            marked["armed"] = False
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.MUST_RECOMPUTE
+
+    return wrapped_policy
+
+
 def _apply_selective_ac(
     module: nn.Module,
     ac: ActivationCheckpointingConfig,
 ) -> nn.Module:
     """Apply per-op selective activation checkpointing to ``module``."""
     save_ops_regex = [re.compile(pattern) for pattern in ac.save_ops_regex]
-
-    def _get_custom_policy():
-        def wrapped_policy(ctx, func, *args, **kwargs) -> CheckpointPolicy:
-            op_name = getattr(func, "__name__", str(func))
-            if any(pattern.search(op_name) for pattern in save_ops_regex):
-                return CheckpointPolicy.MUST_SAVE
-            return CheckpointPolicy.MUST_RECOMPUTE
-
-        return wrapped_policy
+    if ac.save_only_marked_ops:
+        # Here rather than at the call sites: this is the one place that knows the
+        # policy wants marks, and it runs before the first forward, so the marker is
+        # a pass-through for every model that does not ask for it.
+        enable_marking()
 
     return ptd_checkpoint_wrapper(
         module,
-        context_fn=lambda: create_selective_checkpoint_contexts(_get_custom_policy()),
+        context_fn=lambda: create_selective_checkpoint_contexts(
+            make_selective_ac_policy(save_ops_regex, save_only_marked_ops=ac.save_only_marked_ops)
+        ),
         preserve_rng_state=ac.preserve_rng_state,
         determinism_check=ac.determinism_check,
     )
@@ -127,10 +201,18 @@ def _apply_full_ac(
     )
 
 
-def _apply_ac_to_transformer_block(
+def apply_ac_to_module(
     module: nn.Module,
     config: ActivationCheckpointingConfig,
 ) -> nn.Module:
+    """Wrap one module in the checkpoint wrapper that ``config.mode`` selects.
+
+    Nothing here is specific to a transformer block, so the VFM side reuses it
+    for the standalone modules that sit outside ``model.layers`` (see
+    ``parallelize_vfm_network``). ``config.mode == "none"`` is rejected rather
+    than treated as a no-op: the callers decide whether AC applies at all, and
+    silently returning an unwrapped module would hide a miswired policy.
+    """
     if config.mode == "full":
         return _apply_full_ac(module, config)
     elif config.mode == "selective":
@@ -156,7 +238,7 @@ def apply_ac(
 
     layers = model.model.layers
     for layer_id, transformer_block in layers.named_children():
-        transformer_block = _apply_ac_to_transformer_block(
+        transformer_block = apply_ac_to_module(
             transformer_block,
             config,
         )
@@ -314,12 +396,21 @@ def apply_compile(model: nn.Module, config: CompileConfig) -> None:
     if config.coordinate_descent_tuning:
         compile_options["coordinate_descent_tuning"] = True
 
+    # A whole-forward CUDA-graph capture replays the compiled block's wrapper as recorded GPU work
+    # only.  With symbolic shapes inductor materialises Python floats (e.g. RMSNorm epsilons) and
+    # sizes through CPU code plus a pinned host->device copy inside that wrapper; on replay the
+    # CPU side never runs and the copy reads freed host memory.  Static shapes bake those values
+    # into the kernels, so forward scope forces ``dynamic=False`` (as the post-saturation static
+    # compile already does).
+    forward_scope_capture = config.use_cuda_graphs and config.cuda_graph_scope == "forward"
     for layer_id, block in model.model.layers.named_children():
         block = torch.compile(
             block,
             fullgraph=True,
-            dynamic=config.compile_dynamic,
-            mode="reduce-overhead" if config.use_cuda_graphs else None,
+            dynamic=False if forward_scope_capture else config.compile_dynamic,
+            # Forward-scope capture wraps the whole AR forward in one explicit graph; inductor's
+            # per-block CUDA-graph trees cannot nest inside it, so they are only used for "block".
+            mode="reduce-overhead" if (config.use_cuda_graphs and config.cuda_graph_scope == "block") else None,
             options=compile_options or None,
         )
         # Instance-attribute override, not a subclass/wrapper module: OptimizedModule already
@@ -377,7 +468,7 @@ def apply_fsdp(
     model: nn.Module,
     parallel_dims: ParallelDims,
     mp_policy: MixedPrecisionPolicy | None = None,
-):
+) -> None:
     """
     Apply data parallelism (via FSDP2) to the model.
 
@@ -395,6 +486,11 @@ def apply_fsdp(
     is 2-D even when ``dp_replicate == 1``, which silently puts a pure-FSDP run on FSDP2's
     HSDP path and pays a one-rank ``all_reduce`` per block per step.
 
+    For CPU offload, each complete decoder block is materialized on the compute
+    device immediately before it is wrapped. ``CPUOffloadPolicy`` then creates
+    the FSDP-owned CPU-local shards before the next block is materialized, which
+    bounds construction-time CUDA parameter memory to one decoder block.
+
     Args:
         model (nn.Module): The model to apply data parallelism to.
         parallel_dims (ParallelDims): The device mesh to use for data parallelism and expert parallel.
@@ -411,11 +507,25 @@ def apply_fsdp(
     """
     mesh = fsdp_mesh(parallel_dims)
     for _, block in model.model.layers.named_children():
+        if parallel_dims.fsdp_cpu_offload:
+            parameters = list(block.parameters())
+            meta_parameters = [parameter for parameter in parameters if parameter.is_meta]
+            if meta_parameters:
+                if len(meta_parameters) != len(parameters):
+                    raise ValueError("FSDP CPU-offload blocks must be entirely meta or entirely materialized.")
+                compute_device = torch.device(mesh.device_type)
+                if compute_device.type == "cuda":
+                    compute_device = torch.device("cuda", torch.cuda.current_device())
+                _to_empty_preserving_buffers(block, device=compute_device, recurse=True)
+        offload_policy = CPUOffloadPolicy() if parallel_dims.fsdp_cpu_offload else OffloadPolicy()
         fully_shard(
             module=block,
             mesh=mesh,
             mp_policy=mp_policy or MixedPrecisionPolicy(),
+            offload_policy=offload_policy,
+            reshard_after_forward=True,
         )
+        setattr(block, "_fsdp_cpu_offloaded", parallel_dims.fsdp_cpu_offload)
         register_fsdp_forward_method(block, "reasoner_forward")
 
 
