@@ -123,6 +123,7 @@ class ARReplicatedIODispatch(nn.Module):
         natten_metadata: dict | None = None,
         memory_value: MemoryValue | None = None,
         packed_key_states_normalized: SequencePack | None = None,
+        backend: str | None = None,
     ) -> tuple[SequencePack, KVToStore | None]:
         # Check the stable post-saturation flag first so the statically compiled
         # path does not guard on the changing Python ``frame_idx`` value and
@@ -139,6 +140,7 @@ class ARReplicatedIODispatch(nn.Module):
                 natten_metadata=natten_metadata,
                 memory_value=memory_value,
                 packed_key_states_normalized=packed_key_states_normalized,
+                backend=backend,
             )
         if getattr(memory_value, "for_cuda_graphs", False):
             raise ValueError("replicated attention_io_layout does not support ARMemoryState(for_cuda_graphs=True)")
@@ -163,6 +165,7 @@ class ARReplicatedIODispatch(nn.Module):
             natten_metadata=natten_metadata,
             memory_value=memory_value,
             packed_key_states_normalized=local_key_pack_normalized,
+            backend=backend,
         )
         return local_output_pack, kv_to_store
 
