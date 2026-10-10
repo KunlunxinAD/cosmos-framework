@@ -12,6 +12,10 @@ from PIL import Image
 
 from cosmos_framework.data.imaginaire.webdataset.augmentors.augmentor import Augmentor
 from cosmos_framework.utils import log
+from cosmos_framework.data.generator.augmentors.reasoner.sample_data_stats import (
+    SampleDataStats,
+    system_prompt_from,
+)
 from cosmos_framework.data.generator.reasoner.video_decoder_qwen import (
     VideoTemporalMode,
     get_effective_temporal_patch_size,
@@ -33,6 +37,13 @@ from cosmos_framework.data.generator.processors.audio_utils import (
 )
 from cosmos_framework.data.generator.processors.qwen3vl_processor import Qwen3VLProcessor as Processor
 from cosmos_framework.utils.generator.reasoner.constant import IGNORE_INDEX, PROCESSOR_KEYS_TO_ADD
+from cosmos_framework.utils.generator.source_video_timing import (
+    SOURCE_VIDEO_TIMING_KEY,
+    require_source_pts_processor,
+    validate_source_video_timing,
+    validate_video_timestamp_mode,
+)
+from cosmos_framework.utils.generator.video_source_metadata import VIDEO_METADATA_KEY, validate_source_video_metadata
 
 
 class _AudioProcessor(Protocol):
@@ -149,6 +160,7 @@ class TokenizeData(Augmentor):
         max_image_token_length: int = 8192,
         custom_system_prompt: str | None = None,
         strip_original_system_prompt: bool = False,
+        data_stats_writer_enabled: bool = False,
         text_only: bool = False,
         sound_und: bool = False,
         audio_processor: Optional[_AudioProcessor] = None,
@@ -158,6 +170,7 @@ class TokenizeData(Augmentor):
         audio_end_token: str = AUDIO_END_TOKEN,
         audio_timestamp_fps: float = DEFAULT_REASONER_VIDEO_FPS,
         audio_layout: str = "separate_with_timestamps",
+        video_timestamp_mode: str = "qwen_index",
         video_temporal_mode: VideoTemporalMode = "native",
     ) -> None:
         """
@@ -166,9 +179,16 @@ class TokenizeData(Augmentor):
             max_video_token_length (int): Maximum number of video tokens to use. Defaults to 8192.
             custom_system_prompt: Prompt to inject when no leading system message exists.
             strip_original_system_prompt: Remove existing system messages before optional injection.
+            data_stats_writer_enabled: Collect per-sample metadata for DataStatsWriterCallback.
             sound_und (bool): Opt in to audio preprocessing and audio-token registration.
                 Disabled by default so existing text/vision tokenizers are unchanged.
         """
+        validate_video_timestamp_mode(video_timestamp_mode)
+        self.video_timestamp_mode: str = video_timestamp_mode
+        if video_timestamp_mode == "source_pts":
+            require_source_pts_processor(processor)
+            if sound_und or audio_processor is not None:
+                raise ValueError("source_pts currently supports video without audio understanding")
         # Create the tokenizer
         self.text_only = text_only
         self.processor = processor  # Expecting a ImageTextTokenizer
@@ -176,6 +196,7 @@ class TokenizeData(Augmentor):
         self.max_image_token_length = max_image_token_length
         self.custom_system_prompt = custom_system_prompt
         self.strip_original_system_prompt = strip_original_system_prompt
+        self.collect_data_stats = data_stats_writer_enabled
         self.video_temporal_mode: VideoTemporalMode = video_temporal_mode
         self.effective_temporal_patch_size: int = get_effective_temporal_patch_size(
             getattr(self.processor, "temporal_patch_size", 2), video_temporal_mode
@@ -238,6 +259,14 @@ class TokenizeData(Augmentor):
             data_dict (dict): Output dict
         """
         conversation = data_dict["conversation"]
+        if self.video_timestamp_mode == "source_pts":
+            for message in conversation:
+                contents = message.get("content")
+                if isinstance(contents, list) and any(content.get("type") == "audio" for content in contents):
+                    raise ValueError("source_pts does not support audio conversation content")
+            for value in data_dict.get("media", {}).values():
+                if isinstance(value, dict) and "audio" in value:
+                    raise ValueError("source_pts does not support paired audio media")
         processor_kwargs = {}
         total_images = 0
         total_videos = 0
@@ -245,6 +274,7 @@ class TokenizeData(Augmentor):
         raw_images: list[torch.Tensor] = []
         raw_videos: list[torch.Tensor] = []
         audio_clips: list[np.ndarray | torch.Tensor] = []
+        audio_start_seconds: list[float] = []
         # Pre-compute modality counts. Audio clips follow the same typed-content
         # -> media-dictionary schema as images and videos.
         for message in conversation:
@@ -256,6 +286,7 @@ class TokenizeData(Augmentor):
                 total_images += len([content for content in message["content"] if content["type"] == "image"])
                 total_videos += len([content for content in message["content"] if content["type"] == "video"])
                 total_audios += len([content for content in message["content"] if content["type"] == "audio"])
+        data_stats = SampleDataStats.from_conversation(conversation) if self.collect_data_stats else None
 
         # url
         url = data_dict["__url__"].root + "/" + data_dict["__url__"].path
@@ -290,6 +321,9 @@ class TokenizeData(Augmentor):
                         )
                         return None
                     audio = data_dict["media"][media_key]
+                    audio_start_seconds.append(
+                        float(audio.get("audio_start_seconds", 0.0)) if isinstance(audio, dict) else 0.0
+                    )
                     if isinstance(audio, dict):
                         if "audio" not in audio:
                             log.critical(
@@ -321,7 +355,8 @@ class TokenizeData(Augmentor):
         audio_index = 0
         audio_segment_lengths_by_video: list[list[int] | None] = []
         for message in conversation:
-            active_video_timestamps: list[float] | None = None
+            video_timestamps_by_key: dict[str, list[float]] = {}
+            active_video_key: str | None = None
             # for user message, we insert the media
             if message["role"] == "user" and isinstance(
                 message["content"], list
@@ -381,6 +416,9 @@ class TokenizeData(Augmentor):
                         content["max_pixels"] = max_pixels_per_image
                         raw_image = np.asarray(image.convert("RGB"))  # [H,W,3]
                         raw_images.append(torch.from_numpy(raw_image).permute(2, 0, 1)[:, None])  # [3,1,H,W]
+                        native_height, native_width = raw_image.shape[:2]
+                        if data_stats is not None:
+                            data_stats.add_image(native_height, native_width, self.processor)
 
                     elif content["type"] == "video":
                         # as tokenization will NOT upsample the video, we can use a larger value here at the cost of multiple video having 1.5x token length
@@ -409,6 +447,26 @@ class TokenizeData(Augmentor):
                             return None
                         videos = video_media["videos"]  # list of PIL images
                         fps = video_media["fps"]
+                        source_timing = video_media.get(SOURCE_VIDEO_TIMING_KEY)
+                        if self.video_timestamp_mode == "source_pts":
+                            validate_source_video_timing(source_timing, len(videos))
+                        elif source_timing is not None:
+                            raise ValueError(
+                                "source_pts media requires TokenizeData(video_timestamp_mode='source_pts')"
+                            )
+                        video_metadata = video_media.get(VIDEO_METADATA_KEY)
+                        if VIDEO_METADATA_KEY in video_media:
+                            if self.video_timestamp_mode != "qwen_index":
+                                raise ValueError(
+                                    "video_metadata requires TokenizeData(video_timestamp_mode='qwen_index')"
+                                )
+                            video_metadata = validate_source_video_metadata(video_metadata, len(videos))
+                        if data_stats is not None:
+                            data_stats.add_video(
+                                video_media,
+                                self.processor,
+                                self.effective_temporal_patch_size,
+                            )
                         # this is because videos are decoded to be around "max_video_token_length" tokens
 
                         videos = maybe_subsample_frames(
@@ -417,9 +475,21 @@ class TokenizeData(Augmentor):
                         if len(videos) == 0:
                             log.info(f"[TokenizerDataError]video {media_key} has no decoded frames. url: {url}")
                             return None
+                        if self.video_timestamp_mode == "source_pts":
+                            validate_source_video_timing(source_timing, len(videos))
+                            content[SOURCE_VIDEO_TIMING_KEY] = source_timing
+                        content["video"] = videos
+                        if video_metadata is not None:
+                            # Any later temporal selection must update source indices with the pixels.
+                            content[VIDEO_METADATA_KEY] = validate_source_video_metadata(video_metadata, len(videos))
+
                         max_pixels_per_image = max_total_pixels // total_videos // len(videos)
                         if self.video_temporal_mode == "framewise":
-                            source_indices = video_media.get("source_frames_indices", list(range(len(videos))))
+                            source_indices = (
+                                video_metadata["frames_indices"]
+                                if video_metadata is not None
+                                else video_media.get("source_frames_indices", list(range(len(videos))))
+                            )
                             if len(source_indices) != len(videos):
                                 log.critical(
                                     f"[TokenizerDataError]video frame metadata length {len(source_indices)} does not "
@@ -429,18 +499,29 @@ class TokenizeData(Augmentor):
                             content["video"], content["frames_indices"] = expand_video_frames_for_framewise(
                                 videos, source_indices, self.processor.temporal_patch_size
                             )
-                            content["fps"] = video_media.get("source_fps", fps)
-                            content["total_num_frames"] = video_media.get("source_total_num_frames", len(videos))
+                            if video_metadata is not None:
+                                # Repeat the source indices with the pixels, keeping source crop offsets.
+                                content[VIDEO_METADATA_KEY] = validate_source_video_metadata(
+                                    {**video_metadata, "frames_indices": content["frames_indices"]},
+                                    len(content["video"]),
+                                )
+                                content["fps"] = video_metadata["fps"]
+                                content["total_num_frames"] = video_metadata["total_num_frames"]
+                            else:
+                                content["fps"] = video_media.get("source_fps", fps)
+                                content["total_num_frames"] = video_media.get("source_total_num_frames", len(videos))
                         else:
                             content["video"] = videos
                             content["fps"] = fps
                         content["max_pixels"] = max_pixels_per_image
                         if message_has_audio:
-                            active_video_timestamps = get_qwen_video_timestamps(
+                            video_timestamps_by_key[media_key] = get_qwen_video_timestamps(
                                 num_frames=len(videos),
-                                fps=fps,
+                                fps=video_metadata["fps"] if video_metadata is not None else fps,
                                 temporal_patch_size=self.processor.temporal_patch_size,
+                                frame_indices=video_metadata["frames_indices"] if video_metadata is not None else None,
                             )
+                            active_video_key = media_key
                         if self.audio_layout == "interleaved_av":
                             audio_segment_lengths_by_video.append(None)
 
@@ -451,6 +532,18 @@ class TokenizeData(Augmentor):
                     elif content["type"] == "audio":
                         assert audio_outputs is not None
                         assert self.audio_special_tokens is not None
+                        audio_key = content["audio"]
+                        audio_media = data_dict["media"][audio_key]
+                        # Extracted audio belongs to its own video media entry. Standalone
+                        # waveforms retain the existing positional pairing convention.
+                        paired_video_key = (
+                            audio_key
+                            if message_has_video and isinstance(audio_media, dict) and "videos" in audio_media
+                            else active_video_key
+                        )
+                        active_video_timestamps = (
+                            video_timestamps_by_key.get(paired_video_key) if paired_video_key is not None else None
+                        )
                         if active_video_timestamps is None and message_has_video:
                             log.critical(
                                 "[TokenizerDataError]paired audio must follow its video in the same user message "
@@ -463,13 +556,18 @@ class TokenizeData(Augmentor):
                         audio_token_timestamps = self.audio_processor.get_token_timestamps(
                             int(audio_outputs["audio_feature_lengths"][audio_index])
                         )
+                        # Cropped waveforms begin at zero locally; compare them to video on the source clock.
+                        if active_video_timestamps is not None:
+                            audio_token_timestamps = [
+                                timestamp + audio_start_seconds[audio_index] for timestamp in audio_token_timestamps
+                            ]
                         if self.audio_layout == "interleaved_av" and message_has_video:
                             previous_content_type = (
                                 message["content"][content_idx - 1]["type"] if content_idx > 0 else None
                             )
-                            if previous_content_type != "video":
+                            if previous_content_type != "video" or paired_video_key != active_video_key:
                                 log.critical(
-                                    "[TokenizerDataError]interleaved_av requires adjacent [video, audio] "
+                                    "[TokenizerDataError]interleaved_av requires matching adjacent [video, audio] "
                                     f"content pairs. url: {url}",
                                     rank0_only=False,
                                 )
@@ -544,6 +642,8 @@ class TokenizeData(Augmentor):
         try:
             conversation = convert_all_images_to_rgb(conversation)
         except Exception as e:
+            if self.video_timestamp_mode == "source_pts":
+                raise ValueError("source_pts failed while converting selected video frames to RGB") from e
             log.critical(
                 f"Error in convert_all_images_to_rgb: {e} | conversation: {conversation} | __url__: {url} | data_dict: {data_dict.keys()}"
             )
@@ -577,6 +677,8 @@ class TokenizeData(Augmentor):
                     spliced_input_ids.shape
                 )
         except Exception as e:
+            if self.video_timestamp_mode == "source_pts":
+                raise ValueError("source_pts failed while rendering aligned video timestamps") from e
             log.critical(
                 f"Error in tokenizer_output: {e} | conversation: {conversation} | __url__: {url} | data_dict: {data_dict.keys()}"
             )
@@ -617,12 +719,16 @@ class TokenizeData(Augmentor):
         input_ids = torch.LongTensor(input_ids)  # [N_token]
         token_mask = torch.BoolTensor(token_mask)  # [N_token]; True = compute loss on this token
 
-        data_dict.update(
-            {
-                "input_ids": input_ids,
-                "token_mask": token_mask,
-            }
-        )
+        data_dict.update({"input_ids": input_ids, "token_mask": token_mask})
+        if data_stats is not None:
+            data_dict["data_stats"] = data_stats.finalize(
+                input_ids=input_ids,
+                processor=self.processor,
+                system_prompt=system_prompt_from(conversation),
+                is_thinking_stripped=bool(data_dict.get("is_thinking_stripped", False)),
+                max_image_token_length=self.max_image_token_length,
+                max_video_token_length=self.max_video_token_length,
+            )
         if audio_outputs is not None:
             data_dict.update(audio_outputs)
         for key in PROCESSOR_KEYS_TO_ADD:

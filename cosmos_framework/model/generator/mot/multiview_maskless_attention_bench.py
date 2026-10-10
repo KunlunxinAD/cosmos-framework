@@ -3,7 +3,7 @@
 
 """Time the maskless multiview folds against the paths they are an alternative to.
 
-Three ways to attend one multiview sample, all timed over the same packed batch and all
+Four ways to attend one multiview sample, all timed over the same packed batch and all
 including the reasoner's own causal self-attention, since every one of them runs it:
 
 * ``dense_full`` -- ``two_way_attention`` with no mask, i.e. every GEN token attends to its
@@ -14,6 +14,8 @@ including the reasoner's own causal self-attention, since every one of them runs
 * ``multiview_maskless`` -- ``multiview_attention`` under a ``MultiviewMasklessPlan``: three
   unmasked kernels (same
   view, cross view, gen->und) merged by log-sum-exp, no ``BlockMask`` anywhere.
+* ``multiview_maskless_exact`` -- the same fast view fold, with disjoint rectangular
+  cross-view passes. Counts each pair once, matching the flex-decomposed RGB mask.
 
 ``mask_build`` times the block mask the flex row needs. It is charged separately because
 production builds it once per forward, outside the decoder layers, and every layer then
@@ -28,9 +30,9 @@ approximation documented on ``multiview_maskless_attention``, not a benchmarking
 TFLOP/s is therefore each row's own useful work over its own time; the ``vs dense`` column is
 what a caller actually chooses between.
 
-Inference only: the maskless folds refuse grad, so every row is timed under
-``torch.no_grad`` and the flex and dense rows are timed the same way rather than in the
-training forward ``flex_attention_bench`` measures.
+Inference by default, and a training step under ``--train``: the folds' backward is correct
+(``MergeAttentionsBridge``, see ``multiview_maskless_attention``), so every row can be timed
+either way, and all of them are timed the same way as each other.
 
 Example:
 
@@ -70,7 +72,10 @@ from cosmos_framework.model.generator.mot.flex_attention_bench import (
     time_call,
 )
 from cosmos_framework.model.generator.mot.multiview_attention import multiview_attention
-from cosmos_framework.model.generator.mot.multiview_maskless_attention import build_multiview_maskless_plan
+from cosmos_framework.model.generator.mot.multiview_maskless_attention import (
+    MultiviewMasklessPlan,
+    build_multiview_maskless_plan,
+)
 from cosmos_framework.data.generator.sequence_packing.runtime import (
     SequencePack,
     get_causal_seq,
@@ -203,10 +208,10 @@ class BenchConfig:
     def scenario(self, pixel_frames: int, backend: FlexBackend) -> MultiviewScenario:
         """The scenario for one point of the ``pixel_frames_per_view`` sweep.
 
-        One generated camera item and no control item, which is the case
-        the maskless folds take. The scope is pinned to ``"decomposed"``
-        because that is the mask this row is an alternative to; the folds also express
-        ``"same_view"``, which is a cheaper row this sweep does not cover.
+        One generated camera item, with a control item ahead of it under ``--camera-control``
+        and none otherwise. The scope is pinned to ``"decomposed"`` because that is the mask
+        this row is an alternative to; the folds also express ``"same_view"``, which is a
+        cheaper row this sweep does not cover.
         """
         return MultiviewScenario(
             seq_alignment=backend.full_seq_alignment,
@@ -311,7 +316,8 @@ def multiview_maskless_plan(
     device: torch.device,
     per_view_captions: bool = False,
     padded_gen_tokens: int | None = None,
-):
+    deduplicate_cross_view: bool = False,
+) -> MultiviewMasklessPlan:
     """The plan for these scenarios, one entry per item with the control items marked."""
     num_views: list[int] = []
     token_shapes: list[tuple[int, int, int]] = []
@@ -336,9 +342,13 @@ def multiview_maskless_plan(
         device=device,
         items_per_sample=counts,
         is_control=control,
+        # The rule ``counted_pairs`` counts and the masks below are built with: a control token
+        # and its target share a view group outright, so the group is one varlen segment.
+        control_attends_sensor=True,
         view_axis=[0] * len(num_views),
         captions=captions,
         padded_gen_tokens=padded_gen_tokens,
+        deduplicate_cross_view=deduplicate_cross_view,
     )
 
 
@@ -362,7 +372,7 @@ def counted_pairs(scenarios: Sequence[MultiviewScenario], variant: str, per_view
             for frame in range(frames)
         ]
         gen_tokens = len(cells) * spatial
-        if variant in ("dense_full", "flex_all_views"):
+        if variant == "dense_full":
             gen_pairs = gen_tokens * gen_tokens
         else:
             # A single-view sample owns one same-view group, so its cross-instant groups sit
@@ -373,7 +383,17 @@ def counted_pairs(scenarios: Sequence[MultiviewScenario], variant: str, per_view
             for q_control, q_view, q_frame in cells:
                 for k_control, k_view, k_frame in cells:
                     same_view = q_view == k_view
-                    same_instant = (not neutralised) and (not q_control) and (not k_control) and q_frame == k_frame
+                    both_sensor = (not q_control) and (not k_control)
+                    if variant == "flex_all_views":
+                        # The scope widens the sensor->sensor rule and only that one: it is read
+                        # inside ``in_scope``, which every control rule bypasses, so a pair
+                        # touching a control token is a view rule under this scope too. Charging
+                        # the whole square -- as this did, alongside ``dense_full`` -- is right
+                        # only for a sample with no control item, where every cell is a sensor
+                        # and ``both_sensor`` already admits everything.
+                        gen_pairs += int(both_sensor or same_view) * spatial * spatial
+                        continue
+                    same_instant = (not neutralised) and both_sensor and q_frame == k_frame
                     if multiplicity:
                         gen_pairs += (int(same_view) + int(same_instant)) * spatial * spatial
                     elif same_view or same_instant:
@@ -469,7 +489,11 @@ def build_ragged_mask(
         causal_offsets=causal_offsets,
         attention_scope=attention_scope,
         decomposed_temporal_window_seconds=None,
-        control_attends_sensor=False,
+        # The same rule the maskless plan is built with, so the rows compare one attention and
+        # not two. It was ``False`` here while the plan could only express ``True``, which under
+        # ``--camera-control`` left the flex rows denying the control->sensor quadrant that
+        # ``counted_pairs`` charges them for and the maskless row computes.
+        control_attends_sensor=True,
     )
 
 
@@ -550,7 +574,11 @@ def build_mask(
         causal_offsets=causal_offsets,
         attention_scope=attention_scope,
         decomposed_temporal_window_seconds=None,
-        control_attends_sensor=False,
+        # The same rule the maskless plan is built with, so the rows compare one attention and
+        # not two. It was ``False`` here while the plan could only express ``True``, which under
+        # ``--camera-control`` left the flex rows denying the control->sensor quadrant that
+        # ``counted_pairs`` charges them for and the maskless row computes.
+        control_attends_sensor=True,
     )
 
 
@@ -581,6 +609,7 @@ def variant_pairs(scenario: MultiviewScenario, variant: str) -> int:
         "flex_all_views": None,
         "flex_decomposed": scenario.latent_frames_per_view + scenario.num_views - 1,
         "multiview_maskless": scenario.latent_frames_per_view + scenario.num_views,
+        "multiview_maskless_exact": scenario.latent_frames_per_view + scenario.num_views - 1,
     }[variant]
     gen_keys = num_gen if cells is None else cells * scenario.spatial_tokens
     return num_gen * (num_und + gen_keys)
@@ -602,6 +631,13 @@ def run_scenario(
     plan = multiview_maskless_plan(
         [scenario], device, config.per_view_captions, int(get_full_only_seq(packs[0])[0].shape[0])
     )
+    exact_plan = multiview_maskless_plan(
+        [scenario],
+        device,
+        config.per_view_captions,
+        int(get_full_only_seq(packs[0])[0].shape[0]),
+        deduplicate_cross_view=True,
+    )
 
     calls: dict[str, Callable[[], object]] = {}
     if not config.skip_dense:
@@ -612,6 +648,9 @@ def run_scenario(
             lambda mask=block_mask: multiview_attention(*packs, flex_block_mask=mask, flex_backend=backend),
         )
     calls["multiview_maskless"] = _timed_or_trained(config, lambda: multiview_attention(*packs, maskless_plan=plan))
+    calls["multiview_maskless_exact"] = _timed_or_trained(
+        config, lambda: multiview_attention(*packs, maskless_plan=exact_plan)
+    )
 
     if config.compile:
         # Only the token count varies between steps in production, and the head dims have to
@@ -721,6 +760,13 @@ def run_ragged(
     plan = multiview_maskless_plan(
         scenarios, device, config.per_view_captions, int(get_full_only_seq(packs[0])[0].shape[0])
     )
+    exact_plan = multiview_maskless_plan(
+        scenarios,
+        device,
+        config.per_view_captions,
+        int(get_full_only_seq(packs[0])[0].shape[0]),
+        deduplicate_cross_view=True,
+    )
 
     calls: dict[str, Callable[[], object]] = {}
     if not config.skip_dense:
@@ -731,6 +777,9 @@ def run_ragged(
             lambda mask=block_mask: multiview_attention(*packs, flex_block_mask=mask, flex_backend=backend),
         )
     calls["multiview_maskless"] = _timed_or_trained(config, lambda: multiview_attention(*packs, maskless_plan=plan))
+    calls["multiview_maskless_exact"] = _timed_or_trained(
+        config, lambda: multiview_attention(*packs, maskless_plan=exact_plan)
+    )
 
     if config.compile:
         for pack in packs:

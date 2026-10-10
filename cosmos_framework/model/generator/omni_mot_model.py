@@ -31,9 +31,14 @@ from cosmos_framework.model.generator.algorithm.loss.flow_matching import (
     ACTION_SLOT_SAMPLE_COUNT_KEY,
     ACTION_SLOT_SAMPLE_LOSS_KEY,
     ActionSlotLossStats,
+    FlowMatchingLossItems,
     compute_flow_matching_loss,
 )
 from cosmos_framework.model.generator.algorithm.loss.load_balancing import compute_load_balancing_loss
+from cosmos_framework.model.generator.algorithm.loss.modality_reduction import (
+    build_modality_loss_items,
+    reduce_global_modality_means,
+)
 from cosmos_framework.configs.base.defaults.joint_attention import JointAttnImplementation
 from cosmos_framework.configs.base.defaults.model_config import OmniMoTModelConfig
 from cosmos_framework.configs.base.defaults.parallelism import PRECISION_TO_TORCH_DTYPE
@@ -52,6 +57,7 @@ from cosmos_framework.model.generator.mot.context_parallel_utils import (
     context_parallel_broadcast_tensor_list,
 )
 from cosmos_framework.model.generator.mot.cosmos3_vfm_network import Cosmos3VFMNetwork, Cosmos3VFMNetworkConfig
+from cosmos_framework.model.generator.mot.diffusion_cache import _velocity_pathways
 from cosmos_framework.model.generator.mot.inference_text_kv_memory import (
     InferenceTextKVMemoryState,
     UndKVCache,
@@ -62,7 +68,14 @@ from cosmos_framework.model.generator.mot.inference_text_kv_memory import (
 from cosmos_framework.model.generator.mot.modeling_utils import has_noisy_tokens
 from cosmos_framework.model.generator.mot.parallelize_unified_mot import materialize_non_offloaded_state
 from cosmos_framework.model.generator.mot.parallelize_vfm_network import parallelize_vfm_network
+from cosmos_framework.model.generator.mot.replica_partition import ReplicaPartitioner
 from cosmos_framework.model.generator.reasoner.qwen3_vl.utils import tokenize_caption
+from cosmos_framework.model.generator.sensor_encoder import (
+    SensorEncoder,
+    get_vae_pixel_shapes,
+    normalize_uint8_item,
+)
+from cosmos_framework.model.generator.utils.batch_normalization import normalize_vision_batch_inplace
 from cosmos_framework.model.generator.utils.data_and_condition import (
     GenerationDataClean,
     GenerationDataNoised,
@@ -81,17 +94,13 @@ from cosmos_framework.model.generator.utils.moe_utils import (
     uses_aux_loss_free_load_balancing,
     uses_ema_router_bias,
 )
+from cosmos_framework.model.generator.utils.rig_view_embedding import vision_view_ids
 from cosmos_framework.model.generator.utils.safetensors_loader import (
     load_language_model as load_language_model_safetensors,
 )
 from cosmos_framework.model.generator.utils.sr_latent_noise import (
     apply_sr_latent_condition_noise,
     sr_sample_mask,
-)
-from cosmos_framework.model.generator.vision_encoder import (
-    VisionEncoder,
-    get_vae_pixel_shapes,
-    normalize_uint8_item,
 )
 from cosmos_framework.data.generator.sequence_packing import (
     PackedSequence,
@@ -100,7 +109,12 @@ from cosmos_framework.data.generator.sequence_packing import (
     pack_input_sequence,
 )
 from cosmos_framework.data.generator.sequence_packing.modality import add_special_tokens
-from cosmos_framework.data.generator.sequence_packing.packers import is_item_generated, uses_single_timestep
+from cosmos_framework.data.generator.sequence_packing.packers import (
+    is_item_generated,
+    pack_multiview_action_conditioning,
+    replicate_multiview_actions,
+    uses_single_timestep,
+)
 from cosmos_framework.model.generator.tokenizers.interface import VideoTokenizerInterface
 from cosmos_framework.model.generator.upsampler.prompts import build_messages, clean_response
 from cosmos_framework.utils.generator.data_utils import get_vision_data_resolution, read_positive_int_metadata
@@ -108,6 +122,10 @@ from cosmos_framework.utils.generator.dtensor_helper import DTensorFastEmaModelU
 from cosmos_framework.utils.generator.model_weights_stats import WeightTrainingStat
 from cosmos_framework.utils.generator.parallelism import ParallelDims
 from cosmos_framework.utils.generator.quantization import swap_modelopt_fp8_linears_on_meta
+
+# "LIDA" in ASCII: fixed domain tag separating joint LiDAR noise from RGB.
+# Changing this value changes all joint LiDAR inference noise.
+_LIDAR_NOISE_DOMAIN_TAG: int = 0x4C494441
 
 
 def _all_group_ranks_allow(
@@ -127,13 +145,31 @@ def _any_dp_shard_rank_needs_guidance_path(
     local_needs_guidance_path: bool,
     dp_shard_group: torch.distributed.ProcessGroup | None,
     device: torch.device | str | None,
+    num_postprocess_forwards: int = 0,
 ) -> bool:
-    """Enter the guidance path on every FSDP shard rank when any rank needs it."""
+    """Enter guidance together and reject mismatched extra forwards before any branch runs."""
     if dp_shard_group is None:
         return local_needs_guidance_path
-    needed = torch.tensor([local_needs_guidance_path], device=device, dtype=torch.uint8)
-    torch.distributed.all_reduce(needed, op=torch.distributed.ReduceOp.MAX, group=dp_shard_group)
-    return bool(needed.item())
+    # Gather guidance flags and forward counts so every shard checks the same schedules.
+    schedule = torch.tensor(
+        [int(local_needs_guidance_path), num_postprocess_forwards],
+        device=device,
+        dtype=torch.int32,
+    )  # [2]
+    gathered = [
+        torch.empty_like(schedule) for _ in range(torch.distributed.get_world_size(dp_shard_group))
+    ]  # list[[2]]
+    torch.distributed.all_gather(gathered, schedule, group=dp_shard_group)  # list[[2]]
+    schedules = [rank_schedule.tolist() for rank_schedule in gathered]
+    forward_counts = [count for _, count in schedules]
+    if len(set(forward_counts)) != 1:
+        raise ValueError(
+            "FSDP shard ranks have different control-guidance branch schedules: "
+            f"postprocess forward counts by shard rank are {forward_counts}. "
+            "Use matching control-guidance activation schedules within each dp_shard group "
+            "or place these samples in independent shard groups."
+        )
+    return any(needs_guidance for needs_guidance, _ in schedules)
 
 
 def _uses_lidar_primary_tokenizer(data_batch: dict[str, Any]) -> bool:
@@ -239,10 +275,11 @@ INFERENCE_RAW_VISION_RETAINED_ITEMS_KEY = "_inference_raw_vision_retained_items"
 
 @dataclasses.dataclass(frozen=True)
 class VelocityPostprocess:
-    """A velocity transform with a preparation hook before any branch executes."""
+    """A velocity transform that declares its CFG branches before execution."""
 
     apply: Callable[[list[torch.Tensor], list[torch.Tensor], torch.Tensor, float], list[torch.Tensor]]
-    prepare: Callable[[list[torch.Tensor], torch.Tensor], None]
+    cfg_branches: Callable[[torch.Tensor], tuple[str, ...]]
+    """Return the CFG branch names this postprocessor will execute, in order, at timestep [B,1]."""
 
     def __call__(
         self,
@@ -384,6 +421,31 @@ class OmniMoTModel(ImaginaireModel):
                 self.tokenizer_lidar_gen.reset_dtype()
             log.info(f"LiDAR tokenizer initialized: {type(self.tokenizer_lidar_gen).__name__}")
 
+        # 2c. Radar VAE for the BEV stream, a third sensor alongside camera and LiDAR and
+        # standing to the sequence exactly as LiDAR does. Its latent_ch is as wide as the
+        # LiDAR VAE's, but the network sizes the radar projections from radar_state_ch, so
+        # that is the field this VAE has to agree with.
+        self.tokenizer_radar_gen: VideoTokenizerInterface | None = None
+        if self.config.radar_tokenizer is not None and self.config.load_vision_tokenizer:
+            self.tokenizer_radar_gen = lazy_instantiate(self.config.radar_tokenizer)
+            if self.config.radar_state_ch is None:
+                raise ValueError("radar_state_ch must be set when radar_tokenizer is configured.")
+            if self.tokenizer_radar_gen.latent_ch != self.config.radar_state_ch:
+                raise ValueError(
+                    f"Radar tokenizer latent_ch {self.tokenizer_radar_gen.latent_ch} != "
+                    f"radar_state_ch {self.config.radar_state_ch}; the radar projection heads are sized "
+                    "from radar_state_ch, so a mismatch would silently project the wrong width."
+                )
+            if self.config.radar_fps is None or self.config.radar_fps <= 0:
+                raise ValueError(
+                    f"radar_fps must be a positive cycle rate when radar_tokenizer is configured, got "
+                    f"{self.config.radar_fps}. Without it the packer has no way to convert a radar "
+                    "latent index into seconds and would silently place scans on the camera's rate."
+                )
+            if hasattr(self.tokenizer_radar_gen, "reset_dtype"):
+                self.tokenizer_radar_gen.reset_dtype()
+            log.info(f"Radar tokenizer initialized: {type(self.tokenizer_radar_gen).__name__}")
+
         # 3. Sound/audio tokenizer (optional)
         if self.config.sound_gen:
             assert self.config.sound_tokenizer is not None, "sound_tokenizer must be provided when sound_gen is True"
@@ -426,6 +488,29 @@ class OmniMoTModel(ImaginaireModel):
             lora_enabled: Override for ``config.lora_enabled``.
         """
         # Build model network and parallelize it.
+        multiview_action_conditioning = getattr(self.config, "multiview_action_conditioning", None)
+        if multiview_action_conditioning is not None:
+            if (
+                not self.config.action_gen
+                or self.config.video_temporal_causal
+                or self.config.causal_training_strategy != "none"
+                or self.config.joint_attn_implementation != "multiview"
+                or self.config.multiview_attention.backend != "maskless"
+            ):
+                raise ValueError("Multiview action conditioning requires bidirectional RGB/action maskless attention.")
+            if self.config.diffusion_expert_config.num_view_embeddings != 0:
+                raise ValueError("num_view_embeddings must be 0 with fixed action view codes (no learned embeddings).")
+            codes = torch.tensor([list(code) for code in multiview_action_conditioning.view_codes])
+            if (
+                codes.ndim != 2
+                or codes.shape[0] < 2
+                or codes.shape[1] == 0
+                or multiview_action_conditioning.view_code_start < 0
+                or multiview_action_conditioning.view_code_start + codes.shape[1] > self.config.max_action_dim
+                or not torch.isfinite(codes).all()
+                or codes[0].any()
+            ):
+                raise ValueError("Fixed view codes must fit padded action slots and keep the reference view zero.")
         lora_enabled = self.config.lora_enabled if lora_enabled is None else lora_enabled
         with torch.device("meta"):
             assert self.vlm_config.model_instance is not None, "Model instance should be specified"
@@ -458,9 +543,13 @@ class OmniMoTModel(ImaginaireModel):
             network_config = Cosmos3VFMNetworkConfig(
                 vlm_config=language_model.config,
                 latent_patch_size=self.config.diffusion_expert_config.patch_spatial,
+                lidar_patch_spatial_hw=self.config.diffusion_expert_config.lidar_patch_spatial_hw,
+                num_view_embeddings=self.config.diffusion_expert_config.num_view_embeddings,
                 latent_downsample_factor=self.config.latent_downsample_factor,
                 latent_channel_size=self.config.state_ch,
                 lidar_latent_channel_size=self.config.lidar_state_ch,
+                radar_latent_channel_size=self.config.radar_state_ch,
+                radar_patch_spatial_hw=self.config.diffusion_expert_config.radar_patch_spatial_hw,
                 max_latent_h=self.config.diffusion_expert_config.max_vae_latent_side_after_patchify,
                 max_latent_w=self.config.diffusion_expert_config.max_vae_latent_side_after_patchify,
                 max_latent_t=self.config.state_t,
@@ -477,7 +566,9 @@ class OmniMoTModel(ImaginaireModel):
                 sound_gen=self.config.sound_gen,
                 joint_attn_implementation=self.config.joint_attn_implementation,
                 multiview_attention_config=self.config.multiview_attention,
+                multiview_action_conditioning=multiview_action_conditioning is not None,
                 timestep_scale=1.0 / float(num_train_timesteps) * self.config.diffusion_expert_config.timestep_range,
+                timestep_range=self.config.diffusion_expert_config.timestep_range,
                 action_dim=self.config.max_action_dim,
                 num_embodiment_domains=self.config.num_embodiment_domains,
                 action_io_projector_type=self.config.action_io_projector_type,
@@ -717,6 +808,9 @@ class OmniMoTModel(ImaginaireModel):
             lb=self.config.parallelism.vae_load_balance_group_size,
         )
         self.parallel_dims.build_meshes(device_type=DEVICE)
+        # Shares the per-sample work every rank of an inference replica would otherwise repeat
+        # (sensor media loads, VAE encode and decode); None outside a multi-rank replica.
+        self.replica_partitioner = ReplicaPartitioner.from_parallel_dims(self.parallel_dims, device=DEVICE)
 
     def set_up_scheduler_and_sampler(self):
         # Get shift values - support both int and dict-based resolution lookup.
@@ -903,13 +997,31 @@ class OmniMoTModel(ImaginaireModel):
         plus three optional flags.
         """
         assert self.tokenizer_vision_gen is not None
-        return pack_input_sequence(
+        multiview_action_conditioning = getattr(self.config, "multiview_action_conditioning", None)
+        if multiview_action_conditioning is not None and gen_data_clean.num_vision_items_per_sample is not None:
+            if skip_text_tokens or include_end_of_generation_token or initial_mrope_temporal_offset:
+                raise ValueError("Multiview action conditioning keeps sample-level text and no generation markers.")
+            return pack_multiview_action_conditioning(
+                sequence_plans,
+                input_text_indexes,
+                gen_data_clean,
+                input_timesteps,
+                config=multiview_action_conditioning,
+                special_tokens=self.llm_special_tokens,
+                patch_spatial=self.config.diffusion_expert_config.patch_spatial,
+                temporal_factor=self.tokenizer_vision_gen.temporal_compression_factor,
+                temporal_margin=self.config.diffusion_expert_config.unified_3d_mrope_temporal_modality_margin,
+                base_fps=float(self.config.diffusion_expert_config.base_fps),
+            )
+        packed = pack_input_sequence(
             sequence_plans=sequence_plans,
             input_text_indexes=input_text_indexes,
             gen_data_clean=gen_data_clean,
             input_timesteps=input_timesteps,
             special_tokens=self.llm_special_tokens,
             latent_patch_size=self.config.diffusion_expert_config.patch_spatial,
+            lidar_patch_spatial_hw=self.config.diffusion_expert_config.lidar_patch_spatial_hw,
+            radar_patch_spatial_hw=self.config.diffusion_expert_config.radar_patch_spatial_hw,
             skip_text_tokens=skip_text_tokens,
             include_end_of_generation_token=include_end_of_generation_token,
             unified_3d_mrope_reset_spatial_ids=self.config.diffusion_expert_config.unified_3d_mrope_reset_spatial_ids,
@@ -921,11 +1033,15 @@ class OmniMoTModel(ImaginaireModel):
             lidar_temporal_compression_factor=(
                 self.tokenizer_lidar_gen.temporal_compression_factor if self.tokenizer_lidar_gen is not None else None
             ),
+            radar_temporal_compression_factor=(
+                self.tokenizer_radar_gen.temporal_compression_factor if self.tokenizer_radar_gen is not None else None
+            ),
             vision_temporal_position_mode=self.config.diffusion_expert_config.vision_temporal_position_mode,
             video_temporal_causal=self.config.video_temporal_causal,
             action_dim=self.config.max_action_dim,
             initial_mrope_temporal_offset=initial_mrope_temporal_offset,
         )
+        return packed
 
     def _get_temporal_positions_vision(
         self,
@@ -1126,6 +1242,9 @@ class OmniMoTModel(ImaginaireModel):
         leave it off deliberately: balancing runs collectives over the whole ``lb`` group, and
         those paths are not guaranteed to run on every rank of it.
         """
+        normalize_vision_batch_inplace(
+            data_batch, video_key=self.input_video_key, tensor_kwargs_fp32=getattr(self, "tensor_kwargs_fp32", {})
+        )
         input_text_indexes = self._load_and_tokenize_text_data(data_batch, iteration)
         sequence_plans = build_sequence_plans_from_data_batch(
             data_batch=data_batch,
@@ -1145,15 +1264,36 @@ class OmniMoTModel(ImaginaireModel):
         gen_data_clean, memory_info = self.memory_init_training(gen_data_clean, data_batch, input_text_indexes)
 
         # image_size[i] may be (1, 4) from IterativeJointDataLoader or (4,) from custom_collate_fn.
-        if "image_size" in data_batch:
-            data_resolutions: list[str] | str | None = []
+        if (
+            getattr(self.config, "multiview_action_conditioning", None) is not None
+            and gen_data_clean.num_vision_items_per_sample is not None
+        ):
+            # There is no last-item transfer target. Use the configured reference
+            # resolution once per synchronized sample, not the last smaller view.
+            data_resolutions: list[str] | str | None = [self.config.resolution] * gen_data_clean.batch_size
+        elif "image_size" in data_batch:
+            data_resolutions = []
             # Multi-item samples (transfer, SR) carry one image_size per vision item; the noise
             # schedule must follow the generated (last) item of each sample.
-            target_image_sizes = select_target_image_sizes(
-                data_batch["image_size"], gen_data_clean.num_vision_items_per_sample, gen_data_clean.batch_size
-            )
+            vision_counts = gen_data_clean.num_vision_items_per_sample
+            target_image_sizes: list[torch.Tensor | None]
+            if vision_counts is not None and any(count == 0 for count in vision_counts):
+                # Mixed batches can contain samples without vision. Select camera-bearing
+                # targets first, then restore the slots that use the configured resolution.
+                camera_counts = [count for count in vision_counts if count > 0]
+                camera_target_sizes = iter(
+                    select_target_image_sizes(data_batch["image_size"], camera_counts, len(camera_counts))
+                )
+                target_image_sizes = [next(camera_target_sizes) if count else None for count in vision_counts]
+            else:
+                target_image_sizes = select_target_image_sizes(
+                    data_batch["image_size"], vision_counts, gen_data_clean.batch_size
+                )
             for i in range(gen_data_clean.batch_size):
                 img_size = target_image_sizes[i]
+                if img_size is None:
+                    data_resolutions.append(self.config.resolution)
+                    continue
                 if img_size.dim() == 2:
                     img_size = img_size[0]
                 target_h = int(img_size[0].item())
@@ -1186,8 +1326,8 @@ class OmniMoTModel(ImaginaireModel):
         gen_data_clean_payload = {
             field.name: getattr(gen_data_clean, field.name) for field in dataclasses.fields(GenerationDataClean)
         }
-        # Raw pixels/audio/action/LiDAR are unused after tokenization; omit them from the CP cache.
-        for key in ("raw_state_vision", "raw_state_sound", "raw_state_action", "raw_state_lidar"):
+        # Raw pixels/audio/action/LiDAR/radar are unused after tokenization; omit them from the CP cache.
+        for key in ("raw_state_vision", "raw_state_sound", "raw_state_action", "raw_state_lidar", "raw_state_radar"):
             gen_data_clean_payload.pop(key)
         return {
             "input_text_indexes": input_text_indexes,
@@ -1325,6 +1465,19 @@ class OmniMoTModel(ImaginaireModel):
         # Sample a random noise level (sigma) and corresponding interpolation coefficient ("timesteps" in RF)
         # Apply shift per sample based on each sample's resolution
         num_vision_latent_frames = [x.shape[2] for x in gen_data_clean.x0_tokens_vision]
+        sample_is_image = getattr(gen_data_clean, "sample_is_image", None)
+        if sample_is_image is not None:
+            # Schedules belong to logical samples; multi-item controls/targets use
+            # the same sample schedule, expanded to items later in this method.
+            counts = gen_data_clean.num_vision_items_per_sample or [1] * gen_data_clean.batch_size
+            offset = 0
+            sample_tokens: list[int] = []
+            sample_frames: list[int] = []
+            for count in counts:
+                sample_tokens.append(sum(num_tokens_per_sample[offset : offset + count]))
+                sample_frames.append(max(num_vision_latent_frames[offset : offset + count], default=1))
+                offset += count
+            num_tokens_per_sample, num_vision_latent_frames = sample_tokens, sample_frames
         timesteps_vision, sigmas_vision = self._get_train_noise_level_vision(
             batch_size=gen_data_clean.batch_size,
             is_image_batch=gen_data_clean.is_image_batch,
@@ -1332,6 +1485,8 @@ class OmniMoTModel(ImaginaireModel):
             num_vision_latent_frames=num_vision_latent_frames,
             num_tokens=num_tokens_per_sample,
             iteration=iteration,
+            **({"sample_is_image": sample_is_image} if sample_is_image is not None else {}),
+            sequence_plans=sequence_plans,
         )  # [B, T_vis] each
 
         # Optional independent action schedule (sampled from rectified_flow_action with
@@ -1355,6 +1510,12 @@ class OmniMoTModel(ImaginaireModel):
             sigmas_action = sg_full[idx]  # [n_action, 1]
         else:
             timesteps_action, sigmas_action = (None, None)
+
+        if timesteps_action is None and sample_is_image is not None and action_sample_indices:
+            # The shared schedule remains indexed by logical sample before the
+            # vision-item expansion. Sparse actions need their own dense view.
+            timesteps_action = timesteps_vision[action_sample_indices]  # [N_action,T_vis]
+            sigmas_action = sigmas_vision[action_sample_indices]  # [N_action,T_vis]
 
         # Optional independent sound schedule: sample a scalar sound sigma per batch
         # slot, then reindex to the dense audio-bearing subset.
@@ -1415,7 +1576,7 @@ class OmniMoTModel(ImaginaireModel):
         # Under independent_action_schedule, overwrite the vision-based action timestep the
         # packer injected with the action timestep, so the denoiser's action timestep embedding
         # matches the sigma used to noise action tokens.
-        if timesteps_action is not None and packed_sequence.action is not None:
+        if rf_cfg.independent_action_schedule and timesteps_action is not None and packed_sequence.action is not None:
             action_has_noisy_tokens = any(nfi.numel() > 0 for nfi in packed_sequence.action.noisy_frame_indexes)
             if action_has_noisy_tokens:
                 sample_ts = timesteps_action.squeeze(1).cpu()  # [n_action]
@@ -1477,6 +1638,22 @@ class OmniMoTModel(ImaginaireModel):
         else:
             timesteps_lidar, sigmas_lidar = (None, None)
 
+        # Radar borrows the sample's vision clock on the same terms LiDAR does, and is
+        # likewise expanded before the vision rebinding below.
+        if gen_data_clean.num_radar_items_per_sample is not None:
+            assert timesteps_vision.shape[1] == 1, (
+                "Radar reuses the sample's vision timestep, which requires a single timestep per sample "
+                "(diffusion forcing is not supported for joint camera + radar batches)"
+            )
+            timesteps_radar = _expand_per_sample_to_per_vision_item(
+                timesteps_vision, gen_data_clean.num_radar_items_per_sample
+            )  # [B_radar_items, 1]
+            sigmas_radar = _expand_per_sample_to_per_vision_item(
+                sigmas_vision, gen_data_clean.num_radar_items_per_sample
+            )  # [B_radar_items, 1]
+        else:
+            timesteps_radar, sigmas_radar = (None, None)
+
         timesteps_vision = _expand_per_sample_to_per_vision_item(
             timesteps_vision, gen_data_clean.num_vision_items_per_sample
         )  # [B_items, T_vis]
@@ -1494,6 +1671,7 @@ class OmniMoTModel(ImaginaireModel):
             sigmas_action=sigmas_action,
             sigmas_sound=sigmas_sound,
             sigmas_lidar=sigmas_lidar,
+            sigmas_radar=sigmas_radar,
             iteration=iteration,
         )
         self._replace_clean_with_noised(packed_sequence, gen_data_noised)
@@ -1517,6 +1695,7 @@ class OmniMoTModel(ImaginaireModel):
             timesteps_action=timesteps_action,
             timesteps_sound=timesteps_sound,
             timesteps_lidar=timesteps_lidar,
+            timesteps_radar=timesteps_radar,
         )
 
         _vision_tokens = len(packed_sequence.vision.sequence_indexes) if packed_sequence.vision else 0
@@ -1546,6 +1725,17 @@ class OmniMoTModel(ImaginaireModel):
         }
         if sigmas_action is not None:
             output_batch["sigma_action"] = sigmas_action  # [n_action, 1] — dense over action-bearing samples
+        if sample_is_image is not None:
+            # Callback identity follows the CP-rotated payload, not this rank's
+            # raw loader batch, and is aligned with per-vision-item losses.
+            output_batch["vision_is_image"] = packed_sequence.vision_is_image
+            # Batch sizes count logical camera-bearing samples: multiple views or
+            # editing controls count once, and vision-less samples count as neither.
+            vision_sample_flags = [
+                is_image for is_image, plan in zip(sample_is_image, sequence_plans, strict=True) if plan.has_vision
+            ]
+            output_batch["image_batch_size"] = sum(vision_sample_flags)
+            output_batch["video_batch_size"] = len(vision_sample_flags) - output_batch["image_batch_size"]
         if getattr(rf_cfg, "independent_sound_schedule", False) and sigmas_sound is not None:
             output_batch["sigma_sound"] = sigmas_sound  # [n_sound, 1] — dense over sound-bearing samples
 
@@ -1644,41 +1834,6 @@ class OmniMoTModel(ImaginaireModel):
             return None, torch.distributed.get_world_size()
         return None, 1
 
-    def _sample_level_loss_scale(
-        self,
-        is_image_batch: bool,
-        num_samples: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Multiplier that converts rank-level to sample-level loss averaging.
-
-        A packed batch is homogeneous — either all image or all video (video may carry
-        accompanying action/audio) — with ``num_samples`` samples on this rank. Each
-        iteration the per-modality sample counts are all-reduced over the data-parallel
-        group to get the global totals ``N_image`` / ``N_video``, and this rank's batch is
-        scaled by ``group_size * num_samples / N_modality``.
-
-        Applied to the whole ``total_loss`` (video + action + audio for video batches),
-        this scales every term by the same factor, so the video/action/audio balance set
-        by ``loss_scale`` / ``action_loss_weight`` / ``sound_loss_scale`` is preserved,
-        while the effective objective becomes a per-sample mean. The base per-modality
-        weight already baked into ``total_loss`` (``loss_scale`` for video, ``image_loss_scale``
-        for image) cancels out of this multiplier, so it does not appear here. The
-        ``group_size`` factor cancels the framework's ``1/group_size`` gradient averaging;
-        for balanced batches (``num_samples ≈ N/group_size``) the scale is ≈ 1, so logged
-        loss magnitudes stay comparable to rank-level averaging.
-        """
-        dp_group, group_size = self._loss_averaging_group()
-
-        # counts = [num_local_image_samples, num_local_video_samples]; exactly one is non-zero.
-        counts = torch.zeros(2, dtype=torch.float64, device=device)
-        counts[0 if is_image_batch else 1] = float(num_samples)
-        if group_size > 1:
-            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM, group=dp_group)
-
-        global_num_samples = (counts[0] if is_image_batch else counts[1]).clamp(min=1.0)
-        return (group_size * num_samples) / global_num_samples
-
     def _compute_losses(
         self,
         out_net: dict,
@@ -1689,6 +1844,7 @@ class OmniMoTModel(ImaginaireModel):
         timesteps_action: torch.Tensor | None = None,
         timesteps_sound: torch.Tensor | None = None,
         timesteps_lidar: torch.Tensor | None = None,
+        timesteps_radar: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute flow matching loss and auxiliary load balancing losses.
 
@@ -1709,7 +1865,30 @@ class OmniMoTModel(ImaginaireModel):
 
         rf_cfg = self.config.rectified_flow_training_config
         normalize_by_active = rf_cfg.normalize_loss_by_active
-        exclude_fully_conditioned_items = self.config.causal_training_strategy == "teacher_forcing"
+        exclude_fully_conditioned_items = rf_cfg.exclude_fully_conditioned_items
+        if exclude_fully_conditioned_items is None:
+            exclude_fully_conditioned_items = (
+                getattr(self.config, "causal_training_strategy", None) == "teacher_forcing"
+            )
+        # CP gather gradient correction is independent of loss reduction;
+        # disabling it preserves legacy gradient scaling for ablations.
+        use_global_sample_mean = rf_cfg.loss_reduction_mode == "global_sample_mean"
+        vision_flags = getattr(data_batch_packed, "vision_is_image", None)
+        use_vision_item_weights = not use_global_sample_mean and bool(vision_flags)
+        enabled_streams = {
+            "vision": self.config.vision_gen,
+            "action": self.config.action_gen,
+            "sound": self.config.sound_gen,
+            "lidar": self.config.vision_gen and self.config.lidar_state_ch is not None,
+            "radar": self.config.vision_gen and self.config.radar_state_ch is not None,
+        }
+        item_losses = (
+            {name: FlowMatchingLossItems() for name, enabled in enabled_streams.items() if enabled}
+            if use_global_sample_mean
+            else {}
+        )
+        if use_vision_item_weights:
+            item_losses["vision"] = FlowMatchingLossItems()
         if self.config.vision_gen:
             # Only a batch that generates no camera stream, as the LiDAR-only recipe does, may
             # arrive with vision unpacked; for anything else that would silently sink the vision
@@ -1718,13 +1897,18 @@ class OmniMoTModel(ImaginaireModel):
                 "Vision packed data required when the batch carries camera items"
             )
             rectified_flow_vision = self.rectified_flow_image if is_image_batch else self.rectified_flow_video
+            if vision_flags:
+                rectified_flow_vision = [
+                    self.rectified_flow_image if flag else self.rectified_flow_video for flag in vision_flags
+                ]
 
             # With no camera stream there are no noisy vision tokens, so this returns its dummy
             # loss over the network's zero-weighted vision predictions. That is what keeps
             # vae2llm and llm2vae in the backward graph on every rank, which FSDP requires.
             # Transfer teacher forcing flattens clean controls and the generated target into
-            # one vision-item list. Keep the per-item vector aligned for logging, but do not
-            # let zero-loss controls dilute the scalar training objective.
+            # one vision-item list. Keep the per-item vector aligned for logging. By default,
+            # zero-loss controls do not dilute TF's scalar objective; an explicit item-mean
+            # override can instead retain them to match the bidirectional initializer.
             fm_loss_vision, fm_loss_vision_per_instance = compute_flow_matching_loss(
                 pred=out_net["preds_vision"],
                 target=gen_data_noised.vt_target_vision,
@@ -1735,11 +1919,33 @@ class OmniMoTModel(ImaginaireModel):
                 tensor_kwargs_fp32=self.tensor_kwargs_fp32,
                 normalize_by_active=normalize_by_active,
                 exclude_fully_conditioned_items=exclude_fully_conditioned_items,
+                item_losses=item_losses.get("vision"),
             )
-            loss_scale = (
-                rf_cfg.image_loss_scale if is_image_batch and rf_cfg.image_loss_scale is not None else rf_cfg.loss_scale
-            )
-            total_loss += fm_loss_vision * loss_scale  # []
+            if use_vision_item_weights:
+                # Keep legacy rank-level averaging across all local vision items,
+                # applying each item's image/video scale before taking the mean.
+                # Vision-less samples must not change the weight of neighboring images.
+                vision_losses = item_losses["vision"].weighted_losses  # [N_vision] or None
+                valid_vision = item_losses["vision"].valid  # [N_vision] or None
+                assert vision_losses is not None and valid_vision is not None
+                vision_scales = vision_losses.new_tensor(
+                    [
+                        rf_cfg.image_loss_scale if flag and rf_cfg.image_loss_scale is not None else rf_cfg.loss_scale
+                        for flag in vision_flags
+                    ]
+                )  # [N_vision]
+                scaled_vision_losses = vision_losses * vision_scales  # [N_vision]
+                if exclude_fully_conditioned_items:
+                    total_loss += (scaled_vision_losses * valid_vision).sum() / valid_vision.sum().clamp(min=1)  # []
+                else:
+                    total_loss += scaled_vision_losses.mean()  # []
+            else:
+                loss_scale = (
+                    rf_cfg.image_loss_scale
+                    if is_image_batch and rf_cfg.image_loss_scale is not None
+                    else rf_cfg.loss_scale
+                )
+                total_loss += fm_loss_vision * loss_scale  # []
             losses_dict["flow_matching_loss_vision"] = fm_loss_vision  # []
             losses_dict["flow_matching_loss_vision_per_instance"] = fm_loss_vision_per_instance  # [N]
         else:
@@ -1753,8 +1959,8 @@ class OmniMoTModel(ImaginaireModel):
                     "LiDAR condition mask must be a list of tensors for loss computation"
                 )
                 assert gen_data_noised.vt_target_lidar is not None, "LiDAR targets required when the batch has LiDAR"
-                # Match vision teacher forcing's target-item normalization. Clean HD-map
-                # controls must not dilute the LiDAR mean and change the sensor loss mix.
+                # Match vision's configured item normalization. Apply the same inclusion
+                # rule to clean HD-map controls so the sensor loss mix remains consistent.
                 fm_loss_lidar, _ = compute_flow_matching_loss(
                     pred=out_net["preds_lidar"],
                     target=gen_data_noised.vt_target_lidar,
@@ -1765,6 +1971,7 @@ class OmniMoTModel(ImaginaireModel):
                     tensor_kwargs_fp32=self.tensor_kwargs_fp32,
                     normalize_by_active=normalize_by_active,
                     exclude_fully_conditioned_items=exclude_fully_conditioned_items,
+                    item_losses=item_losses.get("lidar"),
                 )
                 lidar_loss_scale = rf_cfg.lidar_loss_scale if rf_cfg.lidar_loss_scale is not None else rf_cfg.loss_scale
                 total_loss += fm_loss_lidar * lidar_loss_scale  # []
@@ -1788,6 +1995,41 @@ class OmniMoTModel(ImaginaireModel):
                 dummy_loss = 0.0 * sum(p.sum() for p in preds_lidar)  # []
                 total_loss += dummy_loss  # []
                 losses_dict["flow_matching_loss_lidar"] = dummy_loss  # []
+
+        # Same condition the network builds its radar projections under, so the two cannot
+        # disagree about whether this run has a radar stream to supervise.
+        if self.config.vision_gen and self.config.radar_state_ch is not None:
+            if data_batch_packed.radar is not None:
+                assert isinstance(data_batch_packed.radar.condition_mask, list), (
+                    "Radar condition mask must be a list of tensors for loss computation"
+                )
+                assert gen_data_noised.vt_target_radar is not None, "Radar targets required when the batch has radar"
+                fm_loss_radar, _ = compute_flow_matching_loss(
+                    pred=out_net["preds_radar"],
+                    target=gen_data_noised.vt_target_radar,
+                    condition_mask=data_batch_packed.radar.condition_mask,
+                    timesteps=timesteps_radar if timesteps_radar is not None else timesteps,
+                    has_valid_tokens=has_noisy_tokens(data_batch_packed.radar),
+                    rectified_flow=self.rectified_flow_video,
+                    tensor_kwargs_fp32=self.tensor_kwargs_fp32,
+                    normalize_by_active=normalize_by_active,
+                    item_losses=item_losses.get("radar"),
+                )
+                radar_loss_scale = rf_cfg.radar_loss_scale if rf_cfg.radar_loss_scale is not None else rf_cfg.loss_scale
+                total_loss += fm_loss_radar * radar_loss_scale  # []
+                losses_dict["flow_matching_loss_radar"] = fm_loss_radar  # []
+            else:
+                # No radar data in this batch. Connect the network's dummy preds_radar to the
+                # loss so radar2llm / llm2radar stay in the backward graph, for the reason
+                # spelled out for LiDAR above.
+                preds_radar = out_net["preds_radar"]
+                assert preds_radar, (
+                    "preds_radar must carry the network's zero-weighted probe so radar2llm / "
+                    "llm2radar stay in the backward graph on a batch with no radar"
+                )
+                dummy_loss = 0.0 * sum(p.sum() for p in preds_radar)  # []
+                total_loss += dummy_loss  # []
+                losses_dict["flow_matching_loss_radar"] = dummy_loss  # []
 
         if self.config.action_gen:
             if data_batch_packed.action is not None:
@@ -1816,6 +2058,7 @@ class OmniMoTModel(ImaginaireModel):
                     action_valid_mask=data_batch_packed.action.action_valid_mask,
                     normalize_by_active=normalize_by_active,
                     action_slot_stats=action_slot_stats,
+                    item_losses=item_losses.get("action"),
                 )
 
                 # Yihuai: In case the video loss is too large (1.5) and covers the action loss (0.05), we scale up the action loss to match the video loss to improve action precision.
@@ -1851,6 +2094,8 @@ class OmniMoTModel(ImaginaireModel):
                     rectified_flow=self.rectified_flow_sound,
                     tensor_kwargs_fp32=self.tensor_kwargs_fp32,
                     normalize_by_active=normalize_by_active,
+                    item_losses=item_losses.get("sound"),
+                    time_axis=1 if use_global_sample_mean else 0,
                 )
                 loss_scale = rf_cfg.sound_loss_scale if rf_cfg.sound_loss_scale is not None else rf_cfg.loss_scale
                 total_loss += fm_loss_sound * loss_scale
@@ -1866,19 +2111,38 @@ class OmniMoTModel(ImaginaireModel):
         else:
             losses_dict["flow_matching_loss_sound"] = torch.tensor(0.0, **self.tensor_kwargs_fp32)
 
-        # Sample-level (vs rank-level) loss averaging. Scale the whole batch loss
-        # (vision + accompanying action/audio for video batches) by one factor so every
-        # image / video sample contributes equally across the data-parallel group. Applied
-        # here — after all flow-matching terms, before load balancing — so the video/action/
-        # audio balance is preserved and the auxiliary load-balancing losses stay unscaled.
-        if rf_cfg.sample_level_loss_averaging and self.config.vision_gen:
-            num_samples = len(out_net["preds_vision"])
-            sample_level_scale = self._sample_level_loss_scale(
+        # Sample-level (vs rank-level) loss averaging. Normalize each supervised
+        # modality by its own global sample count so sparse action/audio samples
+        # do not inherit the image/video denominator. Apply this after all flow-matching
+        # terms, before load balancing, preserving configured modality weights and
+        # leaving auxiliary load-balancing losses unscaled.
+        if use_global_sample_mean:
+            # This opt-in policy normalizes contributing logical samples per modality
+            # over the gradient-averaging group, within this microbatch only. The
+            # collector exposes weighted training losses, not unweighted logging
+            # values. Clean/invalid items and absent modalities add no sample count.
+            # Fixed modality weights are summed without renormalizing; the trainer's
+            # accumulation averaging and the auxiliary terms below are unchanged.
+            group, group_size = self._loss_averaging_group()
+            modality_items = build_modality_loss_items(
+                item_losses,
+                out_net,
+                data_batch_packed.modality_sample_ids,
+                vision_is_image=vision_flags,
                 is_image_batch=is_image_batch,
-                num_samples=num_samples,
-                device=self.tensor_kwargs_fp32["device"],
             )
-            total_loss = total_loss * sample_level_scale.to(dtype=total_loss.dtype)
+            weights = {
+                "image": rf_cfg.image_loss_scale if rf_cfg.image_loss_scale is not None else rf_cfg.loss_scale,
+                "video": rf_cfg.loss_scale,
+                "action": rf_cfg.action_loss_weight,
+                "sound": rf_cfg.sound_loss_scale if rf_cfg.sound_loss_scale is not None else rf_cfg.loss_scale,
+                "lidar": rf_cfg.lidar_loss_scale if rf_cfg.lidar_loss_scale is not None else rf_cfg.loss_scale,
+                "radar": rf_cfg.radar_loss_scale if rf_cfg.radar_loss_scale is not None else rf_cfg.loss_scale,
+            }
+            total_loss, modality_means = reduce_global_modality_means(
+                modality_items, weights, group=group, gradient_average_size=group_size
+            )
+            losses_dict.update({f"global_sample_loss_{name}": value for name, value in modality_means.items()})
 
         # 2. Load balancing auxiliary losses
         device_mesh, context_parallel_mesh = self._get_load_balancing_loss_meshes()
@@ -1903,7 +2167,11 @@ class OmniMoTModel(ImaginaireModel):
         """Update sample counters from a processed ``GenerationDataClean`` payload."""
         if not isinstance(self.net, WeightTrainingStat):
             return
-        if gen_data_clean.is_image_batch:
+        if gen_data_clean.sample_is_image is not None:
+            image_count = sum(gen_data_clean.sample_is_image)
+            self.net.accum_image_sample_counter += image_count
+            self.net.accum_video_sample_counter += gen_data_clean.batch_size - image_count
+        elif gen_data_clean.is_image_batch:
             self.net.accum_image_sample_counter += gen_data_clean.batch_size
         else:
             self.net.accum_video_sample_counter += gen_data_clean.batch_size
@@ -1968,6 +2236,8 @@ class OmniMoTModel(ImaginaireModel):
                 f"has {len(sequence_plans)} sequence plans."
             )
         for sample_idx, (caption_lengths, plan) in enumerate(zip(caption_lengths_per_sample, sequence_plans)):
+            if caption_lengths is None:
+                continue
             num_captions = len(caption_lengths)
             if num_captions < 1:
                 raise ValueError(f"Sample {sample_idx} carries no per-view caption.")
@@ -2002,6 +2272,8 @@ class OmniMoTModel(ImaginaireModel):
         resolutions: list[str] | str | None = None,
         num_tokens: list[int] | None = None,
         iteration: int | None = None,
+        sample_is_image: list[bool] | None = None,
+        sequence_plans: list[SequencePlan] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Sample the rectified flow interpolation coefficient (timesteps) and obtain the corresponding
@@ -2018,10 +2290,43 @@ class OmniMoTModel(ImaginaireModel):
                          Can be a single string (applied to all samples) or a list of strings (one per sample).
                          If None, defaults to self.config.resolution (can be used for other modalities).
             num_tokens: Number of tokens for each sample (before 2x2 merge). Needed for dynamic shift.
+            sample_is_image: Per-sample image identities for mixed image/video schedules.
+            sequence_plans: Effective per-sample modality metadata after CP input selection.
+                Batches with LiDAR and no RGB use shift_lidar when configured. RGB and joint
+                RGB/LiDAR batches share the vision schedule. None retains the vision schedule.
 
         Returns:
             (timesteps, sigmas): Both [B,1] for TF/base, or [B,T_max] for diffusion_forcing.
         """
+
+        if sample_is_image is not None:
+            if len(sample_is_image) != batch_size:
+                raise ValueError("Image identities must match the logical batch size.")
+            if all(sample_is_image) or not any(sample_is_image):
+                is_image_batch = all(sample_is_image)
+            else:
+                # Homogeneous inputs retain the original sampling call and RNG order.
+                # A mixed input draws each modality's own schedule and restores sample order.
+                schedules: list[tuple[list[int], torch.Tensor, torch.Tensor]] = []
+                for image_flag in (True, False):
+                    indexes = [i for i, flag in enumerate(sample_is_image) if flag == image_flag]
+                    times, noise = self._get_train_noise_level_vision(
+                        len(indexes),
+                        image_flag,
+                        [num_vision_latent_frames[i] for i in indexes],
+                        resolutions=[resolutions[i] for i in indexes] if isinstance(resolutions, list) else resolutions,
+                        num_tokens=[num_tokens[i] for i in indexes] if num_tokens is not None else None,
+                        iteration=iteration,
+                        sequence_plans=[sequence_plans[i] for i in indexes] if sequence_plans is not None else None,
+                    )  # [N,T_modality] each
+                    schedules.append((indexes, times, noise))
+                width = max(times.shape[1] for _, times, _ in schedules)
+                timesteps = schedules[0][1].new_zeros((batch_size, width))  # [B,T_max]
+                sigmas = torch.zeros_like(timesteps)  # [B,T_max]
+                for indexes, times, noise in schedules:
+                    timesteps[indexes, : times.shape[1]] = times  # [N,T_modality]
+                    sigmas[indexes, : noise.shape[1]] = noise  # [N,T_modality]
+                return timesteps, sigmas
 
         rectified_flow = self.rectified_flow_image if is_image_batch else self.rectified_flow_video
 
@@ -2035,6 +2340,14 @@ class OmniMoTModel(ImaginaireModel):
         rf_config = self.config.rectified_flow_training_config
         shift_image = getattr(rf_config, "shift_image", None)
         shift_config = shift_image if is_image_batch and shift_image is not None else rf_config.shift
+        if (
+            sequence_plans
+            and getattr(rf_config, "shift_lidar", None) is not None
+            and all(plan.has_lidar and not plan.has_vision for plan in sequence_plans)
+        ):
+            shift_config = rf_config.shift_lidar
+            if not isinstance(shift_config, int) or shift_config <= 0:
+                raise ValueError("shift_lidar must be a positive integer")
         if isinstance(shift_config, int):
             # Int-based shift: use directly for all samples
             shifts = torch.full((batch_size,), shift_config, dtype=torch.float32)
@@ -2191,6 +2504,7 @@ class OmniMoTModel(ImaginaireModel):
         sigmas_action: torch.Tensor | None = None,
         sigmas_sound: torch.Tensor | None = None,
         sigmas_lidar: torch.Tensor | None = None,
+        sigmas_radar: torch.Tensor | None = None,
         iteration: int | None = None,
     ) -> GenerationDataNoised:
         """
@@ -2214,6 +2528,8 @@ class OmniMoTModel(ImaginaireModel):
             sigmas_lidar: ``[n_lidar_items, 1]`` sigma per LiDAR item, required when the batch
                 carries LiDAR. Rows are the owning sample's vision sigma so both sensors are
                 noised at the same point on the flow.
+            sigmas_radar: ``[n_radar_items, 1]`` sigma per radar item, required when the batch
+                carries radar. Read exactly as ``sigmas_lidar``.
 
         Returns:
             GenerationDataNoised: A dataclass containing the noise, noisy data (xt), and velocity field (vt).
@@ -2261,6 +2577,8 @@ class OmniMoTModel(ImaginaireModel):
         sigmas_vision = [
             sigmas[i].view(-1, 1, 1)[: x0_vision[i].shape[2]] * noisy_mask_vision[i] for i in range(num_vision_items)
         ]
+        # Image/video interpolation has the same linear equation; modality-specific
+        # distributions and weights are selected in scheduling and loss computation.
         rectified_flow_vision = (
             self.rectified_flow_image if gen_data_clean.is_image_batch else self.rectified_flow_video
         )
@@ -2296,6 +2614,31 @@ class OmniMoTModel(ImaginaireModel):
             sigmas_lidar_list = None
             xt_lidar = None
             vt_lidar = None
+
+        # Radar: same rectified flow as video, on its own BEV grid latents.
+        x0_radar = gen_data_clean.x0_tokens_radar  # list of [C,T,H,W]
+        if x0_radar is not None and len(x0_radar) > 0:
+            assert packed_sequence.radar is not None, "Packed radar data required when radar tokens exist"
+            assert isinstance(packed_sequence.radar.condition_mask, list), (
+                "Radar condition mask must be a list of tensors for noise scheduling"
+            )
+            assert sigmas_radar is not None, "sigmas_radar required when radar tokens exist"
+            epsilon_radar = [
+                torch.randn(x0_i.size(), generator=noise_gen, **self.tensor_kwargs_fp32) for x0_i in x0_radar
+            ]  # list of [C,T,H,W]
+            context_parallel_broadcast_tensor_list(epsilon_radar, self.parallel_dims)
+            # sigmas_radar[i] is (1,) → view (1,1,1), broadcast against condition_mask [T,1,1].
+            sigmas_radar_list = [
+                sigmas_radar[i].view(-1, 1, 1) * (1.0 - packed_sequence.radar.condition_mask[i])
+                for i in range(len(x0_radar))
+            ]  # list of [T,1,1]
+            xt_radar, vt_radar = self.rectified_flow_video.get_interpolation(epsilon_radar, x0_radar, sigmas_radar_list)
+            xt_radar = [xt_i.to(**self.tensor_kwargs) for xt_i in xt_radar]  # list of [C,T,H,W]
+        else:
+            epsilon_radar = None
+            sigmas_radar_list = None
+            xt_radar = None
+            vt_radar = None
 
         # Action (x0_tokens_action is already a dense list with no None entries).
         # Gate on action_gen: the dataset may emit action tensors for models that
@@ -2404,6 +2747,11 @@ class OmniMoTModel(ImaginaireModel):
             xt_tokens_lidar=xt_lidar,
             vt_target_lidar=vt_lidar,
             sigmas_lidar=sigmas_lidar_list,
+            # radar
+            epsilon_radar=epsilon_radar,
+            xt_tokens_radar=xt_radar,
+            vt_target_radar=vt_radar,
+            sigmas_radar=sigmas_radar_list,
             # action
             epsilon_action=epsilon_action,
             xt_tokens_action=xt_action,
@@ -2430,6 +2778,8 @@ class OmniMoTModel(ImaginaireModel):
             packed_sequence.vision.tokens = gen_data_noised.xt_tokens_vision
         if packed_sequence.lidar is not None and gen_data_noised.xt_tokens_lidar is not None:
             packed_sequence.lidar.tokens = gen_data_noised.xt_tokens_lidar
+        if packed_sequence.radar is not None and gen_data_noised.xt_tokens_radar is not None:
+            packed_sequence.radar.tokens = gen_data_noised.xt_tokens_radar
         if packed_sequence.action is not None and gen_data_noised.xt_tokens_action is not None:
             action_all_conditioning = all(
                 torch.all(condition_mask == 1).item() for condition_mask in packed_sequence.action.condition_mask
@@ -2566,6 +2916,9 @@ class OmniMoTModel(ImaginaireModel):
                   callers must thread it to _get_velocity so both sides split the
                   flat state identically.
         """
+        normalize_vision_batch_inplace(
+            data_batch, video_key=self.input_video_key, tensor_kwargs_fp32=getattr(self, "tensor_kwargs_fp32", {})
+        )
         # 1. Build sequence plans (same as training)
         sequence_plans = build_sequence_plans_from_data_batch(
             data_batch=data_batch,
@@ -2638,6 +2991,10 @@ class OmniMoTModel(ImaginaireModel):
             seed_dict["vision"].extend([seed[sample_idx]] * num_vision_items)
             seed_dict["action"].append(seed[sample_idx])
             seed_dict["sound"].append(seed[sample_idx])
+        if gen_data_clean.action_sample_ids is not None:
+            seed_dict["action"] = [seed[index] for index in gen_data_clean.action_sample_ids]
+        if gen_data_clean.sound_sample_ids is not None:
+            seed_dict["sound"] = [seed[index] for index in gen_data_clean.sound_sample_ids]
 
         # Generate noise and apply conditioning per vision item (supports variable shapes).
         # Noise and the conditioning blend are kept in fp32 so the sampler accumulates
@@ -2662,7 +3019,17 @@ class OmniMoTModel(ImaginaireModel):
             assert packed_sequence.lidar is not None, "Packed LiDAR data required when the batch carries LiDAR"
             assert isinstance(packed_sequence.lidar.condition_mask, list), "LiDAR condition mask required"
             lidar_counts = gen_data_clean.num_lidar_items_per_sample or [1] * n_sample
-            seed_lidar = [seed[sample_idx] for sample_idx, count in enumerate(lidar_counts) for _ in range(count)]
+            # arch_invariant_rand restarts its RNG on every call. Joint RGB/LiDAR
+            # therefore need distinct streams, even when their tensor shapes differ.
+            # Derive from sample identity, never batch position or distributed rank;
+            # preserve existing RGB noise and standalone LiDAR reproducibility.
+            seed_lidar = [
+                int(np.random.SeedSequence([seed[sample_idx], _LIDAR_NOISE_DOMAIN_TAG, item_idx]).generate_state(1)[0])
+                if sequence_plans[sample_idx].has_vision
+                else seed[sample_idx]
+                for sample_idx, count in enumerate(lidar_counts)
+                for item_idx in range(count)
+            ]
             noise_lidar_list = []
             for i, (x0_token, cond_mask) in enumerate(
                 zip(gen_data_clean.x0_tokens_lidar, packed_sequence.lidar.condition_mask, strict=True)
@@ -2674,6 +3041,25 @@ class OmniMoTModel(ImaginaireModel):
                     seed_lidar[i],
                 )  # [C,T,H,W]
                 noise_lidar_list.append(cond_mask * x0_token + (1.0 - cond_mask) * pure_noise_i)  # [C,T,H,W]
+
+        # 5c. Initialize radar noise the same way, from its own stream's condition masks.
+        noise_radar_list: list[torch.Tensor] | None = None
+        if gen_data_clean.x0_tokens_radar is not None:
+            assert packed_sequence.radar is not None, "Packed radar data required when the batch carries radar"
+            assert isinstance(packed_sequence.radar.condition_mask, list), "Radar condition mask required"
+            radar_counts = gen_data_clean.num_radar_items_per_sample or [1] * n_sample
+            seed_radar = [seed[sample_idx] for sample_idx, count in enumerate(radar_counts) for _ in range(count)]
+            noise_radar_list = []
+            for i, (x0_token, cond_mask) in enumerate(
+                zip(gen_data_clean.x0_tokens_radar, packed_sequence.radar.condition_mask, strict=True)
+            ):
+                pure_noise_i = misc.arch_invariant_rand(
+                    tuple(x0_token.shape),
+                    self.tensor_kwargs_fp32["dtype"],
+                    self.tensor_kwargs_fp32["device"],
+                    seed_radar[i],
+                )  # [C,T,H,W]
+                noise_radar_list.append(cond_mask * x0_token + (1.0 - cond_mask) * pure_noise_i)  # [C,T,H,W]
 
         # 6. Initialize action noise if action_gen is True
         has_action = self.config.action_gen and any(plan.has_action for plan in sequence_plans)
@@ -2749,9 +3135,9 @@ class OmniMoTModel(ImaginaireModel):
                 )  # [sound_channels,T_sound]
                 noise_sound_list.append(noise_sound_i)
 
-        # 8. Concatenate vision, LiDAR, action, and sound noise per sample (flattened)
-        # Order: [vision | lidar (if present) | action (if present) | sound (if present)],
-        # matching the order the packer lays a sample out in.
+        # 8. Concatenate vision, LiDAR, radar, action, and sound noise per sample (flattened)
+        # Order: [vision | lidar (if present) | radar (if present) | action (if present) |
+        # sound (if present)], matching the order the packer lays a sample out in.
         # noise_action_list and noise_sound_list are dense (only modality-having samples),
         # so we use separate indexes.
         initial_noise: list[torch.Tensor] = []
@@ -2759,6 +3145,7 @@ class OmniMoTModel(ImaginaireModel):
         condition_mask: list[torch.Tensor] = []
         idx_vision = 0
         idx_lidar = 0
+        idx_radar = 0
         idx_action = 0
         idx_sound = 0
 
@@ -2792,6 +3179,20 @@ class OmniMoTModel(ImaginaireModel):
                     condition_reference_parts.append(x0_lidar.reshape(-1))  # [N_lidar]
                     condition_mask_parts.append((mask_lidar * torch.ones_like(x0_lidar)).reshape(-1))  # [N_lidar]
                     idx_lidar += 1
+
+            if noise_radar_list is not None and sequence_plans[i].has_radar:
+                assert packed_sequence.radar is not None
+                assert gen_data_clean.x0_tokens_radar is not None
+                radar_counts = gen_data_clean.num_radar_items_per_sample
+                for _ in range(radar_counts[i] if radar_counts is not None else 1):
+                    parts.append(noise_radar_list[idx_radar].reshape(-1))
+                    x0_radar = gen_data_clean.x0_tokens_radar[idx_radar]  # [C,T,H,W]
+                    mask_radar = packed_sequence.radar.condition_mask[idx_radar].to(  # [T,1,1]
+                        dtype=x0_radar.dtype, device=x0_radar.device
+                    )
+                    condition_reference_parts.append(x0_radar.reshape(-1))  # [N_radar]
+                    condition_mask_parts.append((mask_radar * torch.ones_like(x0_radar)).reshape(-1))  # [N_radar]
+                    idx_radar += 1
 
             if noise_action_list is not None and sequence_plans[i].has_action:
                 assert packed_sequence.action is not None
@@ -2869,7 +3270,7 @@ class OmniMoTModel(ImaginaireModel):
         ):
             raise TypeError(f"{INFERENCE_RAW_VISION_RETAINED_ITEMS_KEY} must be a list of CPU vision tensors.")
 
-        media_key = self.input_image_key if gen_data_clean.is_image_batch else self.input_video_key
+        media_key = self.input_image_key if self.input_image_key in data_batch else self.input_video_key
         raw_items = data_batch.get(media_key)
         if not isinstance(raw_items, list):
             raise TypeError(f"Expected data_batch[{media_key!r}] to be a list before releasing raw vision tensors.")
@@ -2946,6 +3347,7 @@ class OmniMoTModel(ImaginaireModel):
         packed_sequence: PackedSequence,
         noise_x_vision: list[torch.Tensor],
         noise_x_lidar: list[torch.Tensor] | None,
+        noise_x_radar: list[torch.Tensor] | None,
         noise_x_action: list[torch.Tensor] | None,
         noise_x_sound: list[torch.Tensor] | None,
         timestep: torch.Tensor,
@@ -2959,6 +3361,11 @@ class OmniMoTModel(ImaginaireModel):
             assert packed_sequence.lidar is not None, "packed_sequence.lidar must exist when LiDAR noise is present"
             packed_sequence.lidar.tokens = [x.to(**self.tensor_kwargs) for x in noise_x_lidar]  # list[[C,T,H,W]]
             self._copy_timestep_to_template(packed_sequence.lidar.timesteps, timestep)
+
+        if noise_x_radar is not None:
+            assert packed_sequence.radar is not None, "packed_sequence.radar must exist when radar noise is present"
+            packed_sequence.radar.tokens = [x.to(**self.tensor_kwargs) for x in noise_x_radar]  # list[[C,T,H,W]]
+            self._copy_timestep_to_template(packed_sequence.radar.timesteps, timestep)
 
         if noise_x_action is not None:
             assert packed_sequence.action is not None, "packed_sequence.action must exist when action noise is present"
@@ -3002,6 +3409,8 @@ class OmniMoTModel(ImaginaireModel):
                 kwargs[field.name] = val * 2
             elif field.name == "is_image_batch":
                 kwargs[field.name] = val
+            elif field.name in {"action_sample_ids", "sound_sample_ids"} and val is not None:
+                kwargs[field.name] = val + [index + gd.batch_size for index in val]
             else:
                 kwargs[field.name] = _dup(val)
         return GenerationDataClean(**kwargs)
@@ -3061,16 +3470,21 @@ class OmniMoTModel(ImaginaireModel):
         has_lidar = gen_data_clean.x0_tokens_lidar is not None
         num_lidar_items = gen_data_clean.num_lidar_items_per_sample
 
-        # Split flattened noise_x into vision, LiDAR, action, and sound parts per sample
+        has_radar = gen_data_clean.x0_tokens_radar is not None
+        num_radar_items = gen_data_clean.num_radar_items_per_sample
+
+        # Split flattened noise_x into vision, LiDAR, radar, action, and sound parts per sample
         # Order must match _prepare_inference_data:
-        # [vision | lidar (if present) | action (if present) | sound (if present)]
+        # [vision | lidar (if present) | radar (if present) | action (if present) | sound (if present)]
         noise_x_vision: list[torch.Tensor] = []
         noise_x_lidar: list[torch.Tensor] | None = [] if has_lidar else None
+        noise_x_radar: list[torch.Tensor] | None = [] if has_radar else None
         noise_x_action: list[torch.Tensor] | None = [] if has_noisy_actions else None
         noise_x_sound: list[torch.Tensor] | None = [] if has_sound else None
 
         vision_offset = 0  # tracks position in the flat x0_tokens_vision list
         lidar_offset = 0  # tracks position in the flat x0_tokens_lidar list
+        radar_offset = 0  # tracks position in the flat x0_tokens_radar list
         idx_action = 0
         idx_sound = 0
         for i in range(n_samples):
@@ -3092,6 +3506,15 @@ class OmniMoTModel(ImaginaireModel):
                     noise_x_lidar.append(noise_x[i][offset : offset + lidar_dim].reshape(lidar_shape))
                     offset += lidar_dim
                 lidar_offset += n_lidar
+
+            if noise_x_radar is not None and sequence_plans[i].has_radar:
+                n_radar = num_radar_items[i] if num_radar_items is not None else 1
+                for j in range(n_radar):
+                    radar_shape = gen_data_clean.x0_tokens_radar[radar_offset + j].shape
+                    radar_dim = int(torch.prod(torch.tensor(radar_shape)))
+                    noise_x_radar.append(noise_x[i][offset : offset + radar_dim].reshape(radar_shape))
+                    offset += radar_dim
+                radar_offset += n_radar
 
             if has_noisy_actions and noise_x_action is not None and sequence_plans[i].has_action:
                 assert gen_data_clean.x0_tokens_action is not None
@@ -3134,22 +3557,33 @@ class OmniMoTModel(ImaginaireModel):
             fps_action=gen_data_clean.fps_action if has_action else None,
             raw_action_dim=gen_data_clean.raw_action_dim if has_action else None,
             action_valid_mask=gen_data_clean.action_valid_mask if has_action else None,
+            num_views_per_action_item=gen_data_clean.num_views_per_action_item if has_action else None,
             # Sound fields
             raw_state_sound=gen_data_clean.raw_state_sound if has_sound else None,
             x0_tokens_sound=noise_x_sound if has_sound else None,
             fps_sound=gen_data_clean.fps_sound if has_sound else None,
             num_vision_items_per_sample=num_items,
             num_views_per_vision_item=gen_data_clean.num_views_per_vision_item,
+            vision_view_ids=gen_data_clean.vision_view_ids,
             # LiDAR fields
             raw_state_lidar=gen_data_clean.raw_state_lidar,
             x0_tokens_lidar=noise_x_lidar if has_lidar else None,
             fps_lidar=gen_data_clean.fps_lidar,
             num_lidar_items_per_sample=num_lidar_items,
+            # Radar fields
+            raw_state_radar=gen_data_clean.raw_state_radar,
+            x0_tokens_radar=noise_x_radar if has_radar else None,
+            fps_radar=gen_data_clean.fps_radar,
+            num_radar_items_per_sample=num_radar_items,
             # Multi-control transfer: carry per-control weights so the packer can
             # populate vision_item_split_lens / control_weights on the packed
             # sequence. Without this, multi_control_two_way_attention never runs
             # and all controls are blended equally (weights ignored).
             control_weights=gen_data_clean.control_weights,
+            sample_is_image=gen_data_clean.sample_is_image,
+            action_sample_ids=gen_data_clean.action_sample_ids,
+            sound_sample_ids=gen_data_clean.sound_sample_ids,
+            action_family=gen_data_clean.action_family,
         )
 
         if packed_sequence_template is None:
@@ -3170,6 +3604,10 @@ class OmniMoTModel(ImaginaireModel):
                 assert packed_sequence.lidar is not None, "packed_sequence.lidar must exist when the batch has LiDAR"
                 packed_sequence.lidar.tokens = [x.to(**self.tensor_kwargs) for x in noise_x_lidar]  # list[[C,T,H,W]]
 
+            if noise_x_radar is not None:
+                assert packed_sequence.radar is not None, "packed_sequence.radar must exist when the batch has radar"
+                packed_sequence.radar.tokens = [x.to(**self.tensor_kwargs) for x in noise_x_radar]  # list[[C,T,H,W]]
+
             if has_noisy_actions and noise_x_action is not None:
                 assert packed_sequence.action is not None, "packed_sequence.action must exist when has_action is True"
                 packed_sequence.action.tokens = [x.to(**self.tensor_kwargs) for x in noise_x_action]  # list[[T,D]]
@@ -3185,6 +3623,7 @@ class OmniMoTModel(ImaginaireModel):
                 packed_sequence_template,
                 noise_x_vision,
                 noise_x_lidar,
+                noise_x_radar,
                 noise_x_action,
                 noise_x_sound,
                 timestep,
@@ -3227,6 +3666,18 @@ class OmniMoTModel(ImaginaireModel):
                     velocity_lidar.append(pred * noisy_mask.to(dtype=pred.dtype, device=pred.device))  # [C,T,H,W]
                 else:
                     velocity_lidar.append(torch.zeros_like(pred))  # [C,T,H,W]
+
+        # Handle radar velocity
+        velocity_radar: list[torch.Tensor] | None = None
+        if has_radar and packed_sequence.radar is not None and isinstance(packed_sequence.radar.condition_mask, list):
+            velocity_radar = []
+            for pred, cond_mask in zip(out["preds_radar"], packed_sequence.radar.condition_mask, strict=True):
+                # pred: [C,T,H,W], cond_mask: [T,1,1]
+                noisy_mask = 1.0 - cond_mask
+                if noisy_mask.sum() > 0:
+                    velocity_radar.append(pred * noisy_mask.to(dtype=pred.dtype, device=pred.device))  # [C,T,H,W]
+                else:
+                    velocity_radar.append(torch.zeros_like(pred))  # [C,T,H,W]
 
         # Handle action velocity
         velocity_action: list[torch.Tensor] | None = None
@@ -3275,11 +3726,12 @@ class OmniMoTModel(ImaginaireModel):
                 else:
                     velocity_sound.append(torch.zeros_like(pred))  # [sound_channels,T_sound]
 
-        # Concatenate vision, LiDAR, action, and sound velocities per sample (flattened)
-        # Order must match _prepare_inference_data: [vision | lidar | action | sound]
+        # Concatenate vision, LiDAR, radar, action, and sound velocities per sample (flattened)
+        # Order must match _prepare_inference_data: [vision | lidar | radar | action | sound]
         velocity_output: list[torch.Tensor] = []
         vis_offset = 0
         lidar_out_offset = 0
+        radar_out_offset = 0
         idx_action = 0
         idx_sound = 0
         for i in range(n_samples):
@@ -3294,6 +3746,11 @@ class OmniMoTModel(ImaginaireModel):
                 for _ in range(num_lidar_items[i] if num_lidar_items is not None else 1):
                     parts.append(velocity_lidar[lidar_out_offset].reshape(-1))
                     lidar_out_offset += 1
+
+            if velocity_radar is not None and sequence_plans[i].has_radar:
+                for _ in range(num_radar_items[i] if num_radar_items is not None else 1):
+                    parts.append(velocity_radar[radar_out_offset].reshape(-1))
+                    radar_out_offset += 1
 
             if velocity_action is not None and sequence_plans[i].has_action:
                 parts.append(velocity_action[idx_action].reshape(-1))
@@ -3430,7 +3887,7 @@ class OmniMoTModel(ImaginaireModel):
         n_sample: int | None = None,
         has_negative_prompt: bool = False,
         num_steps: int = 35,
-        shift: float = 5.0,
+        shift: float | None = None,
         sigma_max: float = 80.0,
         skip_text_tokens_for_cfg: bool = False,
         normalize_cfg: bool = False,
@@ -3473,7 +3930,8 @@ class OmniMoTModel(ImaginaireModel):
             n_sample (int | None): Number of samples to generate; defaults to batch size.
             has_negative_prompt (bool): If True, use negative prompt for unconditional branch.
             num_steps (int): Number of sampling steps for the diffusion process.
-            shift (float): Time shift parameter for the sampler.
+            shift (float | None): Explicit sampler shift. With shift_lidar configured, None uses
+                the LiDAR or RGB-resolution training shift; otherwise it retains the legacy value 5.
             sigma_max (float): Maximum sigma for the EDM sampler.
             skip_text_tokens_for_cfg (bool): If True, skip text tokens in unconditional branch.
             normalize_cfg (bool): If True, normalize the CFG output.
@@ -3540,6 +3998,19 @@ class OmniMoTModel(ImaginaireModel):
             ValueError: If the seed is a single integer. This is not supported anymore: `seed` must be
                 a list of integers, one for each sample.
         """
+        if shift is None:
+            shift = 5.0
+            rf_config = getattr(self.config, "rectified_flow_training_config", None)
+            if getattr(rf_config, "shift_lidar", None) is not None:
+                if not self._has_vision_stream(data_batch):
+                    shift = float(rf_config.shift_lidar)
+                elif isinstance(rf_config.shift, int):
+                    shift = float(rf_config.shift)
+                else:
+                    size = data_batch["image_size"][-1].reshape(-1, 4)[0]  # [4]
+                    resolution = get_vision_data_resolution((int(size[0]), int(size[1])))
+                    shift = float(rf_config.shift[resolution])
+
         if isinstance(seed, int):
             raise ValueError(
                 "Single integer seed is not supported anymore: `seed` must be a list of integers, one for each sample."
@@ -3714,7 +4185,7 @@ class OmniMoTModel(ImaginaireModel):
         #
         # In throughput-preset inference each rank holds a different sample,
         # and different samples can diverge on (a) whether text CFG or a
-        # velocity postprocess hook requires a second forward, (b) whether
+        # velocity postprocess hook requires additional forwards, (b) whether
         # the fused batched path is locally eligible, and (c) ``num_steps``.
         # Any divergence makes the FSDP allgather sequence misalign across
         # ranks, deadlocking NCCL at the 30-min watchdog timeout.
@@ -3722,9 +4193,10 @@ class OmniMoTModel(ImaginaireModel):
         # We align in three places:
         #   1. Before velocity_fn: MIN-reduce fused-path eligibility so every
         #      rank agrees on batched versus sequential CFG.
-        #   2. Inside velocity_fn (per call): MAX-reduce whether any rank
-        #      needs CFG/postprocessing; if so, every rank performs the same
-        #      forward sequence. Ranks whose local decision was "no CFG" return
+        #   2. Inside velocity_fn (per call): all_gather text-CFG flags and
+        #      postprocess counts to detect any guidance need and reject mismatched counts;
+        #      every rank then performs the same forward sequence.
+        #      Ranks whose local decision was "no CFG" return
         #      ``cond_v`` directly — bit-identical to the original no-CFG path.
         #   3. Around the sampler call: all_reduce the local num_steps;
         #      ranks with local < max issue a dummy sampler call with the
@@ -3758,6 +4230,8 @@ class OmniMoTModel(ImaginaireModel):
         # Request-scoped: install only for this generate call and restore afterward so we
         # never permanently shadow another dispatch_attention_fn on the model.
         previous_attention_dispatch = None
+        diffusion_cache = getattr(self, "_diffusion_cache", None)
+        cache_step_index: int | None = None
         try:
             if reuse_text_kv:
                 target_net = net or self.net
@@ -3826,18 +4300,37 @@ class OmniMoTModel(ImaginaireModel):
                     needs_text_cfg = t_lo < timestep[0].item() < t_hi
 
                 # FSDP alignment: if ANY rank in the shard group needs a second
-                # forward for text CFG or a velocity postprocess hook, every rank
+                # forward for text CFG, every rank
                 # must issue two sequential forwards (or one globally eligible
                 # batched forward) so the allgather sequence stays aligned.
-                needs_guidance_path = needs_text_cfg or velocity_postprocess is not None
+                # Postprocessors declare extra branches; the sampler owns cache bookkeeping.
+                cfg_branches: tuple[str, ...] = ()
+                if isinstance(velocity_postprocess, VelocityPostprocess):
+                    cfg_branches = velocity_postprocess.cfg_branches(timestep)
                 _any_needs_guidance_path = _any_dp_shard_rank_needs_guidance_path(
-                    needs_guidance_path,
+                    needs_text_cfg,
                     _dp_shard_group,
                     _align_device,
+                    num_postprocess_forwards=len(cfg_branches),
                 )
+                if diffusion_cache is not None and cache_step_index is not None:
+                    cfgp_rank = (
+                        self.parallel_dims.cfgp_rank
+                        if velocity_postprocess is None
+                        and self.parallel_dims is not None
+                        and self.parallel_dims.cfgp_enabled
+                        else None
+                    )
+                    pathways = _velocity_pathways(
+                        _any_needs_guidance_path,
+                        cfg_branches=cfg_branches,
+                        batched_cfg=batched_cfg_fast_path,
+                        cfgp_rank=cfgp_rank,
+                    )
+                    diffusion_cache.begin_step(cache_step_index, pathways)
 
                 # Fast path: no rank needs CFG or postprocessing — single forward.
-                if not _any_needs_guidance_path:
+                if not _any_needs_guidance_path and velocity_postprocess is None:
                     return _single_velocity_fn(cond_tokens, skip_text_tokens=False)
 
                 # Batched-CFG fast path (opt-in): run cond + uncond as one forward of
@@ -3903,13 +4396,12 @@ class OmniMoTModel(ImaginaireModel):
 
                 # Conditional forward, then per-step postprocess hook. Hook runs
                 # sequentially; cfgp parallelism not used on this path.
-                # Preflight control-CFG cache decisions before any branch runs.
-                if isinstance(velocity_postprocess, VelocityPostprocess):
-                    velocity_postprocess.prepare(noise_x, timestep)
                 cond_v_full = _single_velocity_fn(cond_tokens, skip_text_tokens=False)  # list of [N_i]
                 text_guidance_scale = guidance if needs_text_cfg else 1.0
                 cond_v = velocity_postprocess(cond_v_full, noise_x, timestep, text_guidance_scale)  # list of [N_i]
 
+                if not _any_needs_guidance_path:
+                    return cond_v
                 uncond_v = _single_velocity_fn(
                     uncond_tokens, skip_text_tokens=skip_text_tokens_for_cfg
                 )  # list of [N_i]
@@ -3961,11 +4453,16 @@ class OmniMoTModel(ImaginaireModel):
                     "condition_mask": condition_mask,
                 }
 
-            # Mixed-precision diffusion steps: select W8A16/W8A8 once per
-            # sampler step; reset (trace + staging cleanup) when the request
-            # ends, including on error.
+            # Explicit sampler steps drive both cache indexing and mixed precision.
+            # Select W8A16/W8A8 once per sampler step; reset (trace + staging cleanup)
+            # when the request ends, including on error.
             _mixed_precision_runtime = getattr(self.net, "_mixed_precision_runtime", None)
-            _step_callback = _mixed_precision_runtime.set_step if _mixed_precision_runtime is not None else None
+
+            def _step_callback(step_index: int, step_count: int) -> None:
+                nonlocal cache_step_index
+                cache_step_index = step_index
+                if _mixed_precision_runtime is not None:
+                    _mixed_precision_runtime.set_step(step_index, step_count)
 
             try:
                 if isinstance(sampler, FixedStepSampler) or scheduler_type == "unipc":
@@ -3979,6 +4476,8 @@ class OmniMoTModel(ImaginaireModel):
                         **fixed_step_sampler_kwargs,
                     )
                     if _extra_num_steps > 0:
+                        # Unregistered padding calls bypass caching on every shard rank.
+                        cache_step_index = None
                         # Dummy sampler call to issue (_extra_num_steps × per-step)
                         # FSDP allgathers; output discarded so `latents` keeps the
                         # real result captured above. Slow ranks have _extra_num_steps==0
@@ -4028,6 +4527,8 @@ class OmniMoTModel(ImaginaireModel):
                         step_callback=_step_callback,
                     )
                     if _extra_num_steps > 0:
+                        # Unregistered padding calls bypass caching on every shard rank.
+                        cache_step_index = None
                         # Pad the FSDP allgather sequence with ``_extra_num_steps``
                         # direct ``x0_fn`` calls instead of a second EDM sampler
                         # run. Avoids two EDM-specific footguns:
@@ -4042,7 +4543,7 @@ class OmniMoTModel(ImaginaireModel):
                         #       case would need num_steps=0 to balance the count.
                         # Direct ``x0_fn`` calls bypass both: each call routes
                         # through the same ``velocity_fn`` closure (so the
-                        # per-call CFG all_reduce still aligns ranks), issues
+                        # per-call CFG all_gather still aligns ranks), issues
                         # exactly one model forward, and discards its return.
                         # ``latents`` is the catted single tensor at this point;
                         # the dummy sigma value is irrelevant for collective
@@ -4071,21 +4572,25 @@ class OmniMoTModel(ImaginaireModel):
                 if _mixed_precision_runtime is not None:
                     _mixed_precision_runtime.reset()
 
-            # Split flattened latents back into vision latents, LiDAR latents, external actions,
-            # and sound latents. Mirror the per-sample logic from _prepare_inference_data:
-            # Order: [vision | lidar (if present) | action (if present) | sound (if present)]
-            # lidar/action/sound lists are dense (only modality-having samples), so use separate indexes.
+            # Split flattened latents back into vision latents, LiDAR latents, radar latents,
+            # external actions, and sound latents. Mirror the per-sample logic from
+            # _prepare_inference_data:
+            # Order: [vision | lidar (if present) | radar (if present) | action (if present) | sound (if present)]
+            # lidar/radar/action/sound lists are dense (only modality-having samples), so use separate indexes.
             result_vision: list[torch.Tensor] = []
             result_lidar: list[torch.Tensor] = []
+            result_radar: list[torch.Tensor] = []
             result_action: list[torch.Tensor] = []
             result_sound: list[torch.Tensor] = []
             action_processing_records = get_action_processing_records(data_batch)
             idx_vision = 0
             idx_lidar = 0
+            idx_radar = 0
             idx_action = 0
             idx_sound = 0
             num_vision_items = gen_data_clean.num_vision_items_per_sample
             num_lidar_items = gen_data_clean.num_lidar_items_per_sample
+            num_radar_items = gen_data_clean.num_radar_items_per_sample
 
             for i in range(n_sample):
                 offset = 0
@@ -4100,7 +4605,9 @@ class OmniMoTModel(ImaginaireModel):
                     if n_vis == 1 or is_item_generated(
                         sequence_plans[i].condition_frame_indexes_vision,
                         item_idx=j,
-                        num_items=n_vis,
+                        num_items=(
+                            1 if getattr(self.config, "multiview_action_conditioning", None) is not None else n_vis
+                        ),
                         latent_t=int(vision_shape[2]),
                     ):
                         result_vision.append(latents[i][offset : offset + vision_dim].reshape(vision_shape))
@@ -4123,6 +4630,23 @@ class OmniMoTModel(ImaginaireModel):
                             result_lidar.append(latents[i][offset : offset + lidar_dim].reshape(lidar_shape))
                         offset += lidar_dim
                     idx_lidar += n_lidar
+
+                # Extract radar if present, on the same rule: every item the plan generates.
+                if sequence_plans[i].has_radar:
+                    assert gen_data_clean.x0_tokens_radar is not None
+                    n_radar = num_radar_items[i] if num_radar_items is not None else 1
+                    for j in range(n_radar):
+                        radar_shape = gen_data_clean.x0_tokens_radar[idx_radar + j].shape
+                        radar_dim = int(torch.prod(torch.tensor(radar_shape)))
+                        if is_item_generated(
+                            sequence_plans[i].condition_frame_indexes_radar,
+                            item_idx=j,
+                            num_items=n_radar,
+                            latent_t=int(radar_shape[2]),
+                        ):
+                            result_radar.append(latents[i][offset : offset + radar_dim].reshape(radar_shape))
+                        offset += radar_dim
+                    idx_radar += n_radar
 
                 # Extract action if present
                 if has_noisy_actions and sequence_plans[i].has_action:
@@ -4153,6 +4677,8 @@ class OmniMoTModel(ImaginaireModel):
             result: dict[str, list[torch.Tensor]] = {"vision": result_vision}
             if result_lidar:
                 result["lidar"] = result_lidar
+            if result_radar:
+                result["radar"] = result_radar
             if has_noisy_actions and result_action:
                 result["action"] = result_action
             if self.config.sound_gen and len(result_sound) > 0:
@@ -4292,16 +4818,45 @@ class OmniMoTModel(ImaginaireModel):
             subset_num_lidar_items = None if num_lidar_items is None else num_lidar_items[start:limit]
         fps_lidar = gen_data_clean.fps_lidar[start:limit] if gen_data_clean.fps_lidar is not None else None
 
+        # The radar stream is grouped by sample the same way, so it takes its own slice.
+        num_radar_items = gen_data_clean.num_radar_items_per_sample
+        if gen_data_clean.x0_tokens_radar is None:
+            subset_x0_radar = None
+            subset_raw_radar = None
+            subset_num_radar_items = None
+        else:
+            radar_counts = num_radar_items if num_radar_items is not None else [1] * gen_data_clean.batch_size
+            radar_slice = slice(sum(radar_counts[:start]), sum(radar_counts[:limit]))
+            subset_x0_radar = gen_data_clean.x0_tokens_radar[radar_slice]
+            subset_raw_radar = gen_data_clean.raw_state_radar[radar_slice] if gen_data_clean.raw_state_radar else None
+            subset_num_radar_items = None if num_radar_items is None else num_radar_items[start:limit]
+        fps_radar = gen_data_clean.fps_radar[start:limit] if gen_data_clean.fps_radar is not None else None
+
+        def dense_slice(owners: list[int] | None) -> slice:
+            if owners is None:
+                return slice(start, limit)
+            return slice(sum(owner < start for owner in owners), sum(owner < limit for owner in owners))
+
+        action_slice = dense_slice(gen_data_clean.action_sample_ids)
+        sound_slice = dense_slice(gen_data_clean.sound_sample_ids)
+
         if has_action:
             subset_raw_action = (
-                gen_data_clean.raw_state_action[start:limit] if gen_data_clean.raw_state_action else None
+                gen_data_clean.raw_state_action[action_slice] if gen_data_clean.raw_state_action else None
             )
-            x0_tokens_action = gen_data_clean.x0_tokens_action[start:limit]
-            fps_action = gen_data_clean.fps_action[start:limit] if gen_data_clean.fps_action is not None else None
-            action_domain_id = gen_data_clean.action_domain_id[start:limit] if gen_data_clean.action_domain_id else None
-            raw_action_dim = gen_data_clean.raw_action_dim[start:limit] if gen_data_clean.raw_action_dim else None
+            x0_tokens_action = gen_data_clean.x0_tokens_action[action_slice]
+            fps_action = gen_data_clean.fps_action[action_slice] if gen_data_clean.fps_action is not None else None
+            action_domain_id = (
+                gen_data_clean.action_domain_id[action_slice] if gen_data_clean.action_domain_id else None
+            )
+            raw_action_dim = gen_data_clean.raw_action_dim[action_slice] if gen_data_clean.raw_action_dim else None
             action_valid_mask = (
-                gen_data_clean.action_valid_mask[start:limit] if gen_data_clean.action_valid_mask else None
+                gen_data_clean.action_valid_mask[action_slice] if gen_data_clean.action_valid_mask else None
+            )
+            num_views_per_action_item = (
+                gen_data_clean.num_views_per_action_item[action_slice]
+                if gen_data_clean.num_views_per_action_item
+                else None
             )
         else:
             subset_raw_action = None
@@ -4310,19 +4865,23 @@ class OmniMoTModel(ImaginaireModel):
             action_domain_id = None
             raw_action_dim = None
             action_valid_mask = None
+            num_views_per_action_item = None
 
         if has_sound:
-            subset_raw_sound = gen_data_clean.raw_state_sound[start:limit] if gen_data_clean.raw_state_sound else None
-            x0_tokens_sound = gen_data_clean.x0_tokens_sound[start:limit]
-            fps_sound = gen_data_clean.fps_sound[start:limit] if gen_data_clean.fps_sound is not None else None
+            subset_raw_sound = gen_data_clean.raw_state_sound[sound_slice] if gen_data_clean.raw_state_sound else None
+            x0_tokens_sound = gen_data_clean.x0_tokens_sound[sound_slice]
+            fps_sound = gen_data_clean.fps_sound[sound_slice] if gen_data_clean.fps_sound is not None else None
         else:
             subset_raw_sound = None
             x0_tokens_sound = None
             fps_sound = None
 
+        image_flags = (
+            gen_data_clean.sample_is_image[start:limit] if gen_data_clean.sample_is_image is not None else None
+        )
         return GenerationDataClean(
             batch_size=limit - start,
-            is_image_batch=gen_data_clean.is_image_batch,
+            is_image_batch=all(image_flags) if image_flags else gen_data_clean.is_image_batch,
             raw_state_vision=subset_raw_vision,
             raw_state_action=subset_raw_action,
             raw_state_sound=subset_raw_sound,
@@ -4336,12 +4895,35 @@ class OmniMoTModel(ImaginaireModel):
             action_domain_id=action_domain_id,
             raw_action_dim=raw_action_dim,
             action_valid_mask=action_valid_mask,
+            num_views_per_action_item=num_views_per_action_item,
             num_vision_items_per_sample=subset_num_items,
             num_views_per_vision_item=subset_num_views_per_vision_item,
+            vision_view_ids=(
+                gen_data_clean.vision_view_ids[vision_item_slice]
+                if gen_data_clean.vision_view_ids is not None
+                else None
+            ),  # list[[V]]
             raw_state_lidar=subset_raw_lidar,
             x0_tokens_lidar=subset_x0_lidar,
             fps_lidar=fps_lidar,
             num_lidar_items_per_sample=subset_num_lidar_items,
+            sample_is_image=image_flags,
+            action_sample_ids=(
+                [owner - start for owner in gen_data_clean.action_sample_ids[action_slice]]
+                if gen_data_clean.action_sample_ids is not None
+                else None
+            ),
+            sound_sample_ids=(
+                [owner - start for owner in gen_data_clean.sound_sample_ids[sound_slice]]
+                if gen_data_clean.sound_sample_ids is not None
+                else None
+            ),
+            action_family=gen_data_clean.action_family[action_slice] if gen_data_clean.action_family else None,
+            control_weights=gen_data_clean.control_weights[start:limit] if gen_data_clean.control_weights else None,
+            raw_state_radar=subset_raw_radar,
+            x0_tokens_radar=subset_x0_radar,
+            fps_radar=fps_radar,
+            num_radar_items_per_sample=subset_num_radar_items,
         )
 
     @torch.no_grad()
@@ -4430,8 +5012,8 @@ class OmniMoTModel(ImaginaireModel):
         num_views_per_vision_item: list[int] = []
         frames_per_vision_item: list[int] = []
         for sample_idx, num_vision_items in enumerate(vision_item_counts):
-            if num_vision_items <= 0:
-                raise ValueError(f"Vision item counts must be positive, got {vision_item_counts}.")
+            if num_vision_items < 0:
+                raise ValueError(f"Vision item counts must be nonnegative, got {vision_item_counts}.")
             num_views_per_vision_item.extend([sample_n_views[sample_idx]] * num_vision_items)
             frames_per_vision_item.extend([sample_frames_per_view[sample_idx]] * num_vision_items)
 
@@ -4467,6 +5049,15 @@ class OmniMoTModel(ImaginaireModel):
             )
         return self.tokenizer_lidar_gen
 
+    def _require_radar_tokenizer(self) -> VideoTokenizerInterface:
+        """Return the radar VAE, or say which config knob is missing."""
+        if self.tokenizer_radar_gen is None:
+            raise ValueError(
+                "This batch carries a radar stream, but no radar tokenizer is loaded. "
+                "Set radar_tokenizer and radar_state_ch on the model config."
+            )
+        return self.tokenizer_radar_gen
+
     def _normalize_uint8_vision_item(self, state: torch.Tensor) -> torch.Tensor:
         """Move one uint8 vision item to the model device as fp32 and normalize it to ``[-1,1]``."""
         return normalize_uint8_item(state, self.tensor_kwargs_fp32)
@@ -4487,7 +5078,7 @@ class OmniMoTModel(ImaginaireModel):
         encoded as-is: pre-normalized single-view items, and LiDAR range clips (V0
         range+intensity or V1 metric three-channel).
 
-        Kept on the model rather than moved onto :class:`VisionEncoder` because it is a
+        Kept on the model rather than moved onto :class:`SensorEncoder` because it is a
         monkeypatch seam: ``posttrain``'s seeded-validation context manager replaces this
         attribute to give each vision item a deterministic RNG seed, so every unbalanced
         encode has to keep flowing through it.
@@ -4524,19 +5115,21 @@ class OmniMoTModel(ImaginaireModel):
         # Do camera-major repacking for now (instead of timestamp-major).
         return torch.cat(encoded_views, dim=temporal_dim)  # [...,C_latent,V*T_latent_v,H_latent,W_latent]
 
-    def _vision_encoder(self) -> VisionEncoder:
-        """Build the encoder for the current tokenizer, mesh and encode entry point.
+    def _sensor_encoder(self) -> SensorEncoder:
+        """Build the encoder for the current tokenizers, mesh and encode entry points.
 
         Built per use rather than cached in ``__init__``: ``tokenizer_vision_gen`` and
         ``parallel_dims`` are both assigned after construction, and ``IterSpeed`` installs a
         ``MethodTimer`` over ``self.encode`` mid-run. Re-reading them here keeps the encoder
         from pinning a stale collaborator, and costs nothing next to a VAE encode.
         """
-        return VisionEncoder(
+        return SensorEncoder(
             tokenizer=self.tokenizer_vision_gen,
             parallel_dims=self.parallel_dims,
             encode_fn=lambda state: self.encode(state),
             fp32_kwargs=self.tensor_kwargs_fp32,
+            lidar_encode_fn=lambda state: self.encode_lidar(state),
+            partitioner=getattr(self, "replica_partitioner", None),
         )
 
     def _encode_vision_x0_tokens(
@@ -4567,39 +5160,27 @@ class OmniMoTModel(ImaginaireModel):
         non-causal tokenizers; the per-item fallbacks live in that method.
 
         ``balance_vae_encode`` spreads the full-encode path's work across the ``lb`` group
-        (see :meth:`VisionEncoder.encode_balanced`). It is ignored on the prefix-encode path above,
+        (see :meth:`SensorEncoder.encode_balanced`). It is ignored on the prefix-encode path above,
         which is inference-only, and only training opts in.
         """
 
         # Alignment with the vision items was checked by _validate_and_get_num_views against
         # the same list raw_state_vision is built one-to-one from; the strict zips below are
         # the backstop for any other caller.
-        has_multiview_metadata = num_views_per_vision_item is not None
+        if self._vision_prefix_encode_applicable(
+            raw_state_vision, num_vision_items_per_sample, vision_condition_indexes, num_views_per_vision_item
+        ):
+            assert vision_condition_indexes is not None
+            return self._encode_vision_x0_tokens_prefix(raw_state_vision, vision_condition_indexes)
         if num_views_per_vision_item is None:
             num_views_per_vision_item = [1] * len(raw_state_vision)
-
-        # Only opt in when a caller supplied per-sample conditioning indexes, the
-        # samples map 1:1 to single-view vision items (no multi-vision flattening),
-        # and the tokenizer is causal (so a pixel prefix reproduces the leading latents).
-        optimization_applicable = (
-            vision_condition_indexes is not None
-            and num_vision_items_per_sample is None
-            and not has_multiview_metadata
-            and all(num_views == 1 for num_views in num_views_per_vision_item)
-            and self.tokenizer_vision_gen is not None
-            and self.tokenizer_vision_gen.is_causal
-            and len(vision_condition_indexes) == len(raw_state_vision)
-        )
-
-        if optimization_applicable:
-            return self._encode_vision_x0_tokens_prefix(raw_state_vision, vision_condition_indexes)
 
         # Training does not provide vision_condition_indexes, so it fully
         # encodes each item in the flattened control/target list.
         if balance_vae_encode:
             # Built only here: callers that never balance (inference, the visualization
             # callbacks) should not need a tokenizer or an lb mesh to encode.
-            encoder = self._vision_encoder()
+            encoder = self._sensor_encoder()
             if encoder.balancing_available():
                 return encoder.encode_balanced(raw_state_vision, num_views_per_vision_item)
 
@@ -4607,6 +5188,79 @@ class OmniMoTModel(ImaginaireModel):
             self._encode_vision_item(state, num_views=num_views)
             for state, num_views in zip(raw_state_vision, num_views_per_vision_item, strict=True)
         ]
+
+    def _vision_prefix_encode_applicable(
+        self,
+        raw_state_vision: list[torch.Tensor],
+        num_vision_items_per_sample: list[int] | None,
+        vision_condition_indexes: list[list[int]] | None,
+        num_views_per_vision_item: list[int] | None,
+    ) -> bool:
+        """Whether :meth:`_encode_vision_x0_tokens` takes the causal prefix-encode path.
+
+        Only when a caller supplied per-sample conditioning indexes, the samples map 1:1 to
+        single-view vision items (no multi-vision flattening, no multiview metadata), and the
+        tokenizer is causal (so a pixel prefix reproduces the leading latents).
+        """
+        return (
+            vision_condition_indexes is not None
+            and num_vision_items_per_sample is None
+            and num_views_per_vision_item is None
+            and self.tokenizer_vision_gen is not None
+            and self.tokenizer_vision_gen.is_causal
+            and len(vision_condition_indexes) == len(raw_state_vision)
+        )
+
+    def _encode_sensor_x0_tokens(
+        self,
+        raw_state_vision: list[torch.Tensor],
+        num_vision_items_per_sample: list[int] | None,
+        vision_condition_indexes: list[list[int]] | None,
+        num_views_per_vision_item: list[int] | None,
+        raw_state_lidar: list[torch.Tensor] | None,
+        balance_vae_encode: bool = False,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor] | None]:
+        """Encode the vision items of one batch into x0 latent tokens, and its LiDAR items when shared.
+
+        Inside a multi-rank inference replica, every camera view and LiDAR item is encoded
+        once, on one rank, and the latents are broadcast (:meth:`SensorEncoder.encode_replicated`),
+        instead of every rank of the replica encoding everything. That needs at least two
+        encode calls to share, and it defers to the vision prefix-encode path, which already
+        shrinks its encodes to a few frames.
+
+        Otherwise the vision items are encoded locally by :meth:`_encode_vision_x0_tokens` and the
+        returned LiDAR latents are ``None``: the caller encodes LiDAR locally
+        (:meth:`_encode_lidar_items`) where it always has. That keeps the local path's calls in
+        their original order, which matters because the LiDAR VAE draws from the default CUDA
+        generator even when it returns the posterior mean, and training draws the SR latent noise
+        from that same generator in between.
+
+        Every input to that choice is identical across the replica (config, the shared batch's
+        shapes, and grad mode), so either every rank enters the partitioner's collectives or
+        none does.
+        """
+        partitioner: ReplicaPartitioner | None = getattr(self, "replica_partitioner", None)
+        if (
+            partitioner is not None
+            and partitioner.group_size > 1
+            and not balance_vae_encode
+            and not torch.is_grad_enabled()
+            and not self._vision_prefix_encode_applicable(
+                raw_state_vision, num_vision_items_per_sample, vision_condition_indexes, num_views_per_vision_item
+            )
+        ):
+            views_per_item = num_views_per_vision_item or [1] * len(raw_state_vision)
+            if sum(views_per_item) + len(raw_state_lidar or []) >= 2:
+                return self._sensor_encoder().encode_replicated(raw_state_vision, views_per_item, raw_state_lidar)
+
+        x0_tokens_vision = self._encode_vision_x0_tokens(
+            raw_state_vision,
+            num_vision_items_per_sample,
+            vision_condition_indexes,
+            num_views_per_vision_item,
+            balance_vae_encode=balance_vae_encode,
+        )
+        return x0_tokens_vision, None
 
     def _encode_vision_x0_tokens_prefix(
         self,
@@ -4745,7 +5399,7 @@ class OmniMoTModel(ImaginaireModel):
 
     def get_data_and_condition(
         self,
-        data_batch: dict[str, torch.Tensor],
+        data_batch: dict[str, Any],
         vision_condition_indexes: list[list[int]] | None = None,
         retain_raw_state_vision: bool = True,
         balance_vae_encode: bool = False,
@@ -4770,18 +5424,27 @@ class OmniMoTModel(ImaginaireModel):
                 normalized multiview inputs.
             balance_vae_encode: Spread this step's VAE-encode compute across the ``lb``
                 group instead of encoding exactly this rank's own pixels (see
-                ``VisionEncoder.encode_balanced``). Produces identical latents either way; only
+                ``SensorEncoder.encode_balanced``). Produces identical latents either way; only
                 where each encode runs changes. Off by default because it runs collectives
                 over the whole group: only training, which every rank enters in lockstep,
                 may turn it on.
         """
+        normalize_vision_batch_inplace(
+            data_batch, video_key=self.input_video_key, tensor_kwargs_fp32=getattr(self, "tensor_kwargs_fp32", {})
+        )
         if not self._has_vision_stream(data_batch):
             return self._get_lidar_only_data_and_condition(data_batch)
+
+        multiview_action_conditioning = getattr(self.config, "multiview_action_conditioning", None)
+        if multiview_action_conditioning is not None:
+            sizes = data_batch.get("image_size")
+            if isinstance(sizes, list) and sizes and isinstance(sizes[0], list):
+                data_batch["image_size"] = [size for sample_sizes in sizes for size in sample_sizes]
 
         # Detect whether any sample has multiple vision items (e.g. image editing).
         # If so, track the count per sample before all vision items from this batch are flattened into a list.
         is_image_batch = self.is_image_batch(data_batch)
-        media_key = self.input_video_key if not is_image_batch else self.input_image_key
+        media_key = self.input_image_key if self.input_image_key in data_batch else self.input_video_key
 
         sample_vision_list = data_batch[media_key]
 
@@ -4856,11 +5519,15 @@ class OmniMoTModel(ImaginaireModel):
                     )
                 raw_state_vision.append(item)
 
-        x0_tokens_vision = self._encode_vision_x0_tokens(
+        # LiDAR range clips: their own VAE, so they never travel among the vision items. They
+        # are collected before any encode so a replica can plan both streams' encodes together.
+        raw_state_lidar, num_lidar_items_per_sample = self._collect_lidar_stream(data_batch, batch_size)
+        x0_tokens_vision, x0_tokens_lidar = self._encode_sensor_x0_tokens(
             raw_state_vision,
             num_vision_items_per_sample,
             vision_condition_indexes,
             num_views_per_vision_item,
+            raw_state_lidar,
             balance_vae_encode=balance_vae_encode,
         )
 
@@ -4881,9 +5548,12 @@ class OmniMoTModel(ImaginaireModel):
             x0_tokens_vision=x0_tokens_vision,
             num_views_per_vision_item=num_views_per_vision_item,
         )
+        if raw_state_lidar is not None and x0_tokens_lidar is None:
+            # Not shared across a replica: encode LiDAR here, after the SR latent noise, as always.
+            x0_tokens_lidar = self._encode_lidar_items(raw_state_lidar)
 
-        # LiDAR range clips: their own VAE, so they never travel among the vision items.
-        raw_state_lidar, x0_tokens_lidar, num_lidar_items_per_sample = self._encode_lidar_stream(data_batch, batch_size)
+        # Radar BEV clips: likewise their own VAE, so likewise outside the vision items.
+        raw_state_radar, x0_tokens_radar, num_radar_items_per_sample = self._encode_radar_stream(data_batch, batch_size)
 
         output_raw_state_vision = raw_state_vision
         if retain_raw_state_vision and num_views_per_vision_item is not None:
@@ -4901,6 +5571,31 @@ class OmniMoTModel(ImaginaireModel):
         x0_tokens_action = raw_state_action
         raw_action_dim = data_batch.get("raw_action_dim", None)
         action_valid_mask = data_batch.get("action_valid_mask", None)
+        raw_action_view_counts = data_batch.get("num_views_per_action_item")
+        sample_is_image = data_batch.get("sample_is_image")
+        action_sample_ids = None
+        sound_sample_ids = None
+        if sample_is_image is not None:
+            action_sample_ids = [i for i, plan in enumerate(data_batch["sequence_plan"]) if plan.has_action]
+            raw_action_dim = [raw_action_dim[i] for i in action_sample_ids] if raw_action_dim is not None else None
+            action_valid_mask = (
+                [action_valid_mask[i] for i in action_sample_ids] if action_valid_mask is not None else None
+            )
+            if raw_action_view_counts is not None:
+                # Keep batch metadata sample-aligned for callbacks. Dense Action rows
+                # without explicit multiview metadata use the standard single-view layout.
+                raw_action_view_counts = [
+                    1 if raw_action_view_counts[i] is None else raw_action_view_counts[i] for i in action_sample_ids
+                ]
+        num_views_per_action_item = (
+            read_positive_int_metadata(
+                {"num_views_per_action_item": raw_action_view_counts},
+                "num_views_per_action_item",
+                expected_count=len(raw_state_action),
+            )
+            if raw_state_action is not None
+            else None
+        )
 
         # Sound/audio - normalize, encode if present and sound_gen is enabled
         raw_state_sound = self._normalize_sound_databatch_inplace(data_batch)
@@ -4911,6 +5606,9 @@ class OmniMoTModel(ImaginaireModel):
             x0_tokens_sound = self._encode_sound_x0_tokens(raw_state_sound, data_batch["sequence_plan"])
         else:
             x0_tokens_sound = None
+
+        if sample_is_image is not None:
+            sound_sample_ids = [i for i, plan in enumerate(data_batch["sequence_plan"]) if plan.has_sound]
 
         # FPS metadata is used by the sequence packer for mRoPE temporal IDs when
         # FPS modulation is enabled in the training config.
@@ -4927,11 +5625,21 @@ class OmniMoTModel(ImaginaireModel):
                 fps_action_raw = torch.stack(fps_action_raw).flatten()
             fps_action = fps_action_raw.to(**self.tensor_kwargs)
 
+        if action_sample_ids is not None and fps_action is not None:
+            fps_action = fps_action[action_sample_ids]  # [N_action]
+
         # LiDAR sweep rate for mRoPE, a property of the recording rather than of the clip, so
         # it comes from the config the way the LiDAR VAE's compression does.
         fps_lidar = None
         if x0_tokens_lidar is not None:
             fps_lidar = torch.full((batch_size,), float(self.config.lidar_fps), dtype=torch.float32).to(
+                **self.tensor_kwargs
+            )
+
+        # Radar cycle rate for mRoPE, read from the config for the reason the LiDAR rate is.
+        fps_radar = None
+        if x0_tokens_radar is not None:
+            fps_radar = torch.full((batch_size,), float(self.config.radar_fps), dtype=torch.float32).to(
                 **self.tensor_kwargs
             )
 
@@ -4946,8 +5654,17 @@ class OmniMoTModel(ImaginaireModel):
         else:
             fps_sound = None
 
+        physical_view_ids = None
+        if self.config.diffusion_expert_config.num_view_embeddings:
+            physical_view_ids = vision_view_ids(
+                data_batch,
+                batch_size=batch_size,
+                item_counts=num_vision_items_per_sample,
+                views_per_item=num_views_per_vision_item,
+                num_embeddings=self.config.diffusion_expert_config.num_view_embeddings,
+            )  # list[[V]]
         control_weights: list[list[float]] | None = data_batch.get("control_weights", None)
-        return GenerationDataClean(
+        data = GenerationDataClean(
             batch_size=batch_size,
             is_image_batch=is_image_batch,
             raw_state_vision=output_raw_state_vision,
@@ -4964,14 +5681,32 @@ class OmniMoTModel(ImaginaireModel):
             action_family=action_family,
             num_vision_items_per_sample=num_vision_items_per_sample,
             num_views_per_vision_item=num_views_per_vision_item,
+            vision_view_ids=physical_view_ids,
             raw_state_lidar=raw_state_lidar,
             x0_tokens_lidar=x0_tokens_lidar,
             fps_lidar=fps_lidar,
             num_lidar_items_per_sample=num_lidar_items_per_sample,
+            raw_state_radar=raw_state_radar,
+            x0_tokens_radar=x0_tokens_radar,
+            fps_radar=fps_radar,
+            num_radar_items_per_sample=num_radar_items_per_sample,
             raw_action_dim=raw_action_dim,
             action_valid_mask=action_valid_mask,
+            num_views_per_action_item=num_views_per_action_item,
             control_weights=control_weights,
+            sample_is_image=sample_is_image,
+            action_sample_ids=action_sample_ids,
+            sound_sample_ids=sound_sample_ids if x0_tokens_sound is not None or sample_is_image is None else [],
         )
+        if multiview_action_conditioning is not None and data.num_vision_items_per_sample is not None:
+            assert self.tokenizer_vision_gen is not None
+            return replicate_multiview_actions(
+                data,
+                num_views=len(multiview_action_conditioning.view_codes),
+                temporal_factor=self.tokenizer_vision_gen.temporal_compression_factor,
+                action_dim=self.config.max_action_dim,
+            )
+        return data
 
     def _has_vision_stream(self, data_batch: dict[str, Any]) -> bool:
         """Whether the batch carries a camera stream to tokenize.
@@ -4998,12 +5733,23 @@ class OmniMoTModel(ImaginaireModel):
         num_lidar_items_per_sample = data_batch.get("num_lidar_items_per_sample", None)
         batch_size = len(num_lidar_items_per_sample) if num_lidar_items_per_sample is not None else len(lidar_entries)
 
-        raw_state_lidar, x0_tokens_lidar, num_lidar_items = self._encode_lidar_stream(data_batch, batch_size)
+        raw_state_lidar, num_lidar_items = self._collect_lidar_stream(data_batch, batch_size)
+        _, x0_tokens_lidar = self._encode_sensor_x0_tokens([], None, None, None, raw_state_lidar)
+        if raw_state_lidar is not None and x0_tokens_lidar is None:
+            x0_tokens_lidar = self._encode_lidar_items(raw_state_lidar)
         # The sweep rate is a property of the recording rather than of the clip, so it comes
         # from the config the way the LiDAR VAE's compression does.
         fps_lidar = torch.full((batch_size,), float(self.config.lidar_fps), dtype=torch.float32).to(
             **self.tensor_kwargs
         )
+        # A camera-less AV batch may still carry radar beside its LiDAR, so the third stream is
+        # encoded here too rather than silently dropped.
+        raw_state_radar, x0_tokens_radar, num_radar_items = self._encode_radar_stream(data_batch, batch_size)
+        fps_radar = None
+        if x0_tokens_radar is not None:
+            fps_radar = torch.full((batch_size,), float(self.config.radar_fps), dtype=torch.float32).to(
+                **self.tensor_kwargs
+            )
         return GenerationDataClean(
             batch_size=batch_size,
             is_image_batch=False,
@@ -5014,15 +5760,19 @@ class OmniMoTModel(ImaginaireModel):
             x0_tokens_lidar=x0_tokens_lidar,
             fps_lidar=fps_lidar,
             num_lidar_items_per_sample=num_lidar_items,
+            raw_state_radar=raw_state_radar,
+            x0_tokens_radar=x0_tokens_radar,
+            fps_radar=fps_radar,
+            num_radar_items_per_sample=num_radar_items,
             control_weights=data_batch.get("control_weights", None),
         )
 
-    def _encode_lidar_stream(
+    def _collect_lidar_stream(
         self,
         data_batch: dict[str, Any],
         batch_size: int,
-    ) -> tuple[list[torch.Tensor] | None, list[torch.Tensor] | None, list[int] | None]:
-        """Encode the batch's LiDAR range clips into x0 latent tokens.
+    ) -> tuple[list[torch.Tensor] | None, list[int] | None]:
+        """Collect the batch's LiDAR range clips as the flat item list the LiDAR VAE encodes.
 
         ``data_batch["lidar"]`` arrives from the loader as one entry per sample — a list of
         tokenizer-native range clips — and is flattened here the way the vision key is. Both
@@ -5033,13 +5783,17 @@ class OmniMoTModel(ImaginaireModel):
         flat form and so the visualization callbacks can regroup the items once the
         training payload is gone.
 
+        Collection is kept apart from encoding (:meth:`_encode_lidar_items`) so a batch's LiDAR
+        encodes can be planned together with its camera encodes (see
+        :meth:`_encode_sensor_x0_tokens`).
+
         Returns:
-            The raw range clips, their latents, and the per-sample item counts; all
-            ``None`` when the batch carries no LiDAR.
+            The raw range clips and the per-sample item counts; both ``None`` when the batch
+            carries no LiDAR.
         """
         raw = data_batch.get("lidar", None)
         if raw is None:
-            return None, None, None
+            return None, None
 
         num_lidar_items_per_sample = data_batch.get("num_lidar_items_per_sample", None)
         if num_lidar_items_per_sample is None:
@@ -5078,9 +5832,87 @@ class OmniMoTModel(ImaginaireModel):
 
         data_batch["lidar"] = raw_state_lidar
         data_batch["num_lidar_items_per_sample"] = num_lidar_items_per_sample
+        return raw_state_lidar, num_lidar_items_per_sample
 
-        x0_tokens_lidar = [self.encode_lidar(state).contiguous().float() for state in raw_state_lidar]
-        return raw_state_lidar, x0_tokens_lidar, num_lidar_items_per_sample
+    def _encode_lidar_items(self, raw_state_lidar: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Encode collected LiDAR range clips into x0 latent tokens on this rank."""
+        return [self.encode_lidar(state).contiguous().float() for state in raw_state_lidar]
+
+    def _encode_radar_stream(
+        self,
+        data_batch: dict[str, Any],
+        batch_size: int,
+    ) -> tuple[list[torch.Tensor] | None, list[torch.Tensor] | None, list[int] | None]:
+        """Encode the batch's radar BEV clips into x0 latent tokens.
+
+        ``data_batch["radar"]`` arrives from the loader in the same per-sample shape the LiDAR
+        key does — one entry per sample, each a list of tokenizer-native clips — and is
+        flattened here the same way. The clips are on the native polar BEV grid and the
+        tokenizer owns their normalization. The per-sample counts are written back to the
+        batch for the reasons they are for LiDAR.
+
+        Returns:
+            The raw BEV clips, their latents, and the per-sample item counts; all
+            ``None`` when the batch carries no radar.
+        """
+        raw = data_batch.get("radar", None)
+        if raw is None:
+            return None, None, None
+
+        num_radar_items_per_sample = data_batch.get("num_radar_items_per_sample", None)
+        if num_radar_items_per_sample is None:
+            # Per-sample form: group the items and record the counts.
+            if len(raw) != batch_size:
+                raise ValueError(f"The radar stream needs one entry per sample: got {len(raw)} for {batch_size}.")
+            grouped = [list(entry) if isinstance(entry, (list, tuple)) else [entry] for entry in raw]
+            num_radar_items_per_sample = [len(items) for items in grouped]
+            flat_items = [item for items in grouped for item in items]
+        else:
+            # Flat form: already grouped on an earlier pass over this batch.
+            num_radar_items_per_sample = [int(count) for count in num_radar_items_per_sample]
+            flat_items = list(raw)
+            if len(num_radar_items_per_sample) != batch_size:
+                raise ValueError(
+                    "num_radar_items_per_sample must have one count per sample: "
+                    f"got {len(num_radar_items_per_sample)} counts for batch size {batch_size}."
+                )
+            if len(flat_items) != sum(num_radar_items_per_sample):
+                raise ValueError(
+                    "Radar items must match num_radar_items_per_sample: "
+                    f"got {len(flat_items)} items for {sum(num_radar_items_per_sample)} expected."
+                )
+
+        raw_state_radar: list[torch.Tensor] = []
+        for item in flat_items:
+            if not isinstance(item, torch.Tensor):
+                raise TypeError(f"Radar items must be tensors, got {type(item).__name__}.")
+            if item.dim() == 4:  # [C,T,H,W]
+                item = item.unsqueeze(0)  # [1,C,T,H,W]
+            elif item.dim() != 5:
+                raise ValueError(f"Radar items must have shape [C,T,H,W] or [B,C,T,H,W], got {tuple(item.shape)}.")
+            if not torch.is_floating_point(item):
+                raise TypeError(f"Radar BEV maps must arrive as floating-point clips, got {item.dtype}.")
+            raw_state_radar.append(item.to(**self.tensor_kwargs_fp32))  # [1,C,T,H,W]
+
+        data_batch["radar"] = raw_state_radar
+        data_batch["num_radar_items_per_sample"] = num_radar_items_per_sample
+
+        x0_tokens_radar = self._encode_radar_items(raw_state_radar)
+        return raw_state_radar, x0_tokens_radar, num_radar_items_per_sample
+
+    def _encode_radar_items(self, raw_state_radar: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Encode each radar clip on its own batch dim.
+
+        Transfer samples carry a map-control clip and a radar-target clip of
+        equal ``[1,C,T,H,W]``. Stacking them (B=2) with a T=32 stream window
+        made the V1 VAE's circular pad at the 16-head stage allocate ~17 GiB,
+        which OOMs an 8-node run once the camera tokens already sit on the GPU.
+        One clip at a time plus a 16-frame window fits; the extra VAE pass is
+        ~1.4s on a ~24s step.
+        """
+        if not raw_state_radar:
+            return []
+        return [self.encode_radar(state).contiguous().float() for state in raw_state_radar]  # list[[1,Cz,Tz,Hz,Wz]]
 
     def _normalize_video_databatch_inplace(self, data_batch: dict[str, torch.Tensor]) -> None:
         """
@@ -5469,6 +6301,9 @@ class OmniMoTModel(ImaginaireModel):
         differentiate image_batch and video_batch, another from a single dataloader which we
         assume as video_data by default.
         """
+        if "sample_is_image" in data_batch:
+            flags = data_batch["sample_is_image"]
+            return bool(flags) and all(flags)
         is_image = self.input_image_key in data_batch
         is_video = self.input_video_key in data_batch
         if not (is_image or is_video):
@@ -5801,6 +6636,7 @@ class OmniMoTModel(ImaginaireModel):
             dict containing:
                 - "preds_vision": list[Tensor[C,T,H,W]], one per sample.
                 - "preds_lidar": Velocity prediction for the LiDAR stream (if the network carries it).
+                - "preds_radar": Velocity prediction for the radar stream (if the network carries it).
                 - "preds_action": Velocity prediction for action modality (if action_gen enabled).
                 - "preds_sound": Velocity prediction for sound modality (if sound_gen enabled).
                 - "lbl_metadata_und": Load balancing metadata for understanding pathway (if present).
@@ -5817,6 +6653,8 @@ class OmniMoTModel(ImaginaireModel):
         output_dict["preds_vision"] = out_net["preds_vision"]
         if "preds_lidar" in out_net:
             output_dict["preds_lidar"] = out_net["preds_lidar"]
+        if "preds_radar" in out_net:
+            output_dict["preds_radar"] = out_net["preds_radar"]
         if self.config.action_gen and "preds_action" in out_net:
             output_dict["preds_action"] = out_net["preds_action"]
         if self.config.sound_gen and "preds_sound" in out_net:
@@ -6617,6 +7455,21 @@ class OmniMoTModel(ImaginaireModel):
         on which one is configured.
         """
         return self._require_lidar_tokenizer().decode(latent)
+
+    @torch.no_grad()
+    def encode_radar(self, state: torch.Tensor) -> torch.Tensor:
+        """Encode a radar BEV clip with the radar VAE."""
+        return self._require_radar_tokenizer().encode(state)
+
+    @torch.no_grad()
+    def decode_radar(self, latent: torch.Tensor) -> torch.Tensor:
+        """Decode radar latents to BEV pixels with the radar VAE.
+
+        The stream keeps its own VAE's channel count end to end, so a latent arrives here
+        at the width its decoder expects, on the native polar grid the tokenizer was
+        trained on.
+        """
+        return self._require_radar_tokenizer().decode(latent)
 
     @torch.no_grad()
     def encode_sound(self, waveform: torch.Tensor) -> torch.Tensor:

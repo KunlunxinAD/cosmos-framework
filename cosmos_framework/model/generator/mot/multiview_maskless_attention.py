@@ -14,22 +14,31 @@ own module rather than in either.
 from __future__ import annotations
 
 import dataclasses
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
 
-from cosmos_framework.model.attention import attention, merge_attentions
+from cosmos_framework.model.attention import attention, merge_attentions, multi_dimensional_attention
 from cosmos_framework.configs.base.defaults.multiview_attention import (
     CAPTION_SCOPE_ALL,
     CAPTION_SCOPE_NONE,
+    DECOMPOSED_TEMPORAL_WINDOW_EPS,
     AttentionScope,
     CaptionAccess,
     MultiviewAttentionConfig,
+    TemporalFrameWindow,
+    TemporalWindow,
     resolve_caption_scope,
+    temporal_window_bounds,
 )
 from cosmos_framework.model.generator.mot.activation_marks import mark_next_activation
-from cosmos_framework.model.generator.mot.merge_bridge import BridgeFn, MergeAttentionsBridge
+from cosmos_framework.model.generator.mot.merge_bridge import (
+    BridgeFn,
+    DisjointQueriesBridge,
+    MergeAttentionsBridge,
+)
 from cosmos_framework.data.generator.sequence_packing.runtime import (
     SequencePack,
     get_causal_seq,
@@ -39,19 +48,35 @@ from cosmos_framework.data.generator.sequence_packing.runtime import (
 
 # The scopes these folds express as a partition of the GEN stream, and so can run without a
 # mask. ``"same_view"`` is one partition and is exact against its mask. ``"decomposed"`` is two
-# overlapping ones, which is why it is deliberately *not* the same attention as its mask -- see
+# overlapping ones by default, which is why it is deliberately *not* the same attention as its mask -- see
 # ``multiview_maskless_attention``. ``"all_views"`` is absent because it is not a partition at all:
 # it is one unmasked pass over each whole sample, which these folds do not build.
+# The opt-in deduplicated form partitions cross-view edges, not tokens: disjoint
+# query/key rectangles retain dense kernels while counting every permitted edge once.
 MASKLESS_ATTENTION_SCOPES: tuple[AttentionScope, ...] = ("decomposed", "same_view")
+
+
+def _is_supported_neighborhood_window(window: TemporalFrameWindow) -> bool:
+    """Whether NATTEN's size and causal flag can express this frame window."""
+    lower, upper = window
+    return lower < 0 and (upper == -lower or upper == 0)
 
 
 def maskless_unavailable_reason(config: MultiviewAttentionConfig) -> str | None:
     """Why a config rules these folds out, or ``None`` when it does not.
 
     Lives beside the folds rather than on the config because every condition is a fact about
-    what they express -- which scopes are a partition, that a control item needs the symmetric
-    rule -- and a config dataclass that answered it would be asserting implementation knowledge
-    it does not own.
+    what they express -- which scopes are a partition -- and a config dataclass that answered it
+    would be asserting implementation knowledge it does not own.
+
+    ``control_attends_sensor`` is deliberately *not* a condition here, though it was one. A
+    control item shares its target's view group, so with the flag off a control query wants a
+    narrower key set than a sensor query on the same view -- and one unmasked pass over that
+    group as a single varlen segment cannot give two query roles different keys. Two segments
+    can, which is what the folds now cut it into: the group's sensor tokens keyed against the
+    whole group, its control tokens against the group's control tokens alone. Both values of the
+    flag are therefore expressed exactly, and which one a plan was built for is recorded on it.
+    See :func:`build_multiview_maskless_plan`.
 
     Config-level only, and deliberately so. Whether a *batch* can be folded is decided per
     forward by ``_multiview_maskless_geometry``, which raises rather than substituting a mask.
@@ -62,11 +87,39 @@ def maskless_unavailable_reason(config: MultiviewAttentionConfig) -> str | None:
     ``flash_backend_unavailable_reason`` does for FA4.
     """
     if config.mask.decomposed_temporal_window_seconds is not None:
+        window = config.mask.decomposed_temporal_window_seconds
+        try:
+            temporal_window_bounds(window)
+        except ValueError as error:
+            return str(error)
+    if config.mask.decomposed_temporal_window_includes_first_frame and (
+        config.mask.attention_scope != "decomposed" or config.mask.decomposed_temporal_window_seconds is None
+    ):
         return (
-            f"decomposed_temporal_window_seconds={config.mask.decomposed_temporal_window_seconds} "
-            "asks for the sliding-window form of the scope, which is directed and overlapping. "
-            "Only an equivalence relation can be an unmasked pass, so no partition of the "
-            "stream reproduces it"
+            "decomposed_temporal_window_includes_first_frame widens a capture-time window, so it "
+            "needs attention_scope='decomposed' and a decomposed_temporal_window_seconds; this "
+            f"config has attention_scope={config.mask.attention_scope!r} and window "
+            f"{config.mask.decomposed_temporal_window_seconds!r}"
+        )
+    frame_windows = {
+        name: getattr(config.mask, name)
+        for name in (
+            "sensor_to_sensor_window",
+            "sensor_to_control_window",
+            "control_to_control_window",
+            "control_to_sensor_window",
+        )
+        if getattr(config.mask, name) is not None
+    }
+    unsupported_windows = {
+        name: window
+        for name, window in frame_windows.items()
+        if window is not None and not _is_supported_neighborhood_window(window)
+    }
+    if unsupported_windows:
+        return (
+            f"same-view frame windows {unsupported_windows!r} are not centered -N:N or causal -N:0 windows "
+            "supported by fused neighborhood attention"
         )
     if config.mask.attention_scope not in MASKLESS_ATTENTION_SCOPES:
         return (
@@ -75,17 +128,24 @@ def maskless_unavailable_reason(config: MultiviewAttentionConfig) -> str | None:
             "over each whole sample rather than a partition of one, so it is a mask rule here "
             "and not a fold"
         )
-    if not config.mask.control_attends_sensor:
-        return (
-            "control_attends_sensor is off. A control item shares its target's view group, so "
-            "with the flag off a control query would need a narrower key set than a sensor "
-            "query on the same view, and one unmasked pass cannot give two query roles "
-            "different keys. Required unconditionally rather than only for the batches that "
-            "carry a control item: which batches those are is the dataloader's business and "
-            "not this config's, and the flag costs a batch without one nothing, since it only "
-            "ever widens a control query's reach and such a batch has no control queries"
-        )
     return None
+
+
+@dataclass(frozen=True)
+class CrossViewPartition:
+    """Capture-time rectangles batched as varlen, with unique queries per pass.
+
+    Exact mode keys each hierarchy level against the opposite half of its camera
+    group. Overlapping mode uses one pass over all views in the temporal window,
+    including the query's own view. Q/K offsets can describe different lengths.
+    """
+
+    query_indices: torch.Tensor  # [Nq]
+    key_indices: torch.Tensor  # [Nk]
+    query_offsets: torch.Tensor  # [segments+1]
+    key_offsets: torch.Tensor  # [segments+1]
+    max_query_len: int
+    max_key_len: int
 
 
 @dataclass(frozen=True)
@@ -109,6 +169,13 @@ class MultiviewMasklessPlan:
             partitions; ``"same_view"`` builds no cross-instant partition at all, so the pass is
             skipped and a query reaches only its own view. Recorded rather than inferred so a
             plan says which attention it describes.
+        control_attends_sensor: the control rule this plan was folded for, recorded for the same
+            reason ``attention_scope`` is. ``True`` leaves a same-view group as one varlen
+            segment attending itself; ``False`` cuts it into a sensor segment and a control one,
+            which is the only thing the flag changes here. What the caller stated, not what the
+            batch needed: a batch marking no control item has no control query to narrow, so it
+            is folded the same way under either value and still records the one its run means.
+            ``True`` where the caller stated nothing, which only a batch of that kind may do.
         num_views: cameras each sample's item covers, which its ``latent_t`` divides into.
         token_shapes: each sample's ``(latent_t, patch_h, patch_w)``, ``latent_t`` counting
             the camera-major latent axis (``num_views * frames_per_view``).
@@ -122,14 +189,45 @@ class MultiviewMasklessPlan:
         same_view_offsets: cumulative ``(sample, view)`` group boundaries over the GEN stream,
             in packed order.
         same_view_max_len: longest ``(sample, view)`` group, for varlen kernel sizing.
+        same_view_q_gather: the same-view pass's query side under
+            ``control_attends_sensor=False``: every group's sensor tokens in group order, then
+            every group's control tokens in group order, so a group is two varlen segments rather
+            than one. A permutation of the padded stream, not a subset -- see
+            :func:`_control_split_fields`. ``None`` -- every other batch -- leaves the pass keyed
+            by ``same_view_gather`` on both sides, which is a group attending itself. Set only
+            where the split is in play: the flag off *and* some item marked control. The three
+            ``same_view_*`` fields above stay the whole partition either way, because the
+            gen->und pass borrows them for *its* queries and a control token reads its captions
+            whatever this flag says.
+        same_view_q_offsets: cumulative per-segment boundaries into ``same_view_q_gather``.
+        same_view_q_max_len: longest query segment.
+        same_view_kv_gather: the key side, segment for segment with the above: a sensor segment
+            is keyed against its whole group, a control segment against the group's control
+            tokens alone. Longer than the stream, since a group's control tokens appear in both
+            of its segments' keys.
+        same_view_kv_offsets: cumulative per-segment boundaries into ``same_view_kv_gather``.
+        same_view_kv_max_len: longest key segment.
         cross_view_offsets: cumulative ``(sample, frame)`` group boundaries, in *gathered*
             (frame-major) order.
         cross_view_max_len: longest ``(sample, frame)`` group.
         cross_view_gather: the sensor tokens' packed indices, in instant-major order. ``None``
             when the cross-instant partition is empty.
-        cross_view_empty: whether no sample contributes to the cross-instant partition, so
-            that pass is skipped outright and the merge runs on two branches. True exactly when
-            every sample owns a single same-view group -- see :func:`build_multiview_maskless_plan`.
+        cross_view_empty: whether no sample contributes cross-instant attention, so
+            that pass is skipped outright. In the legacy mode this holds exactly when
+            every sample owns a single same-view group; deduplication also excludes
+            queries whose instant/window contains no other view. A configured window
+            may also admit no keys -- see :func:`build_multiview_maskless_plan`.
+        deduplicate_cross_view: whether disjoint cross-view rectangles replace the
+            overlapping instant self-attention pass. Same-view and caption passes stay unchanged.
+        decomposed_temporal_window_seconds: optional (start, end) key-time offsets
+            from the query for cross-view attention in either mode. Bounds (-N, 0)
+            are past-only; None retains instant matching.
+        decomposed_temporal_window_includes_first_frame: whether that window also admits
+            each sample's first frame (capture time 0) for every query time.
+        cross_view_partitions: one varlen pass per binary-tree depth when
+            deduplicating. Each directed cross-view edge occurs once across all levels;
+            a view's own keys are never repeated by any level. With a window and no
+            deduplication, one pass includes all sensor views, including the query's own.
         caption_gather: the caption tokens' indices into the causal stream, one contiguous run
             per same-view group, in that partition's order. ``None`` unless the batch carries
             per-view captions, in which case the gen->und pass keys each sample's GEN tokens
@@ -154,6 +252,7 @@ class MultiviewMasklessPlan:
     """
 
     attention_scope: str
+    control_attends_sensor: bool
     num_views: tuple[int, ...]
     token_shapes: tuple[tuple[int, int, int], ...]
     seconds_per_frame: tuple[float, ...]
@@ -161,10 +260,20 @@ class MultiviewMasklessPlan:
     is_control: tuple[bool, ...]
     view_axis: tuple[int, ...]
     num_gen_tokens: int
+    deduplicate_cross_view: bool = False
+    decomposed_temporal_window_seconds: TemporalWindow | None = None
+    decomposed_temporal_window_includes_first_frame: bool = False
+    cross_view_partitions: tuple[CrossViewPartition, ...] = ()
     padded_gen_tokens: int = 0
     same_view_offsets: torch.Tensor | None = None
     same_view_max_len: int = 0
     same_view_gather: torch.Tensor | None = None
+    same_view_q_gather: torch.Tensor | None = None
+    same_view_q_offsets: torch.Tensor | None = None
+    same_view_q_max_len: int = 0
+    same_view_kv_gather: torch.Tensor | None = None
+    same_view_kv_offsets: torch.Tensor | None = None
+    same_view_kv_max_len: int = 0
     cross_view_offsets: torch.Tensor | None = None
     cross_view_max_len: int = 0
     cross_view_gather: torch.Tensor | None = None
@@ -177,6 +286,13 @@ class MultiviewMasklessPlan:
     caption_q_max_len: int = 0
     gen_to_und_gather: torch.Tensor | None = None
     gen_to_und_max_len: int = 0
+    sensor_gather: torch.Tensor | None = None
+    control_gather: torch.Tensor | None = None
+    neighborhood_layout: tuple[int, int, int] | None = None
+    sensor_to_sensor_window: TemporalFrameWindow | None = None
+    sensor_to_control_window: TemporalFrameWindow | None = None
+    control_to_control_window: TemporalFrameWindow | None = None
+    control_to_sensor_window: TemporalFrameWindow | None = None
 
 
 def _cumulative_offsets(lengths: Sequence[int], device: torch.device) -> torch.Tensor:
@@ -198,6 +314,178 @@ def _partition(group_ids: torch.Tensor) -> tuple[torch.Tensor | None, list[int]]
     lengths = torch.bincount(torch.unique_consecutive(group_ids[gather], return_inverse=True)[1]).tolist()
     identity = torch.equal(gather, torch.arange(group_ids.shape[0], device=group_ids.device))
     return (None if identity else gather), lengths
+
+
+def _cross_view_partitions(
+    instant_cells: dict[tuple[int, float], dict[int, list[tuple[int, int]]]],
+    device: torch.device,
+    temporal_window_seconds: TemporalWindow | None = None,
+    *,
+    deduplicate_cross_view: bool,
+    include_first_frame: bool = False,
+) -> tuple[CrossViewPartition, ...]:
+    """Batch capture-time rectangles, optionally excluding same-view keys.
+
+    In exact mode, split views into halves L/R, attend L->R and R->L, and recurse within each
+    half. A directed pair of distinct views occurs exactly at their lowest common
+    ancestor; same-view pairs never occur. All rectangles at one depth share one
+    varlen call. Thus a query appears at most once per depth, with ceil(log2(V))
+    levels rather than V-1 copies of its KV per query time. Queries with no other
+    view in their instant/window add no work. With deduplication disabled, use one
+    all-view rectangle per query time instead, deliberately retaining own-view keys.
+
+    Cells are host-side packed-token spans derived from layout metadata, not GPU
+    boolean selections. One view can have several spans in an instant (e.g. two
+    LiDAR sweeps), all of which must stay together to avoid same-view duplicates.
+
+    With a window, cell times are float32 frame-start timestamps, not quantised
+    instants. Each query reads keys with capture-time offsets inside (start, end).
+    Bounds (-N, 0) give a past-only window. KV can repeat across
+    distinct query times, never for the same query. The frame-level time table
+    is built on CPU once per forward; no token mask or GPU selection is needed.
+
+    ``include_first_frame`` admits each sample's earliest key time for every query time on
+    top of the window. It edits that same boolean table rather than adding a rectangle, so a
+    first frame already inside the window is admitted once, and the view split still keeps
+    own-view keys out in exact mode.
+    """
+    # Each view has separate query/key spans: identical for an instant, different
+    # for a directed window. Missing views on either side have empty spans.
+    groups: list[list[tuple[list[tuple[int, int]], list[tuple[int, int]]]]] = []
+    bounds = temporal_window_bounds(temporal_window_seconds)
+    if include_first_frame and bounds is None:
+        raise ValueError("include_first_frame widens a capture-time window and needs one.")
+    if bounds is None:
+        groups = [[(spans, spans) for spans in views.values()] for views in instant_cells.values() if len(views) > 1]
+    else:
+        samples: dict[int, dict[float, dict[int, list[tuple[int, int]]]]] = {}
+        for (sample, timestamp), views in instant_cells.items():
+            samples.setdefault(sample, {})[timestamp] = views
+        start, end = torch.tensor(bounds, dtype=torch.float32, device="cpu").unbind()  # each []
+        eps = torch.tensor(DECOMPOSED_TEMPORAL_WINDOW_EPS, dtype=torch.float32, device="cpu")  # []
+        for cells in samples.values():
+            timestamps = sorted(cells)
+            times = torch.tensor(timestamps, dtype=torch.float32, device="cpu")  # [F_union]
+            offsets = times[None, :] - times[:, None]  # [F_union,F_union], key time minus query time
+            allowed = (offsets >= start - eps) & (offsets <= end + eps)  # [F_union,F_union]
+            if include_first_frame:
+                # Every stream's first frame starts at capture time 0, the smallest time in the
+                # sorted table, so column 0 is the sample's first frame on every stream at once.
+                allowed[:, 0] = True
+            for row, timestamp in enumerate(timestamps):
+                queries = cells[timestamp]
+                keys: dict[int, list[tuple[int, int]]] = {}
+                for column in allowed[row].nonzero(as_tuple=True)[0].tolist():
+                    for view, spans in cells[timestamps[column]].items():
+                        keys.setdefault(view, []).extend(spans)
+                views = sorted(queries.keys() | keys.keys())
+                if len(views) > 1 or not deduplicate_cross_view:
+                    groups.append([(queries.get(view, []), keys.get(view, [])) for view in views])
+    partitions: list[CrossViewPartition] = []
+
+    def indices(spans: list[tuple[int, int]]) -> torch.Tensor:  # [N]
+        # Construct indices once per forward on the host, then transfer once per level.
+        return torch.cat([torch.arange(start, end, dtype=torch.int64, device="cpu") for start, end in spans]).to(
+            device
+        )  # [N]
+
+    while groups:
+        query_spans: list[tuple[int, int]] = []
+        key_spans: list[tuple[int, int]] = []
+        query_lengths: list[int] = []
+        key_lengths: list[int] = []
+        next_groups: list[list[tuple[list[tuple[int, int]], list[tuple[int, int]]]]] = []
+        for views in groups:
+            middle = len(views) // 2
+            left, right = views[:middle], views[middle:]
+            pairs = ((left, right), (right, left)) if deduplicate_cross_view else ((views, views),)
+            for query_half, key_half in pairs:
+                q_spans = [span for query, _ in query_half for span in query]
+                k_spans = [span for _, key in key_half for span in key]
+                if q_spans and k_spans:
+                    query_spans.extend(q_spans)
+                    key_spans.extend(k_spans)
+                    query_lengths.append(sum(end - start for start, end in q_spans))
+                    key_lengths.append(sum(end - start for start, end in k_spans))
+            if deduplicate_cross_view:
+                next_groups.extend(half for half in (left, right) if len(half) > 1)
+        if query_lengths:
+            partitions.append(
+                CrossViewPartition(
+                    query_indices=indices(query_spans),  # [Nq]
+                    key_indices=indices(key_spans),  # [Nk]
+                    query_offsets=_cumulative_offsets(query_lengths, device),  # [segments+1]
+                    key_offsets=_cumulative_offsets(key_lengths, device),  # [segments+1]
+                    max_query_len=max(query_lengths),
+                    max_key_len=max(key_lengths),
+                )
+            )
+        groups = next_groups
+    return tuple(partitions)
+
+
+def _control_split_fields(
+    sensor_runs: dict[int, list[torch.Tensor]],
+    control_runs: dict[int, list[torch.Tensor]],
+    device: torch.device,
+) -> dict[str, torch.Tensor | int]:
+    """The same-view pass re-cut by what a token is, for ``control_attends_sensor=False``.
+
+    That flag leaves a same-view group with two query roles wanting different keys. A sensor
+    query reaches the whole group -- its own view's sensor tokens by the attention scope, its
+    view's control tokens by the mask's sensor->control rule, neither of which the flag touches.
+    A control query reaches that view's control tokens and nothing else, the withheld direction
+    being exactly what the flag names. One rectangle cannot say that, but one *varlen call* can:
+    a group simply becomes two varlen segments, a sensor one keyed against the whole group and a
+    control one keyed against the group's control tokens. So this returns a query partition and a
+    key partition, segment for segment -- still one pass, one kernel and one merge branch, which
+    is why the fold's shape is unchanged and only its offsets are.
+
+    The query side is every group's sensor run in group order, then every group's control run in
+    group order. That is a **permutation** of the padded GEN stream rather than a subset of it:
+    every token is a sensor token or a control token, so every row of the pass is written and
+    none is written twice. The key side duplicates a group's control tokens -- once inside the
+    whole-group run the sensor segment reads, once as the control segment's own keys -- which a
+    gather may do freely: the forward reads each segment independently and the backward
+    accumulates into the duplicated rows, the same thing :func:`_caption_partition` relies on.
+
+    Each argument maps a same-view group id to that group's token runs in packed order, one per
+    item that covers the group. A group absent from one of them owns no token of that kind: a
+    view carrying no control stream is missing from ``control_runs``, which is every group of an
+    ordinary batch, and a view whose only items are control is missing from ``sensor_runs`` --
+    what a control item covering more views than the target it conditions produces. Such a group
+    contributes the one segment it has, which is exact rather than approximate: with no sensor
+    token there is no sensor query of that view to key against anything.
+
+    Key order *within* a segment is free, attention summing over a key set, so a group's keys are
+    its sensor runs followed by its control runs rather than being re-sorted back into packed
+    order. Query order within a segment is not free in the same way, but neither does it have to
+    be packed order: the scatter back is by the query gather itself, which inverts whatever order
+    it is in.
+
+    The caller reaches here only for a batch that marks a control item, so the control segments
+    are never empty; and a sample whose items are *all* control is refused before this, so
+    neither are the sensor ones.
+    """
+    groups = sorted(set(sensor_runs) | set(control_runs))
+    # Sensor segments first, then control ones. Any order would do -- the two sides are read
+    # segment for segment -- but blocking them keeps a query gather whose two halves are each in
+    # group order, which is the order every other partition here is in.
+    segments = [(sensor_runs[g], sensor_runs[g] + control_runs.get(g, [])) for g in groups if g in sensor_runs]
+    segments += [(control_runs[g], control_runs[g]) for g in groups if g in control_runs]
+
+    queries = [torch.cat(q) for q, _ in segments]
+    keys = [torch.cat(kv) for _, kv in segments]
+    q_lens = [int(run.shape[0]) for run in queries]
+    kv_lens = [int(run.shape[0]) for run in keys]
+    return {
+        "same_view_q_gather": torch.cat(queries),  # [N_gen], a permutation
+        "same_view_q_offsets": _cumulative_offsets(q_lens, device),
+        "same_view_q_max_len": max(q_lens),
+        "same_view_kv_gather": torch.cat(keys),  # [N_gen + control tokens], duplicating those
+        "same_view_kv_offsets": _cumulative_offsets(kv_lens, device),
+        "same_view_kv_max_len": max(kv_lens),
+    }
 
 
 def _caption_partition(
@@ -348,13 +636,22 @@ def build_multiview_maskless_plan(
     *,
     device: torch.device,
     seconds_per_frame: Sequence[float] | None = None,
+    frame_offsets: Sequence[int] | None = None,
     items_per_sample: Sequence[int] | None = None,
     is_control: Sequence[bool] | None = None,
+    control_attends_sensor: bool | None = None,
     view_axis: Sequence[int] | None = None,
     captions: Sequence[Sequence[tuple[int, int]]] | None = None,
     padded_gen_tokens: int | None = None,
     attention_scope: str = "decomposed",
     caption_access: Sequence[CaptionAccess] | None = None,
+    deduplicate_cross_view: bool = False,
+    decomposed_temporal_window_seconds: TemporalWindow | None = None,
+    decomposed_temporal_window_includes_first_frame: bool = False,
+    sensor_to_sensor_window: TemporalFrameWindow | None = None,
+    sensor_to_control_window: TemporalFrameWindow | None = None,
+    control_to_control_window: TemporalFrameWindow | None = None,
+    control_to_sensor_window: TemporalFrameWindow | None = None,
 ) -> MultiviewMasklessPlan:
     """Describe a batch's GEN stream to :func:`multiview_maskless_attention`.
 
@@ -367,6 +664,14 @@ def build_multiview_maskless_plan(
       ``control_attends_sensor`` fills in the one direction that would otherwise be one-way.
       One item per axis leaves the groups tiling the stream in packed order, so the usual batch
       needs no gather here; a control item costs one, since a view's two runs sit apart.
+
+      With ``control_attends_sensor=False`` that one direction is *not* filled in, and the group
+      stops being one key set: a sensor query still takes it whole, while a control query takes
+      its view's control tokens alone. Two query roles with different keys is two varlen
+      segments rather than one -- still one pass, since varlen pairs each query segment with its
+      own key segment and requires nothing of their lengths. See :func:`_control_split_fields`.
+      Nothing else about the fold changes: the cross-instant partition never held a control token
+      to begin with, and a control token reads its captions under either value of the flag.
     * **cross instant**, groups ``(sample, instant)`` over the **sensor tokens alone**. Every
       control rule in the mask is a view rule, never an instant one, so a control token is
       absent from this partition as a key and as a query alike. It is sliced out rather than
@@ -383,10 +688,10 @@ def build_multiview_maskless_plan(
     sample: the range item is one view there too, but its instant group also holds camera
     tokens, which its view group does not.
 
-    The instant of a token is its frame's **midpoint**, quantised by the anchor item's frame
+    Without a temporal window, the instant of a token is its frame's **midpoint**, quantised by the anchor item's frame
     period::
 
-        instant = floor((frame_id + 0.5) * seconds_per_frame / anchor_seconds_per_frame)
+        instant = floor((frame_id + frame_offset + 0.5) * seconds_per_frame / anchor_seconds_per_frame)
 
     A latent frame is a span rather than a point -- temporal compression folds several pixel
     frames into one -- so the midpoint is what says which anchor frame a frame mostly happened
@@ -413,9 +718,21 @@ def build_multiview_maskless_plan(
         seconds_per_frame: real time between two latent frames of each item. ``None`` gives
             every item 1.0, which makes an instant the frame index -- correct whenever the
             batch carries one rate.
+        frame_offsets: first frame of each item on its own clock; ``None`` keeps every
+            item starting at zero. Frame-rate robot actions grouped by the VAE factor
+            start at latent frame 1, after the initial observation, without null padding.
         items_per_sample: how many items each sample owns. ``None`` means one each.
         is_control: whether each item conditions the target that follows it. ``None`` means
             none of them do.
+        control_attends_sensor: what a control query may reach, matching the mask flag of that
+            name. ``True`` gives it its whole view group, its target's sensor tokens included,
+            which is one unmasked pass over the group. ``False`` gives it the group's control
+            tokens alone, which takes the two passes described above. ``None`` states nothing,
+            and is accepted only for a batch that marks no control item -- where the two are the
+            same attention, since there is no control query to narrow. A batch that carries one
+            is refused rather than given a default: a default here is a silently wider or
+            narrower key set for exactly the tokens the flag is about, and which value the run
+            means is the config's answer, not this builder's.
         view_axis: which sensor's view numbering each item is on, so a camera view 0 and a
             range item's only view are told apart. ``None`` puts every item on axis 0, which
             is right whenever the batch carries one sensor.
@@ -436,10 +753,22 @@ def build_multiview_maskless_plan(
     Returns:
         The plan, with its partitions as varlen offsets and the gathers that reach them.
 
+    With ``deduplicate_cross_view=True``, the instant pass instead uses disjoint
+    cross-view rectangles: same-view edges remain solely in the first pass. The
+    clock assignment, controls and captions are otherwise unchanged. A non-None
+    ``decomposed_temporal_window_seconds`` additionally replaces instant matching
+    with Flex's ``start <= key_time - query_time <= end`` rule, using float32
+    frame-start times and the same tolerance. Bounds (-N, 0) are past-only.
+    Both modes support windows. Without deduplication, the temporal pass includes
+    own-view keys inside that window, so those keys are counted twice after merging.
+    ``decomposed_temporal_window_includes_first_frame`` widens the window to each sample's
+    first frame as well, and needs a window to widen.
+
     Raises:
         ValueError: for mismatched lengths, an empty batch, a non-positive rate, a sample whose
-            items are all control, a ``latent_t`` its item's view count does not divide, or a
-            batch no token of which reads a caption -- every item cut off from the captions by
+            items are all control, a batch that marks a control item without stating
+            ``control_attends_sensor``, a ``latent_t`` its item's view count does not divide, or
+            a batch no token of which reads a caption -- every item cut off from the captions by
             ``lidar_attends_captions=False``, which is generation without text conditioning
             rather than an attention this builds.
     """
@@ -449,12 +778,19 @@ def build_multiview_maskless_plan(
             "'decomposed' or 'same_view'. 'all_views' is one unmasked pass per sample rather "
             "than a partition of one, and is not built here."
         )
+    if decomposed_temporal_window_seconds is not None:
+        temporal_window_bounds(decomposed_temporal_window_seconds)
+        if seconds_per_frame is None:
+            raise ValueError("decomposed_temporal_window_seconds requires explicit seconds_per_frame")
+    elif decomposed_temporal_window_includes_first_frame:
+        raise ValueError("decomposed_temporal_window_includes_first_frame needs decomposed_temporal_window_seconds.")
     num_items = len(num_views)
     if len(token_shapes) != num_items:
         raise ValueError(f"num_views describes {num_items} items but token_shapes describes {len(token_shapes)}.")
     if not num_items:
         raise ValueError("build_multiview_maskless_plan needs at least one item.")
     rates = [1.0] * num_items if seconds_per_frame is None else list(seconds_per_frame)
+    offsets = [0] * num_items if frame_offsets is None else list(frame_offsets)
     control = [False] * num_items if is_control is None else list(is_control)
     axes = [0] * num_items if view_axis is None else list(view_axis)
     # ``None`` reproduces what the axis used to decide on its own: the cameras' axis is the one
@@ -466,17 +802,32 @@ def build_multiview_maskless_plan(
     )
     for name, values in (
         ("seconds_per_frame", rates),
+        ("frame_offsets", offsets),
         ("is_control", control),
         ("view_axis", axes),
         ("caption_access", accesses),
     ):
         if len(values) != num_items:
             raise ValueError(f"num_views describes {num_items} items but {name} describes {len(values)}.")
-    if any(rate <= 0 for rate in rates):
-        raise ValueError(f"seconds_per_frame must be positive, got {rates}.")
+    if any(rate <= 0 or not math.isfinite(rate) for rate in rates):
+        raise ValueError(f"seconds_per_frame must be positive and finite, got {rates}.")
+    if any(not isinstance(offset, int) or offset < 0 for offset in offsets):
+        raise ValueError(f"frame_offsets must be nonnegative integers, got {offsets}.")
     counts = [1] * num_items if items_per_sample is None else list(items_per_sample)
     if sum(counts) != num_items:
         raise ValueError(f"items_per_sample sums to {sum(counts)} but the batch holds {num_items} items.")
+    if control_attends_sensor is None and any(control):
+        raise ValueError(
+            "This batch marks a control item, so control_attends_sensor decides what its control "
+            "queries reach -- their view's sensor tokens as well as its control ones, or only the "
+            "latter -- and no default is right for both. Pass the value the run's mask config "
+            "states (MultiviewAttentionMaskConfig.control_attends_sensor)."
+        )
+    # Unstated is only reachable for a batch with no control query to narrow, where the two
+    # values are the same attention, so the permissive one is what the plan records.
+    control_reaches_sensor = True if control_attends_sensor is None else control_attends_sensor
+    # The split is the flag's only effect, and only where there is a control token to withhold.
+    needs_control_split = not control_reaches_sensor and any(control)
 
     frames_per_view: list[int] = []
     spatial_tokens: list[int] = []
@@ -490,6 +841,7 @@ def build_multiview_maskless_plan(
 
     plan = MultiviewMasklessPlan(
         attention_scope=attention_scope,
+        control_attends_sensor=control_reaches_sensor,
         num_views=tuple(num_views),
         token_shapes=tuple(token_shapes),
         seconds_per_frame=tuple(rates),
@@ -497,7 +849,14 @@ def build_multiview_maskless_plan(
         is_control=tuple(control),
         view_axis=tuple(axes),
         num_gen_tokens=sum(item_lens),
+        deduplicate_cross_view=deduplicate_cross_view,
+        decomposed_temporal_window_seconds=decomposed_temporal_window_seconds,
+        decomposed_temporal_window_includes_first_frame=decomposed_temporal_window_includes_first_frame,
         padded_gen_tokens=sum(item_lens) if padded_gen_tokens is None else padded_gen_tokens,
+        sensor_to_sensor_window=sensor_to_sensor_window,
+        sensor_to_control_window=sensor_to_control_window,
+        control_to_control_window=control_to_control_window,
+        control_to_sensor_window=control_to_sensor_window,
     )
     if plan.padded_gen_tokens < plan.num_gen_tokens:
         raise ValueError(
@@ -523,6 +882,15 @@ def build_multiview_maskless_plan(
     # already walks -- and materialized only when that case is in play.
     per_view_captions = bool(captions) and not all(len(sample_captions) <= 1 for sample_captions in captions)
     subset_gen_to_und = (not per_view_captions) and any(access == "no_captions" for access in accesses)
+    frame_windows = (
+        sensor_to_sensor_window,
+        sensor_to_control_window,
+        control_to_control_window,
+        control_to_sensor_window,
+    )
+    uses_frame_windows = any(window is not None for window in frame_windows)
+    if uses_frame_windows and any(offsets):
+        raise ValueError("Nonzero item frame offsets are not supported by same-view neighborhood windows.")
 
     view_group: dict[tuple[int, int, int], int] = {}
     group_sample: dict[int, int] = {}
@@ -530,8 +898,17 @@ def build_multiview_maskless_plan(
     view_ids: list[torch.Tensor] = []
     instant_ids: list[torch.Tensor] = []
     sensor_positions: list[torch.Tensor] = []
+    instant_cells: dict[tuple[int, float], dict[int, list[tuple[int, int]]]] = {}
     caption_reader_runs: list[torch.Tensor] = []
     caption_reader_lens: list[int] = []
+    # Each same-view group's tokens kept apart by what they are, for the split
+    # ``control_attends_sensor=False`` takes. Collected only then: an ordinary batch pays nothing
+    # for a flag whose one effect it does not see.
+    group_sensor_runs: dict[int, list[torch.Tensor]] = {}
+    group_control_runs: dict[int, list[torch.Tensor]] = {}
+    sensor_runs: dict[tuple[int, int, int], torch.Tensor] = {}
+    control_runs: dict[tuple[int, int, int], torch.Tensor] = {}
+    neighborhood_layouts: dict[tuple[int, int, int], tuple[int, int, int]] = {}
     item = position = 0
     for sample, count in enumerate(counts):
         if all(control[item + offset] for offset in range(count)):
@@ -555,15 +932,80 @@ def build_multiview_maskless_plan(
             # the same answer either way.
             group_access.update({view_group[(sample, axes[item], view)]: accesses[item] for view in range(views)})
             view_ids.append(ids.repeat_interleave(frames * spatial))  # [V*F*S]
+            if needs_control_split:
+                # One run per (item, view), which is what makes a group's two halves separable at
+                # all: an item is view-outer, so a view's share of it is one contiguous run.
+                cell = frames * spatial
+                runs = group_control_runs if control[item] else group_sensor_runs
+                for view in range(views):
+                    start = position + view * cell
+                    runs.setdefault(view_group[(sample, axes[item], view)], []).append(
+                        torch.arange(start, start + cell, device=device)  # [F*S]
+                    )
+
+            if uses_frame_windows:
+                # Record where each view's tokens live in the packed GEN stream. A control item
+                # writes its per-view ranges to control_runs; its sensor target later writes the
+                # corresponding ranges to sensor_runs under the same (sample, axis, view) keys:
+                #
+                #   control_runs[key] = packed positions of this view's control tokens
+                #   sensor_runs[key]  = packed positions of this view's sensor tokens
+                #
+                # Below, the runs are concatenated in the same key order to form control_gather and
+                # sensor_gather. The attention calls then select Q and K from those two gathers to run
+                # Sensor->Sensor, Sensor->Control, Control->Sensor, and Control->Control.
+                for view in range(views):
+                    key = (sample, axes[item], view)
+                    start = position + view * frames * spatial
+                    run = torch.arange(start, start + frames * spatial, device=device)  # [F*S]
+                    destination = control_runs if control[item] else sensor_runs
+                    if key in destination:
+                        raise ValueError(f"Maskless neighborhood attention found multiple items for view group {key}.")
+                    destination[key] = run
+                    layout = (frames, token_shapes[item][1], token_shapes[item][2])
+                    if key in neighborhood_layouts and neighborhood_layouts[key] != layout:
+                        raise ValueError(
+                            f"Maskless neighborhood attention needs matching control/sensor layouts for {key}; "
+                            f"got {neighborhood_layouts[key]} and {layout}."
+                        )
+                    neighborhood_layouts[key] = layout
+
             if not control[item] and not single_group_sample[sample] and attention_scope != "same_view":
-                frame_ids = torch.arange(frames, device=device, dtype=torch.float64)  # [F]
                 # The epsilon nudges a frame whose midpoint lands exactly on an anchor boundary
                 # into the later group rather than leaving it to float rounding. Exact landings
                 # need commensurate spans; at 10Hz against 7.5Hz the margin is an eighth of a
                 # frame.
-                instants = torch.floor((frame_ids + 0.5) * (rates[item] / anchor_rate) + 1e-6).long()  # [F]
-                instant_ids.append(instants.repeat_interleave(spatial).repeat(views) + (sample << 32))
-                sensor_positions.append(torch.arange(position, position + item_lens[item], device=device))
+                if deduplicate_cross_view or decomposed_temporal_window_seconds is not None:
+                    # Match Flex's float32 frame-start clock exactly for windows;
+                    # leave the original midpoint quantisation intact otherwise.
+                    frame_times = (
+                        (
+                            (torch.arange(frames, dtype=torch.float32, device="cpu") + offsets[item]) * rates[item]
+                        ).tolist()  # [F] -> list
+                        if decomposed_temporal_window_seconds is not None
+                        else None
+                    )
+                    for view in range(views):
+                        group = view_group[(sample, axes[item], view)]
+                        for frame in range(frames):
+                            instant = (
+                                frame_times[frame]
+                                if frame_times is not None
+                                else math.floor((frame + offsets[item] + 0.5) * (rates[item] / anchor_rate) + 1e-6)
+                            )
+                            start = position + (view * frames + frame) * spatial
+                            instant_cells.setdefault((sample, instant), {}).setdefault(group, []).append(
+                                (start, start + spatial)
+                            )
+                else:
+                    frame_ids = torch.arange(frames, device=device, dtype=torch.float64)  # [F]
+                    instants = torch.floor(
+                        (frame_ids + offsets[item] + 0.5) * (rates[item] / anchor_rate) + 1e-6
+                    ).long()  # [F]
+                    instant_ids.append(instants.repeat_interleave(spatial).repeat(views) + (sample << 32))  # [V*F*S]
+                    sensor_positions.append(
+                        torch.arange(position, position + item_lens[item], device=device)
+                    )  # [N_item]
             # The cameras' axis is the one captions are written for; every other axis is a
             # sensor no caption describes, which is what the flag decides the fate of.
             if subset_gen_to_und and accesses[item] != "no_captions":
@@ -572,6 +1014,36 @@ def build_multiview_maskless_plan(
             position += item_lens[item]
             item += 1
         caption_reader_lens.append(sample_reader_tokens)
+
+    if uses_frame_windows:
+        if not control_runs and any(
+            window is not None
+            for window in (sensor_to_control_window, control_to_control_window, control_to_sensor_window)
+        ):
+            raise ValueError(
+                "A batch without control items supports only sensor_to_sensor_window; "
+                "the configured control edges have no control queries or keys."
+            )
+        if control_runs and set(sensor_runs) != set(control_runs):
+            raise ValueError(
+                "Neighborhood windows require either sensor-only view groups or exactly one control and one sensor "
+                f"item for every view; sensor groups={sorted(sensor_runs)}, control groups={sorted(control_runs)}."
+            )
+        layouts = set(neighborhood_layouts.values())
+        if len(layouts) != 1:
+            raise ValueError(
+                "Maskless neighborhood windows currently require one common (frames, height, width) layout; "
+                f"got {sorted(layouts)}."
+            )
+        ordered_groups = sorted(sensor_runs)
+        # Update the immutable base plan for windowed attention with the packed sensor/control
+        # token gathers and the common per-view NATTEN layout.
+        plan = dataclasses.replace(
+            plan,
+            sensor_gather=torch.cat([sensor_runs[group] for group in ordered_groups]),
+            control_gather=(torch.cat([control_runs[group] for group in ordered_groups]) if control_runs else None),
+            neighborhood_layout=next(iter(layouts)),
+        )
 
     def _gen_to_und_subset() -> tuple[torch.Tensor | None, int]:
         """The sample-level gen->und pass's query subset, or the whole-stream form as ``None``.
@@ -593,9 +1065,25 @@ def build_multiview_maskless_plan(
         # to the tail where it already sits. The pass then covers the whole stream: a padded
         # query meets only padded keys, and no row is left for a varlen kernel to skip.
         view_ids.append(torch.full((pad_tokens,), len(view_group), device=device))
+        if needs_control_split:
+            # Padding is nobody's control stream, so it is a sensor group here: its queries take
+            # the whole (single-run) group as keys, which is the padding attending itself, the
+            # same thing the unsplit pass gives it.
+            group_sensor_runs[len(view_group)] = [
+                torch.arange(plan.num_gen_tokens, plan.padded_gen_tokens, device=device)  # [pad_tokens]
+            ]
+    split_fields = _control_split_fields(group_sensor_runs, group_control_runs, device) if needs_control_split else {}
     same_view_gather, same_view_lens = _partition(torch.cat(view_ids))
     if not instant_ids:
-        # Every sample owned a single view group, so nothing is left to attend by instant.
+        # No legacy instant partition: either every sample has one view group,
+        # or exact/windowed cross-view rectangles replace the legacy instant partition.
+        partitions = _cross_view_partitions(
+            instant_cells,
+            device,
+            decomposed_temporal_window_seconds,
+            deduplicate_cross_view=deduplicate_cross_view,
+            include_first_frame=decomposed_temporal_window_includes_first_frame,
+        )
         caption_gather, caption_lens = _caption_partition(
             captions, view_group, group_sample, group_access, device, bool(pad_tokens)
         )
@@ -609,7 +1097,8 @@ def build_multiview_maskless_plan(
         gen_to_und_gather, gen_to_und_max_len = _gen_to_und_subset()
         return dataclasses.replace(
             plan,
-            cross_view_empty=True,
+            cross_view_empty=not partitions,
+            cross_view_partitions=partitions,
             caption_gather=caption_gather,
             caption_offsets=caption_offsets,
             caption_max_len=caption_max_len,
@@ -621,6 +1110,7 @@ def build_multiview_maskless_plan(
             same_view_offsets=_cumulative_offsets(same_view_lens, device),
             same_view_max_len=max(same_view_lens),
             same_view_gather=same_view_gather,
+            **split_fields,
         )
     # Sliced to the sensor tokens, so the gather indexes the packed stream but is shorter than
     # it: the pass runs over that subset and its output is scattered back, leaving the control
@@ -654,6 +1144,7 @@ def build_multiview_maskless_plan(
         same_view_offsets=_cumulative_offsets(same_view_lens, device),
         same_view_max_len=max(same_view_lens),
         same_view_gather=same_view_gather,
+        **split_fields,
         cross_view_offsets=_cumulative_offsets(cross_view_lens, device),
         cross_view_max_len=max(cross_view_lens),
         cross_view_gather=cross_view_gather,
@@ -669,6 +1160,19 @@ def _scatter_to_packed(gather: torch.Tensor, num_gen_tokens: int) -> BridgeFn:
     zero and a log-sum-exp of the dtype's minimum, which is the weight ``merge_attentions``
     gives a branch that contributes nothing. ``finfo.min`` rather than ``-inf`` so a row with no
     real branch at all cannot produce ``inf - inf``.
+
+    That weight is only nil in a branch that is **not the first one merged**. ``merge_attentions``
+    accumulates as ``lse0 - logsigmoid(lse0 - lse1)``, and at ``lse0 = finfo.min`` the difference
+    rounds back to ``lse0`` in float32, so ``logsigmoid`` returns it unchanged and the
+    subtraction cancels to ``0.0`` -- destroying the real branch rather than out-weighing it.
+    Measured on this stack: merging ``[-5, finfo.min, -3]`` gives the right answer (1.8808) and
+    ``[finfo.min, -5, -3]`` gives 1.0474, with a log-sum-exp of ``+0.05`` that is then written
+    back into every branch's saved LSE and rescales their gradients.
+
+    So every caller of this has to be a branch the first one does not need to carry, and the
+    first branch has to cover every row. :func:`multiview_maskless_gen_attention` keeps that
+    invariant by construction -- see the comment where it assembles the merge -- and
+    :func:`_control_split_fields` is written the way it is in order to preserve it.
     """
 
     def _forward(out: torch.Tensor, lse: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -713,6 +1217,80 @@ def _check_plan_matches_pack(plan: MultiviewMasklessPlan, packed_query_states: S
         )
 
 
+def _natten_window(
+    window: TemporalFrameWindow | None,
+    layout: tuple[int, int, int],
+) -> tuple[tuple[int, int, int], tuple[bool, bool, bool]]:
+    """Translate an inclusive frame window into NATTEN kernel geometry.
+
+    Returns ``(window_size, is_causal)``. Both tuples follow NATTEN's
+    ``(time, height, width)`` dimension order. Only the temporal dimension can
+    be causal, so the height and width flags are always ``False``. NATTEN keeps
+    centered windows at a fixed width by shifting them inward at the sequence
+    boundaries; causal windows instead clip at the beginning.
+    """
+    frames, height, width = layout
+    if window is None:
+        return layout, (False, False, False)
+    if not _is_supported_neighborhood_window(window):
+        raise ValueError(
+            f"Maskless neighborhood attention needs a centered -N:N or causal -N:0 window; got {window!r}."
+        )
+    lower, upper = window
+    is_causal = upper == 0
+    temporal = min(frames, -lower + 1 if is_causal else upper - lower + 1)
+    return (temporal, height, width), (is_causal, False, False)
+
+
+def _reshape_neighborhood_for_merge(
+    batch_size: int,
+    layout: tuple[int, int, int],
+) -> tuple[BridgeFn, BridgeFn]:
+    """Bridge a NATTEN multidimensional result to merge-attention's packed layout."""
+
+    def _forward(out: torch.Tensor, lse: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        out_flat = out.reshape(1, -1, out.shape[-2], out.shape[-1])  # [1,N,H,D]
+        lse_flat = lse.reshape(1, -1, lse.shape[-1])  # [1,N,H]
+        return out_flat, lse_flat
+
+    def _inverse(out: torch.Tensor, lse: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        out_shaped = out.reshape(batch_size, *layout, out.shape[-2], out.shape[-1])  # [B,F,Y,X,H,D]
+        lse_shaped = lse.reshape(batch_size, *layout, lse.shape[-1])  # [B,F,Y,X,H]
+        return out_shaped, lse_shaped
+
+    return _forward, _inverse
+
+
+def _same_view_neighborhood_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    query_gather: torch.Tensor,
+    key_gather: torch.Tensor,
+    layout: tuple[int, int, int],
+    window: TemporalFrameWindow | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run same-view neighborhood attention for one query-role and key/value-role pair."""
+    tokens_per_view = layout[0] * layout[1] * layout[2]
+    batch_size = int(query_gather.shape[0]) // tokens_per_view
+    q_edge = q[query_gather].reshape(batch_size, *layout, q.shape[-2], q.shape[-1])  # [B,F,Y,X,H,D]
+    k_edge = k[key_gather].reshape(batch_size, *layout, k.shape[-2], k.shape[-1])  # [B,F,Y,X,Hkv,D]
+    v_edge = v[key_gather].reshape(batch_size, *layout, v.shape[-2], v.shape[-1])  # [B,F,Y,X,Hkv,D]
+    window_size, is_causal = _natten_window(window, layout)
+    edge_out, edge_lse = multi_dimensional_attention(
+        q_edge,
+        k_edge,
+        v_edge,
+        window_size=window_size,
+        is_causal=is_causal,
+        backend="natten",
+        return_lse=True,
+    )  # out: [B,F,Y,X,H,D], lse: [B,F,Y,X,H]
+    forward_fn, inverse_fn = _reshape_neighborhood_for_merge(batch_size, layout)
+    return MergeAttentionsBridge.apply(edge_out, edge_lse, forward_fn, inverse_fn)
+
+
 def multiview_maskless_gen_attention(
     packed_query_states: SequencePack,
     packed_key_states: SequencePack,
@@ -738,7 +1316,17 @@ def multiview_maskless_gen_attention(
     * **gen->und** -- the sample's captions, the same pass ``three_way_attention`` calls
       ``full_ca``.
 
-    The two sensor passes overlap on the query's own ``(view, frame)`` cell, which belongs to
+    Still three passes under ``control_attends_sensor=False``, which withholds from a control
+    query the sensor tokens of its own view. That is not a fourth kernel but a finer cut of the
+    first: a same-view group becomes two varlen segments, its sensor tokens keyed against the
+    whole group and its control tokens against the group's control tokens alone. The segments
+    still partition the stream, so every row is written exactly once, and everything below about
+    the sensor overlap and the merge holds unchanged -- a control query is in neither the
+    overlapping pass nor the cross-instant one, so its keys are counted once and the fold is
+    *exact* against the mask for those rows. With the flag on, or with no control item, the
+    group is one segment again and nothing here differs.
+
+    By default, the two sensor passes overlap on the query's own ``(view, frame)`` cell, which belongs to
     both "my view, all frames" and "my frame, all views". ``merge_attentions`` merges as if the
     key sets had been concatenated, so those ``spatial_tokens`` keys carry twice the softmax
     weight they would under FlexAttention's single OR-mask, which counts each key once.
@@ -748,10 +1336,12 @@ def multiview_maskless_gen_attention(
     away from ``attention_scope="decomposed"``. The own cell is a large share of both key sets,
     so double-weighting it moves the distribution. ``multiview_maskless_attention`` is
     therefore its own attention pattern rather than a drop-in for that scope -- a checkpoint
-    trained under the flex mask is not one this can serve unchanged. Making the two agree takes
-    inclusion-exclusion: a third pass over the own cell alone, subtracted from the merge, which
-    ``merge_attentions`` cannot express (it has no negative weights) and which nothing here
-    does.
+    trained under the flex mask is not one this default can serve unchanged. One way to remove
+    overlap would be inclusion-exclusion: a third pass over the own cell alone, subtracted
+    from the merge. ``merge_attentions`` cannot express this (it has no negative weights).
+    ``deduplicate_cross_view`` instead partitions the off-diagonal
+    view blocks hierarchically; its unmasked rectangular passes have disjoint key
+    sets for each query, so the existing positive merge is exact, with no subtraction.
 
     Trains as well as it infers. Both fold-backs run through :class:`MergeAttentionsBridge`,
     which is what makes the backward correct: ``merge_attentions`` repairs each branch by
@@ -808,43 +1398,164 @@ def multiview_maskless_gen_attention(
     # pack's offsets and maximum lengths describe exactly the tensors handed to the kernels.
     q, k, v = full_q, full_k, full_v  # [N_full,*,head_dim]
 
-    # ── Pass 1: same view, every frame ────────────────────────────────────────
+    # ── Pass 1: same view, every frame or configured neighborhood ─────────────
     # Tokens are camera-major (view-outer, frame-inner, spatial-innermost), so one item per view
     # axis leaves a view's tokens already contiguous: the groups tile the stream in packed order
     # and the kernel's own output is that order -- no gather, no bridge. A control item puts a
     # view's tokens in two runs instead, which costs the gather and the bridge back.
-    view_gather = plan.same_view_gather
-    # Keep this fold's output under selective AC rather than recomputing it: it is
-    # ~96% of forward attention time and ~94% of backward, against three other
-    # calls running the same kernel that a name-matching policy cannot tell apart.
-    # The mark goes on K because it is the smallest operand the call takes -- 32 query
-    # heads against 8 KV heads, 2 against 1 per rank under CP16 -- and marking copies
-    # what it marks.
-    same_view_k = mark_next_activation((k if view_gather is None else k[view_gather]).unsqueeze(0))
-    same_view_out, same_view_lse = attention(
-        (q if view_gather is None else q[view_gather]).unsqueeze(0),  # [1,N_gen,heads,head_dim]
-        same_view_k,  # [1,N_gen,kv_heads,head_dim]
-        (v if view_gather is None else v[view_gather]).unsqueeze(0),  # [1,N_gen,kv_heads,head_dim]
-        cumulative_seqlen_Q=plan.same_view_offsets,
-        cumulative_seqlen_KV=plan.same_view_offsets,
-        max_seqlen_Q=plan.same_view_max_len,
-        max_seqlen_KV=plan.same_view_max_len,
-        return_lse=True,
-    )  # out: [1,N_gen,heads,head_dim], lse: [1,N_gen,heads]
-    if view_gather is not None:
-        same_view_out, same_view_lse = MergeAttentionsBridge.apply(
-            same_view_out,
-            same_view_lse,
-            _scatter_to_packed(view_gather, num_gen_tokens),
-            _gather_from_packed(view_gather),
-        )  # [1,N_gen,heads,head_dim], [1,N_gen,heads]
+    frame_windows = (
+        plan.sensor_to_sensor_window,
+        plan.sensor_to_control_window,
+        plan.control_to_control_window,
+        plan.control_to_sensor_window,
+    )
+    if any(window is not None for window in frame_windows):
+        if plan.sensor_gather is None or plan.neighborhood_layout is None:
+            raise ValueError("A windowed multiview attention plan is missing its sensor neighborhood geometry.")
+        sensor_to_sensor_out, sensor_to_sensor_lse = _same_view_neighborhood_attention(
+            q,
+            k,
+            v,
+            query_gather=plan.sensor_gather,
+            key_gather=plan.sensor_gather,
+            layout=plan.neighborhood_layout,
+            window=plan.sensor_to_sensor_window,
+        )  # [1,N_sensor,H,D], [1,N_sensor,H]
+        if plan.control_gather is None:
+            # Sensor is the only query population. The bridge still matters when the pack has
+            # padding: it fills those rows with zero merge weight and preserves the attention
+            # kernel's saved output/LSE storage during the outer log-sum-exp merge's backward.
+            same_view_out, same_view_lse = MergeAttentionsBridge.apply(
+                sensor_to_sensor_out,
+                sensor_to_sensor_lse,
+                _scatter_to_packed(plan.sensor_gather, num_gen_tokens),
+                _gather_from_packed(plan.sensor_gather),
+            )  # [1,N_gen,H,D], [1,N_gen,H]
+        else:
+            sensor_to_control_out, sensor_to_control_lse = _same_view_neighborhood_attention(
+                q,
+                k,
+                v,
+                query_gather=plan.sensor_gather,
+                key_gather=plan.control_gather,
+                layout=plan.neighborhood_layout,
+                window=plan.sensor_to_control_window,
+            )  # [1,N_sensor,H,D], [1,N_sensor,H]
+            sensor_out, sensor_lse = merge_attentions(
+                outputs=[sensor_to_sensor_out, sensor_to_control_out],
+                lse_tensors=[sensor_to_sensor_lse, sensor_to_control_lse],
+                torch_compile=True,
+            )  # [1,N_sensor,H,D], [1,N_sensor,H]
+            control_to_control_out, control_to_control_lse = _same_view_neighborhood_attention(
+                q,
+                k,
+                v,
+                query_gather=plan.control_gather,
+                key_gather=plan.control_gather,
+                layout=plan.neighborhood_layout,
+                window=plan.control_to_control_window,
+            )  # [1,N_control,H,D], [1,N_control,H]
+            # Windowing narrows enabled edges; it must not restore the sensor keys
+            # withheld from control queries by control_attends_sensor=False.
+            control_out, control_lse = (
+                control_to_control_out,
+                control_to_control_lse,
+            )  # [1,N_control,H,D], [1,N_control,H]
+            if plan.control_attends_sensor:
+                control_to_sensor_out, control_to_sensor_lse = _same_view_neighborhood_attention(
+                    q,
+                    k,
+                    v,
+                    query_gather=plan.control_gather,
+                    key_gather=plan.sensor_gather,
+                    layout=plan.neighborhood_layout,
+                    window=plan.control_to_sensor_window,
+                )  # [1,N_control,H,D], [1,N_control,H]
+                control_out, control_lse = merge_attentions(
+                    outputs=[control_to_sensor_out, control_to_control_out],
+                    lse_tensors=[control_to_sensor_lse, control_to_control_lse],
+                    torch_compile=True,
+                )  # [1,N_control,H,D], [1,N_control,H]
+            same_view_out, same_view_lse = DisjointQueriesBridge.apply(
+                sensor_out,
+                sensor_lse,
+                control_out,
+                control_lse,
+                plan.sensor_gather,
+                plan.control_gather,
+                num_gen_tokens,
+            )  # [1,N_gen,H,D], [1,N_gen,H]
+    else:
+        #
+        # Under ``control_attends_sensor=False`` a group is no longer one segment: its sensor queries
+        # take it whole while its control queries take its control tokens alone, so the plan cuts it
+        # into two varlen segments with their own keys. Still one pass and one kernel -- varlen pairs
+        # segment ``i`` of the queries with segment ``i`` of the keys, and nothing requires the two
+        # to be the same length or even the same tokens. Both sides are then a gather, the identity
+        # form belonging to the unsplit case alone.
+        if plan.same_view_q_gather is None:
+            view_gather = kv_gather = plan.same_view_gather
+            q_offsets, kv_offsets = plan.same_view_offsets, plan.same_view_offsets
+            q_max_len, kv_max_len = plan.same_view_max_len, plan.same_view_max_len
+        else:
+            view_gather, kv_gather = plan.same_view_q_gather, plan.same_view_kv_gather
+            q_offsets, kv_offsets = plan.same_view_q_offsets, plan.same_view_kv_offsets
+            q_max_len, kv_max_len = plan.same_view_q_max_len, plan.same_view_kv_max_len
+        # Keep this fold's output under selective AC rather than recomputing it: it is
+        # ~96% of forward attention time and ~94% of backward, against three other
+        # calls running the same kernel that a name-matching policy cannot tell apart.
+        # The mark goes on K because it is the smallest operand the call takes -- 32 query
+        # heads against 8 KV heads, 2 against 1 per rank under CP16 -- and marking copies
+        # what it marks. The split leaves this a single call, so the mark still covers all of it.
+        same_view_k = mark_next_activation((k if kv_gather is None else k[kv_gather]).unsqueeze(0))
+        same_view_out, same_view_lse = attention(
+            (q if view_gather is None else q[view_gather]).unsqueeze(0),  # [1,N_q,heads,head_dim]
+            same_view_k,  # [1,N_kv,kv_heads,head_dim]
+            (v if kv_gather is None else v[kv_gather]).unsqueeze(0),  # [1,N_kv,kv_heads,head_dim]
+            cumulative_seqlen_Q=q_offsets,
+            cumulative_seqlen_KV=kv_offsets,
+            max_seqlen_Q=q_max_len,
+            max_seqlen_KV=kv_max_len,
+            return_lse=True,
+        )  # out: [1,N_q,heads,head_dim], lse: [1,N_q,heads]
+        if view_gather is not None:
+            # By the query gather, which is what indexes this pass's *output* rows; the key gather is
+            # internal to the kernel's own sum and has nothing on the far side to be put back into.
+            same_view_out, same_view_lse = MergeAttentionsBridge.apply(
+                same_view_out,
+                same_view_lse,
+                _scatter_to_packed(view_gather, num_gen_tokens),
+                _gather_from_packed(view_gather),
+            )  # [1,N_gen,heads,head_dim], [1,N_gen,heads]
 
     # A batch whose every sample owns one view group has no cross-instant work to do: its
     # instant groups sit inside its view groups, so the pass would only double-weight each
     # query's own instant. Skipped outright rather than merged at zero weight, which saves
     # the kernel as well as the distortion.
     cross_view_out = cross_view_lse = None
-    if not plan.cross_view_empty:
+    partition_outputs: list[torch.Tensor] = []  # each [1,N,H,D]
+    partition_lses: list[torch.Tensor] = []  # each [1,N,H]
+    if plan.deduplicate_cross_view or plan.decomposed_temporal_window_seconds is not None:
+        for partition in plan.cross_view_partitions:
+            out, lse = attention(
+                q[partition.query_indices].unsqueeze(0),  # [1,Nq,H,D]
+                k[partition.key_indices].unsqueeze(0),  # [1,Nk,Hkv,D]
+                v[partition.key_indices].unsqueeze(0),  # [1,Nk,Hkv,D]
+                cumulative_seqlen_Q=partition.query_offsets,
+                cumulative_seqlen_KV=partition.key_offsets,
+                max_seqlen_Q=partition.max_query_len,
+                max_seqlen_KV=partition.max_key_len,
+                return_lse=True,
+            )  # [1,Nq,H,D], [1,Nq,H]
+            out, lse = MergeAttentionsBridge.apply(
+                out,
+                lse,
+                _scatter_to_packed(partition.query_indices, num_gen_tokens),
+                _gather_from_packed(partition.query_indices),
+            )  # [1,N,H,D], [1,N,H]
+            partition_outputs.append(out)
+            partition_lses.append(lse)
+    elif not plan.cross_view_empty:
         # ── Pass 2: same frame, every view ────────────────────────────────────────
         # A frame's views are strided through the packed order, so this pass reaches them through
         # a gather. The way back is a copy too, and a copy is what
@@ -957,8 +1668,17 @@ def multiview_maskless_gen_attention(
                 _gather_from_packed(reader_gather),
             )  # [1,N_gen,heads,head_dim], [1,N_gen,heads]
 
+    # The same-view pass goes first, and that is an invariant rather than an ordering. It is the
+    # only branch that covers every row of the stream -- the cross-instant one skips control
+    # tokens, the gen->und one skips whatever reads no caption -- and a first branch that does
+    # not cover a row silently destroys the real branches for it, see ``_scatter_to_packed``.
+    # Under ``control_attends_sensor=False`` that is exactly why the split is two varlen segments
+    # of this pass rather than two passes: either pass alone would leave the other's rows
+    # uncovered, and no ordering of the two would fix it.
     outputs = [same_view_out]
     lse_tensors = [same_view_lse]
+    outputs.extend(partition_outputs)
+    lse_tensors.extend(partition_lses)
     if cross_view_out is not None:
         assert cross_view_lse is not None
         outputs.append(cross_view_out)
