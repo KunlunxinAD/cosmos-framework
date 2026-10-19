@@ -19,12 +19,12 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Callable, Container, Optional
 
 import torch
-import torch_xmlir._XMLIRC as XMLIR_C
 import torch.distributed as dist
+import torch_xmlir._XMLIRC as XMLIR_C
 from torch.distributed import get_process_group_ranks
 
-from cosmos_framework.utils.flags import INTERNAL
 from cosmos_framework.utils.device import Device
+from cosmos_framework.utils.flags import INTERNAL
 
 if dist.is_available():
     from torch.distributed.distributed_c10d import _get_default_group
@@ -118,7 +118,6 @@ def init(store: dist.Store | None = None, backend: str | None = None) -> int | N
     log.info(f"Training with {world_size} GPUs.")
 
     return local_rank
-
 
 
 def get_rank(group: Optional[dist.ProcessGroup] = None) -> int:
