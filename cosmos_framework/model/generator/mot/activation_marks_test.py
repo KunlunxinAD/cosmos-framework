@@ -23,7 +23,6 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoi
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
 from cosmos_framework.model.attention import attention
-from cosmos_framework.utils.helper_test import RunIf
 from cosmos_framework.model.generator.mot.activation_marks import (
     MARK_OP_QUALNAME,
     enable_marking,
@@ -33,6 +32,7 @@ from cosmos_framework.model.generator.mot.activation_marks import (
     reset_marking_for_tests,
 )
 from cosmos_framework.model.generator.mot.parallelize_unified_mot import make_selective_ac_policy
+from cosmos_framework.utils.helper_test import RunIf
 
 HEADS = 8
 KV_HEADS = 2
@@ -265,10 +265,10 @@ def test_the_attention_op_regex_covers_every_backend_that_can_be_selected() -> N
     kernel fails here instead of in a training run's memory profile. cuDNN is out of
     scope by design: it rejects varlen and every marked call site is varlen.
     """
-    from cosmos_framework.model.attention.backends import get_backend_list
     from cosmos_framework.configs.base.defaults.activation_checkpointing import (
         ATTENTION_FORWARD_OPS_REGEX,
     )
+    from cosmos_framework.model.attention.backends import get_backend_list
 
     patterns = [re.compile(pattern) for pattern in ATTENTION_FORWARD_OPS_REGEX]
 
@@ -425,13 +425,15 @@ class TestActivationMarks:
         scale = plain.abs().max()
         # Two floors, because either alone is misleading. The run-to-run spread
         # catches a non-deterministic backward, but two runs can land bit-identical
-        # and report zero; bf16 round-off at this scale is the floor underneath
-        # that. Both were measured at 6.25e-02 on the NATTEN path, which is ~1.3e-3
-        # relative -- bf16's mantissa, not a difference marking caused.
+        # and report zero. Account for rounding in both gradients: each has up to
+        # half an epsilon of relative error, so their difference needs a full
+        # epsilon. Half an epsilon can be smaller than one bf16 step (e.g. 0.25
+        # near 46.5), rejecting adjacent representable values.
         observed = (plain - plain_again).abs().max()
-        floor = torch.maximum(observed * 2, scale * 2**-8)
+        roundoff = scale * torch.finfo(plain.dtype).eps
+        floor = torch.maximum(observed * 2, roundoff)
         difference = (marked - plain).abs().max()
-        assert difference <= floor, f"marked differs by {difference}; run-to-run {observed}, bf16 floor {scale * 2**-8}"
+        assert difference <= floor, f"marked differs by {difference}; run-to-run {observed}, bf16 floor {roundoff}"
 
     @pytest.mark.parametrize("compiled", [False, True])
     def test_each_mark_is_consumed_by_exactly_one_call(self, compiled: bool) -> None:

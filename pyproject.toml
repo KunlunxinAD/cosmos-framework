@@ -13,7 +13,7 @@ authors = [
 ]
 description = "Cosmos-Framework: Cosmos3 World Foundation Model (WFM)"
 requires-python = ">=3.10,<3.14"
-license = {text = "OpenMDW-1.1"}
+license = {text = "OpenMDW-1.1 AND Apache-2.0"}
 classifiers = [
   "Development Status :: 4 - Beta",
   "Environment :: GPU :: NVIDIA CUDA",
@@ -34,6 +34,7 @@ dependencies = [
   "hydra-core",
   "imageio-ffmpeg",
   "imageio",
+  "iopath>=0.1.10",
   "loguru",
   "msgpack",
   "nvidia-cudnn-frontend",
@@ -51,6 +52,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+automl = ["nvidia-automl-core==1.0.0.dev0"]
+automl-prompts = ["nvidia-automl-core[prompts]==1.0.0.dev0"]
+reasoner-eval = [
+  "attrs",
+  "evaluate",
+  "matplotlib",
+  "peft",
+  "pillow>=12.2.0",
+  "qwen-vl-utils",
+  "rouge-score",
+  "seaborn",
+  "toml",
+]
 guardrail = [
   "better-profanity",
   "nltk",
@@ -85,7 +99,6 @@ train = [
   "fvcore",
   "glfw",
   "h5py",
-  "iopath>=0.1.10",
   "imagecodecs",
   "ipycanvas",
   "ipyevents",
@@ -94,6 +107,7 @@ train = [
   "kornia",
   "lerobot",
   "librosa",
+  "liger-kernel>=0.8.3,<0.9",
   "lpips",
   "lz4",
   "matplotlib",
@@ -150,6 +164,10 @@ train = [
 ]
 
 
+[project.scripts]
+cosmos-automl = "cosmos_framework.scripts.automl:main"
+cosmos-reasoner-evaluate = "cosmos_framework.evaluation.reasoner.evaluate:main"
+
 [dependency-groups]
 dev = [
   "hatch",
@@ -171,6 +189,8 @@ vllm = [
 ]
 # Match nvcr.io/nvidia/pytorch:25.11-py3: https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-01.html
 cu128 = [
+  # FA4 CuTeDSL kernels; the cu13 extra is only needed by CUDA 13 environments.
+  "flash-attn-4==4.0.0b24",
   "flash-attn-3-nv==1.0.3+cu128.torch210; platform_machine == 'x86_64'",
   "flash-attn==2.7.4.post1+cu128.torch210; platform_machine == 'x86_64'",
   "natten==0.21.6.dev6+cu128.torch210; platform_machine == 'x86_64'",
@@ -204,6 +224,8 @@ cu128-train = [
 ]
 # Match nvcr.io/nvidia/pytorch:25.11-py3: https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-11.html
 cu130 = [
+  # Match imaginaire4's FA4 installation on both x86_64 and aarch64.
+  "flash-attn-4[cu13]==4.0.0b24",
   "flash-attn-3-nv==1.0.3+cu130.torch210; platform_machine == 'x86_64'",
   "flash-attn==2.7.4.post1+cu130.torch210; platform_machine == 'x86_64'",
   # GB300/B300 (sm_103a): use the custom build that includes sm_103a kernels (both arches).
@@ -239,6 +261,7 @@ cu130-train = [
 ]
 # torch 2.13 on CUDA 13.0. Same layout as cu130 but pinned to torch 2.13.
 cu130-torch213 = [
+  "flash-attn-4[cu13]==4.0.0b24",
   #"flash-attn-3-nv==1.0.3+cu130.torch210; platform_machine == 'x86_64'", # TODO: torch213 build (cu130.torch210 wheels are cp313-only + torch210 ABI)
   #"flash-attn==2.7.4.post1+cu130.torch210; platform_machine == 'x86_64'", # TODO: torch213 build (cu130.torch210 wheels are cp313-only + torch210 ABI)
   # torch2.13 build (natten 0.21.6, sm 80/86/89/90/100/103/110/120/121) — matches this group's torch/ABI.
@@ -317,6 +340,12 @@ repository = "https://github.com/NVIDIA/cosmos-framework"
 
 [tool.uv]
 required-version = ">=0.11.3"
+# Development delivery of the optional AutoML engine is by independently built
+# local wheel, not an index. Keep its published extra requirements above intact,
+# but leave that engine out of the repository's uv-managed environment. Install
+# the supplied wheel explicitly after sync; use uv run --no-sync for AutoML.
+# Remove this exception once the core has an approved distribution location.
+exclude-dependencies = ["nvidia-automl-core"]
 conflicts = [
   [
     {group = "cu128"},
