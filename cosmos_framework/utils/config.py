@@ -19,6 +19,8 @@ from loguru import logger as logging
 from cosmos_framework.utils.flags import TRAINING
 
 try:
+    if os.environ.get("COSMOS_DISABLE_MEGATRON") == "1":
+        raise ImportError("Megatron disabled explicitly for this launch")
     from megatron.core import ModelParallelConfig
 
     USE_MEGATRON = True

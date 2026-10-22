@@ -22,6 +22,8 @@ from cosmos_framework.utils.profiling import (
 )
 
 try:
+    if os.environ.get("COSMOS_DISABLE_MEGATRON") == "1":
+        raise ImportError("Megatron disabled explicitly for this launch")
     from megatron.core import parallel_state
 
     USE_MEGATRON = True
@@ -692,7 +694,7 @@ class ImaginaireTrainer:
         final_already_saved = (
             final_epoch is not None and save_freq_in_epoch > 0 and final_epoch % save_freq_in_epoch == 0
         ) or (save_freq_in_epoch == 0 and iteration % self.config.checkpoint.save_iter == 0)
-        if not final_already_saved:
+        if not final_already_saved and os.environ.get("COSMOS_SKIP_FINAL_CHECKPOINT") != "1":
             self.checkpointer.save(
                 model,
                 optimizer,
