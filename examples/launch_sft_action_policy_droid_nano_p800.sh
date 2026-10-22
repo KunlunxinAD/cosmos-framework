@@ -40,7 +40,7 @@ TOML_FILE="examples/toml/sft_config/action_policy_droid_nano.toml"
 
 export DROID_ROOT="${DROID_ROOT:-$DATASET_PATH}"
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export COSMOS_TRAINING=1

@@ -32,7 +32,7 @@ TOML_FILE="examples/toml/sft_config/action_fd_droid_posttrain.toml"
 : "${OUTPUT_ROOT:=outputs/action_fd_droid_posttrain_$(date +%Y%m%d_%H%M%S)}"
 : "${NPROC_PER_NODE:=8}"
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export COSMOS_TRAINING=1
