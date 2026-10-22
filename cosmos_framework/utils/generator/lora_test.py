@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 import torch
 
@@ -129,3 +131,71 @@ def test_packed_lora_rejects_unknown_targets_before_injection() -> None:
             lora_target_modules="q_proj,missing_proj",
         )
     assert not isinstance(model.qkv_proj, LoraInjectedLinear)
+
+
+@pytest.mark.parametrize("training", [True, False])
+@pytest.mark.parametrize("use_rslora", [True, False])
+@pytest.mark.parametrize(
+    "base_dtype,adapter_dtype",
+    [
+        (torch.float64, torch.float64),
+        (torch.float32, torch.float32),
+        (torch.bfloat16, torch.bfloat16),
+        (torch.bfloat16, torch.float32),
+        (torch.float32, torch.bfloat16),
+    ],
+)
+def test_lora_scaled_intermediate_matches_reference(training, use_rslora, base_dtype, adapter_dtype):
+    """Preserve dropout, dtype and gradients against output-scaled LoRA."""
+    torch.manual_seed(42)
+    layer = LoraInjectedLinear(
+        torch.nn.Linear(8, 12, dtype=base_dtype),
+        rank=4,
+        alpha=3,
+        dropout=0.25,
+        use_rslora=use_rslora,
+        adapter_dtype=adapter_dtype,
+    ).train(training)
+    torch.nn.init.normal_(layer.lora_A.weight, std=0.2)
+    torch.nn.init.normal_(layer.lora_B.weight, std=0.2)
+    reference = copy.deepcopy(layer)
+    x = torch.randn(2, 3, 8, dtype=base_dtype, requires_grad=True)
+    reference_x = x.detach().clone().requires_grad_(True)
+    torch.manual_seed(123)
+    actual = layer(x)
+    torch.manual_seed(123)
+    base = torch.nn.functional.linear(reference_x, reference.weight, reference.bias)
+    adapter_input = reference.lora_dropout(reference_x).to(reference.lora_A.weight.dtype)
+    adapter_output = reference.lora_B(reference.lora_A(adapter_input)).to(base.dtype)
+    expected = base + reference._lora_scale * adapter_output
+    assert actual.dtype == base_dtype
+    # Moving scale across a projection/cast changes low-precision rounding.
+    if base_dtype != adapter_dtype:
+        rtol, atol = 0, 0
+    elif torch.bfloat16 in (base_dtype, adapter_dtype):
+        rtol, atol = 0.03, 0.015
+    elif base_dtype == torch.float64:
+        rtol, atol = 1e-10, 1e-12
+    else:
+        rtol, atol = 2e-5, 2e-6
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+    gradient = torch.randn_like(actual)
+    actual.backward(gradient)
+    expected.backward(gradient)
+    torch.testing.assert_close(x.grad, reference_x.grad, rtol=rtol, atol=atol)
+    for (name, parameter), (reference_name, reference_parameter) in zip(
+        layer.named_parameters(), reference.named_parameters()
+    ):
+        assert name == reference_name
+        torch.testing.assert_close(parameter.grad, reference_parameter.grad, rtol=rtol, atol=atol)
+
+
+def test_lora_training_dropout_is_applied_and_disabled_in_eval():
+    layer = LoraInjectedLinear(torch.nn.Linear(4, 3), rank=2, alpha=3, dropout=1.0)
+    torch.nn.init.ones_(layer.lora_A.weight)
+    torch.nn.init.ones_(layer.lora_B.weight)
+    values = torch.ones(2, 4)
+    base = torch.nn.functional.linear(values, layer.weight, layer.bias)
+    torch.testing.assert_close(layer(values), base)
+    layer.eval()
+    torch.testing.assert_close(layer(values), base + 12.0)

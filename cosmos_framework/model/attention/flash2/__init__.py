@@ -16,7 +16,8 @@ from cosmos_framework.model.attention.utils.version import version_in_range
 # We lock to safe releases of Flash 2
 # We will have a separate backend identifier for 2025 releases with CuTeDSL
 # kernels.
-FLASH_ATTENTION_V2_MIN_VERSION = "2.7.0"
+# FLASH_ATTENTION_V2_MIN_VERSION = "2.7.0"
+FLASH_ATTENTION_V2_MIN_VERSION = "2.4.0"
 #FLASH_ATTENTION_V2_MAX_VERSION = "2.7.4.post1"
 FLASH_ATTENTION_V2_MAX_VERSION = "2.99.99"
 

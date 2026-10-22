@@ -43,7 +43,10 @@ class LoraInjectedLinear(nn.Linear):
       ``<path>.lora_A.weight`` — low-rank down-projection
       ``<path>.lora_B.weight`` — low-rank up-projection
 
-    Forward computes ``y = base(x) + (alpha / r) * lora_B(lora_A(x))``.
+    Forward computes ``y = base(x) + lora_B((alpha / r) * lora_A(x))``, which is
+    algebraically ``base(x) + (alpha / r) * lora_B(lora_A(x))`` -- the scalar is applied
+    to the rank-``r`` intermediate when adapter and base outputs have the same dtype.
+    Mixed precision retains output scaling to preserve the original cast order.
     """
 
     def __init__(
@@ -101,8 +104,16 @@ class LoraInjectedLinear(nn.Linear):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base_out = F.linear(x, self.weight, self.bias)
         adapter_input = self.lora_dropout(x).to(dtype=self.lora_A.weight.dtype)
-        lora_out = self.lora_B(self.lora_A(adapter_input)).to(dtype=base_out.dtype)
-        return base_out + self._lora_scale * lora_out
+        lora_hidden = self.lora_A(adapter_input)
+        # Preserve output-cast/scale order for mixed adapter/base precision.
+        # Moving scale across that cast introduces additional rounding changes.
+        if lora_hidden.dtype != base_out.dtype:
+            lora_out = self.lora_B(lora_hidden).to(dtype=base_out.dtype)
+            return base_out + self._lora_scale * lora_out
+        # B is bias-free: scale the rank-r intermediate instead of the full-width
+        # output. This is algebraically equivalent; floating-point rounding can differ.
+        lora_out = self.lora_B(self._lora_scale * lora_hidden)
+        return base_out + lora_out
 
     @torch.no_grad()
     def merge_adapter_(self) -> None:

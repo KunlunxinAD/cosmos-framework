@@ -41,7 +41,7 @@ TOML_FILE="examples/toml/sft_config/action_policy_libero_all_nano.toml"
 
 export LIBERO_ROOT="${LIBERO_ROOT:-$DATASET_PATH}"
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export COSMOS_TRAINING=1
