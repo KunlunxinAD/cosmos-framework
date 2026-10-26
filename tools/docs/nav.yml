@@ -142,6 +142,7 @@ hold:
 
 # Repo-only pages: links to them go to GitHub.
 not_on_site:
+  - docs/numa_cpu_affinity.md
   # How to maintain the docs, for doc developers.
   - docs/README.md
   # AutoML guides.
