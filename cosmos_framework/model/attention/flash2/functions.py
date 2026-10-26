@@ -19,6 +19,26 @@ from cosmos_framework.model.attention.masks import CausalType
 from cosmos_framework.model.attention.utils.environment import is_torch_compiling
 
 
+def _unpad_lse_bhm(lse_: Tensor, cumulative_seqlen_Q: Tensor, total_tokens: int) -> Tensor:
+    """Un-pad a ``[batch, H, max_seqlen]`` LSE into the packed ``[H, total_tokens]`` layout.
+
+    Builds the gather index on the device. The obvious implementation --
+    ``(cu[1:] - cu[:-1]).tolist()`` plus a Python-loop ``torch.cat`` -- costs one
+    device->host sync per attention call, which drains the device queue and stops the
+    host from running ahead; on P800 that is 640 syncs per rank per training step and it
+    prevents FSDP/CP collectives from overlapping with compute. ``total_tokens`` comes
+    from a tensor *shape*, so it is a Python int already and needs no sync.
+    """
+    b, h, m = lse_.shape
+    pos = torch.arange(total_tokens, device=lse_.device, dtype=torch.int64)
+    cu = cumulative_seqlen_Q.to(torch.int64)
+    # Sample owning each packed token = #{boundaries <= pos} over cu[1:]; the upper-bound
+    # search also skips zero-length samples, matching the sliced-cat behaviour exactly.
+    sample = torch.searchsorted(cu[1:].contiguous(), pos, right=True)
+    flat = sample * m + (pos - cu[sample])
+    return lse_.permute(1, 0, 2).reshape(h, b * m).index_select(1, flat)
+
+
 def flash2_attention(
     query: Tensor,
     key: Tensor,
@@ -156,8 +176,7 @@ def flash2_attention(
         #   * Kunlun XPU: [batch, H, max_seqlen] (dim == 3), padded per sample.
         # Normalize both to [H, total_tokens] by un-padding the Kunlun layout using cu_seqlens_q.
         if lse_.dim() == 3:
-            seqlens_q = (cumulative_seqlen_Q[1:] - cumulative_seqlen_Q[:-1]).tolist()
-            lse_ = torch.cat([lse_[i, :, : seqlens_q[i]] for i in range(len(seqlens_q))], dim=-1)
+            lse_ = _unpad_lse_bhm(lse_, cumulative_seqlen_Q, q.shape[0])
         assert lse_.dim() == 2  # [H,total_tokens]
 
         output = out.unsqueeze(0)  # [1,total_tokens,H,Dv]

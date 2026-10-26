@@ -8,6 +8,8 @@ from functools import wraps
 import torch_xmlir._XMLIRC as XMLIR_C
 from loguru import logger as logging
 
+from cosmos_framework.utils.cpu_affinity import initial_cpu_affinity, numa_cpu_affinity
+
 
 def get_gpu_architecture() -> str:
     """
@@ -94,18 +96,30 @@ class Device:
         return XMLIR_C.xpumlDeviceGetName(self.handle)
 
     def get_cpu_affinity(self) -> list[int]:
-        cpu_count = os.cpu_count() or 1
-        device_count = XMLIR_C.xpumlDeviceGetCount()
-        if device_count <= 0 or cpu_count <= device_count:
-            return list(range(cpu_count))
+        """Use physical PCI/NUMA topology, honoring CUDA visibility and the allocated cpuset."""
+        import torch
 
-        cores_per_device = max(1, cpu_count // device_count)
-        start_core = self.device_idx * cores_per_device
-        if self.device_idx == device_count - 1:
-            end_core = cpu_count
-        else:
-            end_core = min(start_core + cores_per_device, cpu_count)
-        return list(range(start_core, end_core))
+        allocated_cpus = initial_cpu_affinity(os.getpid())
+        try:
+            visible_count = torch.cuda.device_count()
+            local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", str(visible_count)))
+            if not 0 < local_world_size <= visible_count:
+                raise ValueError(f"LOCAL_WORLD_SIZE={local_world_size}, visible devices={visible_count}")
+            pci_bus_ids = []
+            for index in range(local_world_size):
+                props = torch.cuda.get_device_properties(index)
+                # The runtime resolves CUDA_VISIBLE_DEVICES and CUDA_DEVICE_ORDER.
+                # Management-library indices are machine-wide and must not use local_rank.
+                pci_bus_ids.append(f"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:{props.pci_device_id:02x}.0")
+            node, cpus = numa_cpu_affinity(self.device_idx, tuple(pci_bus_ids), allocated_cpus)
+            logging.info(
+                f"CPU affinity: local_rank={self.device_idx}, pci={pci_bus_ids[self.device_idx]}, "
+                f"numa={node}, cpus={cpus}"
+            )
+            return cpus
+        except (OSError, ValueError, AttributeError, RuntimeError) as error:
+            logging.warning(f"Cannot determine GPU-local CPU affinity; retaining allocated CPUs: {error}")
+            return list(allocated_cpus)
 
 
 def with_torch_device(device):
