@@ -10,9 +10,10 @@
 # agree, or collection either errors on an out-of-range choice or deselects
 # everything.
 #
-# A single ``pre-commit`` (lint) job runs first; the six GPU jobs all
-# ``needs:`` it, so they wait on ONE pre-commit run and are skipped if lint
-# fails — the single self-hosted runner is never spent on a lint-failing commit.
+# A single ``pre-commit`` (lint) job and a changed-path check run first. The GPU
+# jobs wait on both, so the self-hosted runner is never spent on a lint-failing
+# commit or on a change limited to ``.agents/**`` and Markdown files. The
+# relevant docs, cookbook, and WSM workflows still validate those changes.
 # The six GPU jobs then run (one at a time on the single runner):
 #   * training-smoke                — Nano SFT pipeline (convert -> train 5 -> export -> t2i)
 #   * generator-training-regression — vision_sft_nano loss vs goldens
@@ -49,11 +50,49 @@ jobs:
   pre-commit:
     uses: ./.github/workflows/pre-commit.yml
 
+  changes:
+    name: Detect GPU-relevant changes
+    runs-on: ubuntu-latest
+    outputs:
+      run_gpu: ${{ steps.filter.outputs.run_gpu }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - id: filter
+        name: Check changed paths
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        shell: bash
+        run: |
+          changed_files="$RUNNER_TEMP/gpu-changed-files"
+          git diff --name-only --no-renames "$BASE_SHA" "$HEAD_SHA" > "$changed_files"
+
+          run_gpu=false
+          while IFS= read -r path; do
+            case "$path" in
+              .agents/*|*.md) ;;
+              *)
+                run_gpu=true
+                break
+                ;;
+            esac
+          done < "$changed_files"
+
+          echo "run_gpu=$run_gpu" >> "$GITHUB_OUTPUT"
+          echo "Run GPU tests: \`$run_gpu\`" >> "$GITHUB_STEP_SUMMARY"
+
   training-smoke:
-    needs: pre-commit
+    needs: [pre-commit, changes]
+    if: ${{ always() && !cancelled() && needs.pre-commit.result == 'success' && (needs.changes.result != 'success' || needs.changes.outputs.run_gpu != 'false') }}
     runs-on: [self-hosted, gpu, h200]
     timeout-minutes: 90
     env:
+      # Per-job pytest temp root; the cleanup step at the end of this job removes
+      # only this directory. These jobs share one self-hosted runner.
+      PYTEST_DEBUG_TEMPROOT: /tmp/pytest-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       HF_HUB_DISABLE_XET: "1"
       # 4-GPU SFT run. vision_sft_nano_5iter.toml sets
@@ -64,7 +103,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Isolate the pytest temp root
+        run: mkdir -p "$PYTEST_DEBUG_TEMPROOT"
+
       - uses: astral-sh/setup-uv@v7
+        with:
+          # Keep in step with [tool.uv].constraint-dependencies in pyproject.toml.
+          version: "0.11.29"
 
       - name: Sync environment (cu128-train)
         run: uv sync --all-extras --group=cu128-train
@@ -86,13 +131,17 @@ jobs:
         if: always()
         run: |
           rm -rf examples/checkpoints || true
-          rm -rf "${TMPDIR:-/tmp}"/pytest-of-* /tmp/pytest-of-* || true
+          rm -rf "$PYTEST_DEBUG_TEMPROOT" || true
 
   generator-training-regression:
-    needs: pre-commit
+    needs: [pre-commit, changes]
+    if: ${{ always() && !cancelled() && needs.pre-commit.result == 'success' && (needs.changes.result != 'success' || needs.changes.outputs.run_gpu != 'false') }}
     runs-on: [self-hosted, gpu, h200]
     timeout-minutes: 75
     env:
+      # Per-job pytest temp root; the cleanup step at the end of this job removes
+      # only this directory. These jobs share one self-hosted runner.
+      PYTEST_DEBUG_TEMPROOT: /tmp/pytest-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       HF_HUB_DISABLE_XET: "1"
       # Select the 4-GPU regression test variant.
@@ -100,7 +149,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Isolate the pytest temp root
+        run: mkdir -p "$PYTEST_DEBUG_TEMPROOT"
+
       - uses: astral-sh/setup-uv@v7
+        with:
+          # Keep in step with [tool.uv].constraint-dependencies in pyproject.toml.
+          version: "0.11.29"
 
       - name: Sync environment (cu128-train)
         run: uv sync --all-extras --group=cu128-train
@@ -120,16 +175,20 @@ jobs:
       - name: Clean up run outputs
         if: always()
         run: |
-          rm -rf "${TMPDIR:-/tmp}"/pytest-of-* /tmp/pytest-of-* || true
+          rm -rf "$PYTEST_DEBUG_TEMPROOT" || true
 
   generator-inference-smoke:
-    needs: pre-commit
+    needs: [pre-commit, changes]
+    if: ${{ always() && !cancelled() && needs.pre-commit.result == 'success' && (needs.changes.result != 'success' || needs.changes.outputs.run_gpu != 'false') }}
     runs-on: [self-hosted, gpu, h200]
     # 105 (not 60) since the Nano step gained the three ModelOpt FP8 cases (two
     # parallelism layouts + mixed-precision diffusion steps): a 20 GB checkpoint
     # on a cold cache plus three more full-width runs.
     timeout-minutes: 105
     env:
+      # Per-job pytest temp root; the cleanup step at the end of this job removes
+      # only this directory. These jobs share one self-hosted runner.
+      PYTEST_DEBUG_TEMPROOT: /tmp/pytest-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       HF_HUB_DISABLE_XET: "1"
       # Both steps use the `throughput` preset, whose layout is derived from
@@ -144,7 +203,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Isolate the pytest temp root
+        run: mkdir -p "$PYTEST_DEBUG_TEMPROOT"
+
       - uses: astral-sh/setup-uv@v7
+        with:
+          # Keep in step with [tool.uv].constraint-dependencies in pyproject.toml.
+          version: "0.11.29"
 
       - name: Sync environment (cu128-train)
         run: uv sync --all-extras --group=cu128-train
@@ -183,13 +248,17 @@ jobs:
       - name: Clean up run outputs
         if: always()
         run: |
-          rm -rf "${TMPDIR:-/tmp}"/pytest-of-* /tmp/pytest-of-* || true
+          rm -rf "$PYTEST_DEBUG_TEMPROOT" || true
 
   distilled-inference-smoke:
-    needs: pre-commit
+    needs: [pre-commit, changes]
+    if: ${{ always() && !cancelled() && needs.pre-commit.result == 'success' && (needs.changes.result != 'success' || needs.changes.outputs.run_gpu != 'false') }}
     runs-on: [self-hosted, gpu, h200]
     timeout-minutes: 120
     env:
+      # Per-job pytest temp root; the cleanup step at the end of this job removes
+      # only this directory. These jobs share one self-hosted runner.
+      PYTEST_DEBUG_TEMPROOT: /tmp/pytest-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       HF_HUB_DISABLE_XET: "1"
       # The distilled Super checkpoints use a four-way data-parallel shard.
@@ -197,7 +266,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Isolate the pytest temp root
+        run: mkdir -p "$PYTEST_DEBUG_TEMPROOT"
+
       - uses: astral-sh/setup-uv@v7
+        with:
+          # Keep in step with [tool.uv].constraint-dependencies in pyproject.toml.
+          version: "0.11.29"
 
       - name: Sync environment (cu128-train)
         run: uv sync --all-extras --group=cu128-train
@@ -217,13 +292,17 @@ jobs:
       - name: Clean up run outputs
         if: always()
         run: |
-          rm -rf "${TMPDIR:-/tmp}"/pytest-of-* /tmp/pytest-of-* || true
+          rm -rf "$PYTEST_DEBUG_TEMPROOT" || true
 
   reasoner-inference-smoke:
-    needs: pre-commit
+    needs: [pre-commit, changes]
+    if: ${{ always() && !cancelled() && needs.pre-commit.result == 'success' && (needs.changes.result != 'success' || needs.changes.outputs.run_gpu != 'false') }}
     runs-on: [self-hosted, gpu, h200]
     timeout-minutes: 60
     env:
+      # Per-job pytest temp root; the cleanup step at the end of this job removes
+      # only this directory. These jobs share one self-hosted runner.
+      PYTEST_DEBUG_TEMPROOT: /tmp/pytest-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       HF_HUB_DISABLE_XET: "1"
       # 4-GPU reasoner inference test; the gpus(4) marker
@@ -232,7 +311,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Isolate the pytest temp root
+        run: mkdir -p "$PYTEST_DEBUG_TEMPROOT"
+
       - uses: astral-sh/setup-uv@v7
+        with:
+          # Keep in step with [tool.uv].constraint-dependencies in pyproject.toml.
+          version: "0.11.29"
 
       - name: Sync environment (cu128-train)
         run: uv sync --all-extras --group=cu128-train
@@ -280,13 +365,17 @@ jobs:
       - name: Clean up run outputs
         if: always()
         run: |
-          rm -rf "${TMPDIR:-/tmp}"/pytest-of-* /tmp/pytest-of-* || true
+          rm -rf "$PYTEST_DEBUG_TEMPROOT" || true
 
   reasoner-training-regression:
-    needs: pre-commit
+    needs: [pre-commit, changes]
+    if: ${{ always() && !cancelled() && needs.pre-commit.result == 'success' && (needs.changes.result != 'success' || needs.changes.outputs.run_gpu != 'false') }}
     runs-on: [self-hosted, gpu, h200]
     timeout-minutes: 60
     env:
+      # Per-job pytest temp root; the cleanup step at the end of this job removes
+      # only this directory. These jobs share one self-hosted runner.
+      PYTEST_DEBUG_TEMPROOT: /tmp/pytest-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       HF_HUB_DISABLE_XET: "1"
       # Select the 4-GPU regression test variant.
@@ -294,7 +383,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Isolate the pytest temp root
+        run: mkdir -p "$PYTEST_DEBUG_TEMPROOT"
+
       - uses: astral-sh/setup-uv@v7
+        with:
+          # Keep in step with [tool.uv].constraint-dependencies in pyproject.toml.
+          version: "0.11.29"
 
       - name: Sync environment (cu128-train)
         run: uv sync --all-extras --group=cu128-train
@@ -312,20 +407,24 @@ jobs:
       - name: Clean up run outputs
         if: always()
         run: |
-          rm -rf "${TMPDIR:-/tmp}"/pytest-of-* /tmp/pytest-of-* || true
+          rm -rf "$PYTEST_DEBUG_TEMPROOT" || true
 
   # Co-located unit tests: every *_test.py under cosmos_framework/ (CPU and GPU
   # together) in one pytest invocation, plus two torchrun steps for the
-  # distributed tests that hardcode their world size. Runs parallel to the five
-  # jobs above (all gated on the single pre-commit lint).
+  # distributed tests that hardcode their world size. Runs parallel to the jobs
+  # above (all gated on the single pre-commit lint and changed-path check).
   unittest:
-    needs: pre-commit
+    needs: [pre-commit, changes]
+    if: ${{ always() && !cancelled() && needs.pre-commit.result == 'success' && (needs.changes.result != 'success' || needs.changes.outputs.run_gpu != 'false') }}
     runs-on: [self-hosted, gpu, h200]
     # 60 (not 30) so the first cold-cache run can download the Cosmos3-Nano
     # checkpoint for scripts/_test's convert->export->inference pipeline; steady
     # state (warm HF cache) is a few minutes.
     timeout-minutes: 60
     env:
+      # Per-job pytest temp root; the cleanup step at the end of this job removes
+      # only this directory. These jobs share one self-hosted runner.
+      PYTEST_DEBUG_TEMPROOT: /tmp/pytest-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       HF_HUB_DISABLE_XET: "1"
       # This job passes no --num-gpus, so it only collects the gpus(0)/gpus(1)
@@ -336,10 +435,25 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Isolate the pytest temp root
+        run: mkdir -p "$PYTEST_DEBUG_TEMPROOT"
+
       - uses: astral-sh/setup-uv@v7
+        with:
+          # Keep in step with [tool.uv].constraint-dependencies in pyproject.toml.
+          version: "0.11.29"
 
       - name: Sync environment (cu128-train)
         run: uv sync --all-extras --group=cu128-train
+
+      # Keep every published schema-5 Bimanual domain map loadable before a
+      # checkpoint download or GPU process is started.
+      - name: Bimanual release checkpoint contract
+        run: |
+          export COSMOS_TRAINING=0
+          uv run --all-extras --group=cu128-train python -m pytest -q \
+            tests/bimanual_unified_action_test.py::BimanualUnifiedActionTests::test_released_schema5_revisions_have_registered_validity_masks \
+            -o addopts=
 
       # Run the L0-marked co-located suite (CPU + GPU). Tests that load internal
       # pretrained weights from S3 skip themselves when credentials/pretrained.secret
@@ -363,12 +477,14 @@ jobs:
       # L1, L2, and unmarked cases remain available for explicit or scheduled runs.
       # Non-GPU tests generated from i4 are already covered by i4 CI and are deselected here;
       # CF-owned tests plus mapped tests explicitly marked GPU or gpus(N>0) remain in this job.
+      # The independently mapped Posttrain suite is covered by i4 CI and is not collected here.
       - name: Unit tests
         run: |
           export LD_LIBRARY_PATH=
           export COSMOS_DOWNLOAD_CACHE_DIR="$RUNNER_WORKSPACE/cosmos_input_cache"
           uv run --all-extras --group=cu128-train python -m pytest -v -s \
             cosmos_framework/ -o addopts= -m L0 --skip-mapped-non-gpu-tests \
+            --ignore=cosmos_framework/posttrain \
             --deselect cosmos_framework/model/generator/mot/attention_test.py::test_two_way_attention_flex_matches_dense_across_batch_shapes
 
       # Deselected above and run here instead, in a process of its own.
@@ -438,5 +554,4 @@ jobs:
       - name: Clean up run outputs
         if: always()
         run: |
-          rm -rf "${TMPDIR:-/tmp}"/pytest-of-* /tmp/pytest-of-* \
-            outputs examples/checkpoints schemas || true
+          rm -rf "$PYTEST_DEBUG_TEMPROOT" outputs examples/checkpoints schemas || true

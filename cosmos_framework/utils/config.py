@@ -31,9 +31,9 @@ except ImportError:
 
     USE_MEGATRON = False
 
-from cosmos_framework.utils import distributed
 from cosmos_framework.utils.lazy_config import LazyCall as L
 from cosmos_framework.utils.lazy_config import LazyDict
+from cosmos_framework.utils import distributed
 from cosmos_framework.utils.misc import Color
 
 T = TypeVar("T")
@@ -198,8 +198,8 @@ class JobConfig:
     group: str = ""
     # Run/job name.
     name: str = ""
-    # W&B mode, can be "online", or "disabled".
-    wandb_mode: str = "online"
+    # W&B is opt-in; use "online" or "offline" to enable logging.
+    wandb_mode: str = "disabled"
     # Cluster configuration (optional, for cluster-specific settings).
     cluster: Optional[Any] = None
 
@@ -489,6 +489,8 @@ class TrainerConfig:
     memory_format: torch.memory_format = torch.preserve_format
     # Gradient accumulation (update step every N iteration).
     grad_accum_iter: int = 1
+    # Debug dataloading without training forward/backward or optimizer/scheduler updates.
+    skip_model_update: bool = False
     # Straggler Detection config
     straggler_detection: StragglerDetectionConfig = attrs.field(factory=StragglerDetectionConfig)
     # Profiling config
