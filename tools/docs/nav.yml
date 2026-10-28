@@ -142,6 +142,8 @@ hold:
 
 # Repo-only pages: links to them go to GitHub.
 not_on_site:
+  # Kunlun fork recipes; maintained in the repository alongside the P800 code.
+  - .agents/skills/cookbooks-xpu/**
   - docs/numa_cpu_affinity.md
   # How to maintain the docs, for doc developers.
   - docs/README.md
