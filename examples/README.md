@@ -10,6 +10,15 @@ This directory contains:
 
 For the Sim-Bimanual Stage 0–3 recipes, [check the local training bundle](../docs/bimanual_data_preflight.md) before loading model weights.
 
+The `*_p800.sh` shells target Kunlun P800 (XPU). They run fully offline from local
+artifact directories and fail pre-flight with a path-level message instead of a
+training-time traceback. Every P800-specific default is documented at its definition
+inside the shell, including the attention backend, the FSDP gradient-sync mode, the
+activation-checkpointing policy and the rank-assignment mode. One caveat: the
+`export LD_LIBRARY_PATH=''` that [`docs/setup.md`](../docs/setup.md#pytorch-import-issue)
+discusses for NVIDIA NGC containers must NOT be applied on XPU, where it removes
+`/opt/xre/so` and the process dies with `ImportError: libxpurt.so.2`.
+
 ## Recipe → launch shell
 
 | Recipe                                       | Launch shell                          |
@@ -19,6 +28,7 @@ For the Sim-Bimanual Stage 0–3 recipes, [check the local training bundle](../d
 | Vision SFT (Cosmos3-Edge)                    | `launch_sft_vision_edge.sh`           |
 | Reasoner Alignment SFT                       | `launch_sft_llava_ov.sh`              |
 | Reasoner Alignment SFT (Cosmos3-Nano)        | `launch_sft_videophy2_nano.sh`        |
+| Reasoner Alignment SFT (Cosmos3-Nano, P800)  | `launch_sft_videophy2_nano_p800.sh`   |
 | Reasoner Alignment SFT (Cosmos3-Super)       | `launch_sft_videophy2_super.sh`       |
 | Reasoner Alignment SFT (Cosmos3-Edge)        | `launch_sft_videophy2_edge.sh`        |
 | Video-conversation SFT (Cosmos3-Nano)        | `launch_sft_video.sh`                 |

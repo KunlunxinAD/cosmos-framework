@@ -14,6 +14,14 @@
 # Local training output (generated, large).
 training_output/
 
+# Output root the Kunlun P800 launchers default to (OUTPUT_ROOT /
+# IMAGINAIRE_OUTPUT_ROOT). Holds DCP checkpoints and profiler traces; it
+# reached 1.2 TB during the P800 performance work.
+/output
+
+# Local xprofiler tool settings (per-machine, not shareable).
+xprofiler.settings.json
+
 # Release-tool metadata (regenerated on every release run).
 cosmos_training_meta/
 
