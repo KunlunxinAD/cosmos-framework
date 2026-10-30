@@ -27,8 +27,18 @@ class LogTensorShapeCallback(Callback):
                 summary_str += f" | {key} shape: {data_batch[key].shape}, dtype: {data_batch[key].dtype} "
         summary_str += f"data_batch: {data_batch.keys()}"
         if iteration < 1000:
-            # Only log the first 1000 iterations
-            for key in ["__url__", "__key__", "image_grid_thw", "video_grid_thw"]:
+            # Only log the first 1000 iterations. sample_index/epoch/worker_id
+            # identify which dataset entry landed on this rank and microstep,
+            # which is what makes a per-step sample-set comparison possible.
+            for key in [
+                "__url__",
+                "__key__",
+                "image_grid_thw",
+                "video_grid_thw",
+                "sample_index",
+                "sample_epoch",
+                "sample_worker_id",
+            ]:
                 if key in data_batch:
                     summary_str += f" | {key}: {data_batch[key]}"
         log.info(summary_str, rank0_only=False)
