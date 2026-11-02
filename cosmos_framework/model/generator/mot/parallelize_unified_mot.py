@@ -40,6 +40,7 @@ from cosmos_framework.model.generator.mot.context_parallel_utils import context_
 from cosmos_framework.model.generator.mot.replicated_io import apply_replicated_attention_io_cp
 from cosmos_framework.model.generator.utils.memory import KVToStore, MemoryValue
 from cosmos_framework.data.generator.sequence_packing.runtime import SequencePack
+from cosmos_framework.utils import log
 from cosmos_framework.utils.generator.activation_offloading import (
     checkpoint_with_flattened_inputs,
     offload_checkpoint_inputs,
@@ -527,10 +528,47 @@ def apply_cp(
     return model
 
 
+@torch.no_grad()
+def cast_frozen_decoder_params(model: nn.Module, dtype: torch.dtype) -> dict[str, int]:
+    """Store the frozen decoder parameters in ``dtype``, leaving trainable ones alone.
+
+    Called before ``apply_fsdp``: each FSDP2 unit records its parameters' dtype as it is
+    built, so a cast afterwards would leave the sharded params disagreeing with
+    ``mp_policy.reduce_dtype``. ``requires_grad`` must already be final here -- for LoRA
+    SFT that holds, the adapters are injected while the net is still being built.
+
+    Scope is ``model.model.layers`` on purpose. Embeddings and the LM head are left in the
+    master dtype so tied weights keep sharing one storage; they are a rounding error of the
+    decoder's footprint anyway. Parameters keep their identity (only ``.data`` is swapped),
+    so FSDP2, the optimizer's parameter groups and any LoRA bookkeeping still see the same
+    objects.
+
+    Returns a count of what was converted, for the caller to log.
+    """
+    trainable = [p for p in model.model.layers.parameters() if p.requires_grad]
+    if not trainable:
+        raise ValueError(
+            "fsdp_frozen_param_dtype expects a partially frozen decoder (e.g. LoRA SFT); "
+            "no trainable parameter found under model.layers."
+        )
+    converted = 0
+    kept = 0
+    for parameter in model.model.layers.parameters():
+        if not parameter.is_floating_point():
+            continue
+        if parameter.requires_grad:
+            kept += parameter.numel()
+        elif parameter.dtype != dtype:
+            converted += parameter.numel()
+            parameter.data = parameter.data.to(dtype=dtype)
+    return dict(converted_elements=converted, trainable_elements=kept)
+
+
 def apply_fsdp(
     model: nn.Module,
     parallel_dims: ParallelDims,
     mp_policy: MixedPrecisionPolicy | None = None,
+    frozen_param_dtype: torch.dtype | None = None,
 ) -> None:
     """
     Apply data parallelism (via FSDP2) to the model.
@@ -567,7 +605,20 @@ def apply_fsdp(
             higher precision than the forward/backward, i.e. ``param_dtype`` is the compute
             (and all-gather) dtype and ``reduce_dtype`` the gradient-reduction dtype, which
             must match the dtype the module's parameters are stored in.
+        frozen_param_dtype (torch.dtype | None): When set, the frozen decoder parameters are
+            stored in this dtype instead of the master dtype (see
+            ``ParallelismConfig.fsdp_frozen_param_dtype``). The cast happens here, before
+            the wrap, because each FSDP unit records its parameters' dtype as it is built.
+            A unit then holds two dtypes -- frozen in this one, trainable in the master --
+            which FSDP2 handles by all-gathering per dtype.
     """
+    if frozen_param_dtype is not None:
+        stats = cast_frozen_decoder_params(model, frozen_param_dtype)
+        log.info(
+            f"FSDP frozen-parameter storage: {stats['converted_elements']} elements cast to "
+            f"{frozen_param_dtype}, {stats['trainable_elements']} trainable elements left in "
+            "the master dtype"
+        )
     mesh = fsdp_mesh(parallel_dims)
     for _, block in model.model.layers.named_children():
         if parallel_dims.fsdp_cpu_offload:
@@ -599,6 +650,7 @@ def parallelize_unified_mot(
     ac_config: ActivationCheckpointingConfig,
     attention_io_layout: str = "sequence_sharded",
     mp_policy: MixedPrecisionPolicy | None = None,
+    frozen_param_dtype: torch.dtype | None = None,
 ) -> nn.Module:
     """Optimize the model using CP, FSDP, activation checkpointing, and torch.compile.
 
@@ -620,6 +672,8 @@ def parallelize_unified_mot(
         attention_io_layout: Tensor layout at the attention boundary under CP.
         mp_policy: FSDP2 mixed-precision policy, forwarded to :func:`apply_fsdp`.
             ``None`` keeps FSDP2's default of no casting.
+        frozen_param_dtype: Storage dtype for the frozen decoder parameters, forwarded to
+            :func:`apply_fsdp`. ``None`` leaves every parameter in the master dtype.
 
     """
     if parallel_dims is not None and parallel_dims.cp_enabled:
@@ -636,5 +690,5 @@ def parallelize_unified_mot(
         for block in model.model.layers.children():
             offload_checkpoint_inputs(block, min_cgroup_memory_free_fraction=ac_config.min_cgroup_memory_free_fraction)
     if parallel_dims is not None and parallel_dims.dp_enabled:
-        apply_fsdp(model, parallel_dims, mp_policy)
+        apply_fsdp(model, parallel_dims, mp_policy, frozen_param_dtype=frozen_param_dtype)
     return model

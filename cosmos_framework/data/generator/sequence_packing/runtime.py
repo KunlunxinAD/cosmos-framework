@@ -47,6 +47,16 @@ class SequencePackMetadata:
     full_indices: torch.Tensor
     causal_seq_offsets: torch.Tensor
     full_only_seq_offsets: torch.Tensor
+    # Host-resident duplicates of the three offsets arrays a varlen attention pass keys
+    # against. Every one of them is built from a Python list of ints here and then uploaded,
+    # so keeping the pre-upload tensor costs one small allocation and no synchronization --
+    # whereas recovering these values from the device copy later costs a blocking device->host
+    # read. Backends whose kernels consume the ranges on the host take these; see
+    # ``flash2_attention``'s ``cumulative_seqlen_*_host`` parameters for the one that does and
+    # why it matters. They describe the same ranges as the device arrays above, always.
+    sample_offsets_host: torch.Tensor
+    causal_seq_offsets_host: torch.Tensor
+    full_only_seq_offsets_host: torch.Tensor
     causal_sample_ids: torch.Tensor  # [N_causal_tokens]
     full_only_sample_ids: torch.Tensor  # [N_full_tokens]
     num_causal_tokens: int
@@ -97,6 +107,9 @@ class SequencePackMetadata:
             "_full_indices": self.full_indices,
             "_causal_seq_offsets": self.causal_seq_offsets,
             "_full_only_seq_offsets": self.full_only_seq_offsets,
+            "sample_offsets_host": self.sample_offsets_host,
+            "_causal_seq_offsets_host": self.causal_seq_offsets_host,
+            "_full_only_seq_offsets_host": self.full_only_seq_offsets_host,
             "_causal_sample_ids": self.causal_sample_ids,
             "_full_only_sample_ids": self.full_only_sample_ids,
             "_num_causal_tokens": self.num_causal_tokens,
@@ -157,9 +170,13 @@ def to_device_nonblocking(tensor: torch.Tensor, device: torch.device | str) -> t
 
 def _compute_mode_indices_and_offsets(
     split_lens: torch.Tensor | List[int], attn_modes: List[str], mode: str, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute indices from a joint tensor that are in the given mode.
+
+    Returns the indices, the offsets on ``device``, and the same offsets left on the host. The
+    host copy is the tensor that was about to be uploaded, so it is free; see
+    ``SequencePackMetadata.causal_seq_offsets_host`` for who wants it.
     """
     indices = []
     offsets = [0]
@@ -176,10 +193,12 @@ def _compute_mode_indices_and_offsets(
             offsets.append(next_offset)
         start += split_len
 
+    offsets_host = torch.tensor(offsets, dtype=torch.int32)  # [N_mode_splits+1]
     return (
         to_device_nonblocking(torch.tensor(indices, dtype=torch.int32), device),
-        to_device_nonblocking(torch.tensor(offsets, dtype=torch.int32), device),
-    )  # [N_mode_tokens], [N_mode_splits+1]
+        to_device_nonblocking(offsets_host, device),
+        offsets_host,
+    )  # [N_mode_tokens], [N_mode_splits+1], [N_mode_splits+1]
 
 
 def _get_padded_size(n: int, cp_world_size: int = 1, pad_for_cuda_graphs: bool = False, alignment: int = 1) -> int:
@@ -335,8 +354,13 @@ def _build_sequence_pack_metadata(
     _max_causal_len = max((split_lens[i] for i in range(len(split_lens)) if attn_modes[i] == "causal"), default=0)
     _max_full_len = max((split_lens[i] for i in range(len(split_lens)) if attn_modes[i] == "full"), default=0)
 
-    sample_lens_cu = to_device_nonblocking(torch.tensor([0] + sample_lens, dtype=torch.int32), device)  # [N_samples+1]
-    _sample_offsets = torch.cumsum(sample_lens_cu, dim=0, dtype=torch.int32)  # [N_samples+1]
+    # Accumulated on the host and then uploaded, rather than uploaded and then accumulated on
+    # the device: the host needs these same values anyway (see ``sample_offsets_host``), and a
+    # one-row cumsum is not work worth a kernel launch.
+    _sample_offsets_host = torch.cumsum(
+        torch.tensor([0] + sample_lens, dtype=torch.int32), dim=0, dtype=torch.int32
+    )  # [N_samples+1]
+    _sample_offsets = to_device_nonblocking(_sample_offsets_host, device)  # [N_samples+1]
     sample_lens_tensor = to_device_nonblocking(torch.tensor(sample_lens, dtype=torch.int64), device)  # [N_samples]
     sample_ids = torch.repeat_interleave(
         torch.arange(len(sample_lens), device=device, dtype=torch.int64),
@@ -344,8 +368,12 @@ def _build_sequence_pack_metadata(
         output_size=sum(sample_lens),
     )  # [N_tokens]
 
-    _causal_indices, _causal_seq_offsets = _compute_mode_indices_and_offsets(split_lens, attn_modes, "causal", device)
-    _full_indices, _full_only_seq_offsets = _compute_mode_indices_and_offsets(split_lens, attn_modes, "full", device)
+    _causal_indices, _causal_seq_offsets, _causal_seq_offsets_host = _compute_mode_indices_and_offsets(
+        split_lens, attn_modes, "causal", device
+    )
+    _full_indices, _full_only_seq_offsets, _full_only_seq_offsets_host = _compute_mode_indices_and_offsets(
+        split_lens, attn_modes, "full", device
+    )
     _causal_sample_ids = sample_ids[_causal_indices]  # [N_causal_tokens]
     _full_only_sample_ids = sample_ids[_full_indices]  # [N_full_tokens]
     _caption_seq_offsets, _max_caption_len = _build_caption_offsets(text_caption_lens, _causal_seq_offsets, device)
@@ -363,6 +391,9 @@ def _build_sequence_pack_metadata(
         full_indices=_full_indices,
         causal_seq_offsets=_causal_seq_offsets,
         full_only_seq_offsets=_full_only_seq_offsets,
+        sample_offsets_host=_sample_offsets_host,
+        causal_seq_offsets_host=_causal_seq_offsets_host,
+        full_only_seq_offsets_host=_full_only_seq_offsets_host,
         causal_sample_ids=_causal_sample_ids,
         full_only_sample_ids=_full_only_sample_ids,
         num_causal_tokens=len(_causal_indices),
@@ -567,12 +598,22 @@ def sequence_pack_from_packed_sequence(
         # of callers that need the real-sample boundaries take them off the end instead: the padding
         # is one trailing segment, so ``offsets[:-2]`` is the real-sample starts and
         # ``offsets[-2]`` the real token count.
+        # The host duplicates take the same extra segment, from the same Python int, so the two
+        # stay interchangeable. Leaving them behind would be worse than not having them: a varlen
+        # pass handed un-padded host ranges alongside a padded stream would leave the padding
+        # rows outside every range, which is the exact bug this segment exists to remove.
         pad_segment_fields["_causal_seq_offsets"] = _append_pad_segment(
             meta["_causal_seq_offsets"], int(causal_seq.shape[0])
+        )
+        pad_segment_fields["_causal_seq_offsets_host"] = _append_pad_segment(
+            meta["_causal_seq_offsets_host"], int(causal_seq.shape[0])
         )
         pad_segment_fields["max_causal_len"] = max(meta["max_causal_len"], pad_causal)
         pad_segment_fields["_full_only_seq_offsets"] = _append_pad_segment(
             meta["_full_only_seq_offsets"], int(full_only_seq.shape[0])
+        )
+        pad_segment_fields["_full_only_seq_offsets_host"] = _append_pad_segment(
+            meta["_full_only_seq_offsets_host"], int(full_only_seq.shape[0])
         )
         pad_segment_fields["max_full_len"] = max(meta["max_full_len"], pad_full)
 
@@ -609,6 +650,9 @@ def sequence_pack_from_packed_sequence(
         )
         pad_segment_fields["sample_offsets"] = _append_pad_segment(
             meta["sample_offsets"], int(causal_seq.shape[0]) + int(full_only_seq.shape[0])
+        )
+        pad_segment_fields["sample_offsets_host"] = _append_pad_segment(
+            meta["sample_offsets_host"], int(causal_seq.shape[0]) + int(full_only_seq.shape[0])
         )
         pad_segment_fields["max_sample_len"] = max(meta["max_sample_len"], pad_causal + pad_full)
         # Every offsets array now carries the segment, so none of their names records that it
@@ -902,6 +946,32 @@ def get_full_only_seq(pack: SequencePack) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     _ensure_core_metadata(pack)
     return pack["full_only_seq"], pack["_full_only_seq_offsets"]
+
+
+_HOST_OFFSETS_KEYS: dict[str, str] = {
+    "_causal_seq_offsets": "_causal_seq_offsets_host",
+    "_full_only_seq_offsets": "_full_only_seq_offsets_host",
+    "sample_offsets": "sample_offsets_host",
+}
+
+
+def get_host_offsets(pack: SequencePack, offsets_key: str) -> torch.Tensor | None:
+    """``pack``'s host duplicate of one offsets array, or ``None`` when it carries none.
+
+    ``offsets_key`` names the device array the caller is already using, so the two are picked
+    out together and cannot drift apart at the call site. The returned tensor holds the same
+    values; it exists because a backend may need them on the host, and reading them back off
+    the device costs a blocking synchronization. See
+    :attr:`SequencePackMetadata.causal_seq_offsets_host`.
+
+    ``None`` rather than an error for an absent duplicate: packs assembled outside
+    :func:`_build_sequence_pack_metadata` -- tests, and anything built before these fields
+    existed -- carry only the device arrays, and every consumer of this is an optimization that
+    has to fall back to them cleanly.
+    """
+    if offsets_key not in _HOST_OFFSETS_KEYS:
+        raise KeyError(f"No host duplicate is kept for pack field {offsets_key!r}.")
+    return pack.get(_HOST_OFFSETS_KEYS[offsets_key])
 
 
 def get_caption_seq_offsets(pack: SequencePack) -> Tuple[torch.Tensor, int] | None:

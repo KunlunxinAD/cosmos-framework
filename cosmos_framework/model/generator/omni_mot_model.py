@@ -496,6 +496,7 @@ class OmniMoTModel(ImaginaireModel):
         *,
         mp_policy: MixedPrecisionPolicy | None = None,
         lora_enabled: bool | None = None,
+        frozen_param_dtype: torch.dtype | None = None,
     ) -> torch.nn.Module:
         """Build the VFM network, parallelize it, and materialize it on device.
 
@@ -506,6 +507,11 @@ class OmniMoTModel(ImaginaireModel):
             mp_policy: FSDP2 mixed-precision policy (see :func:`parallelize_vfm_network`).
                 ``None`` runs forward/backward in ``dtype`` itself.
             lora_enabled: Override for ``config.lora_enabled``.
+            frozen_param_dtype: Storage dtype for the frozen decoder parameters, leaving the
+                trainable ones in ``dtype`` (see
+                ``ParallelismConfig.fsdp_frozen_param_dtype``). ``None`` stores everything
+                in ``dtype``. Requires an ``mp_policy`` whose ``param_dtype`` is this dtype,
+                otherwise the forward runs over mixed dtypes.
         """
         # Build model network and parallelize it.
         multiview_action_conditioning = getattr(self.config, "multiview_action_conditioning", None)
@@ -654,6 +660,7 @@ class OmniMoTModel(ImaginaireModel):
             ac_config=self.config.activation_checkpointing,
             attention_io_layout=getattr(self.config, "attention_io_layout", "sequence_sharded"),
             mp_policy=mp_policy,
+            frozen_param_dtype=frozen_param_dtype,
         )
 
         with misc.timer("meta to cuda and broadcast model states"):
@@ -777,7 +784,13 @@ class OmniMoTModel(ImaginaireModel):
 
         with misc.timer("Creating PyTorch model and ema if enabled"):
             master_dtype, mp_policy = _get_master_dtype_and_mp_policy(config, self.precision)
-            self.net = self.build_net(dtype=master_dtype, mp_policy=mp_policy)
+            self.net = self.build_net(
+                dtype=master_dtype,
+                mp_policy=mp_policy,
+                # EMA deliberately excluded: it is built without a policy, so a unit holding
+                # bf16 frozen weights next to FP32 adapters would compute in mixed dtypes.
+                frozen_param_dtype=_get_frozen_param_dtype(config, master_dtype, self.precision),
+            )
             self._param_count = count_params(self.net, verbose=False)
 
             self._uses_aux_loss_free_load_balancing: bool = uses_aux_loss_free_load_balancing(self.net)
@@ -8012,6 +8025,45 @@ def _get_master_dtype_and_mp_policy(
         # already handed to the network in ``precision``, so nothing needs the cast.
         mp_policy = MixedPrecisionPolicy(param_dtype=precision, reduce_dtype=reduce_dtype, cast_forward_inputs=False)
     return master_dtype, mp_policy
+
+
+def _get_frozen_param_dtype(config, master_dtype: torch.dtype, precision: torch.dtype) -> torch.dtype | None:
+    """Resolve ``parallelism.fsdp_frozen_param_dtype`` for the FSDP wrap.
+
+    Returns ``None`` -- meaning "leave every parameter in the master dtype" -- when the
+    field is unset, when it names the master dtype anyway, or under inference mode, where
+    the master dtype has already collapsed to ``precision`` and there is no optimizer state
+    to shrink.
+
+    Args:
+        config: Read for ``parallelism.fsdp_frozen_param_dtype`` and
+            ``parallelism.enable_inference_mode``.
+        master_dtype: What the rest of the parameters are stored in.
+        precision: The forward/backward compute dtype, used only to warn about the one
+            case the config documents as lossy.
+    """
+    name = getattr(config.parallelism, "fsdp_frozen_param_dtype", None)
+    if name is None or config.parallelism.enable_inference_mode:
+        return None
+    if name not in PRECISION_TO_TORCH_DTYPE:
+        raise ValueError(
+            f"parallelism.fsdp_frozen_param_dtype={name!r} is not one of {sorted(PRECISION_TO_TORCH_DTYPE)}."
+        )
+    frozen_dtype = PRECISION_TO_TORCH_DTYPE[name]
+    if frozen_dtype == master_dtype:
+        return None
+    if frozen_dtype.itemsize > master_dtype.itemsize:
+        raise ValueError(
+            f"parallelism.fsdp_frozen_param_dtype={name!r} is wider than the master dtype "
+            f"{master_dtype}; frozen parameters would cost more memory than trainable ones."
+        )
+    if frozen_dtype != precision:
+        log.warning(
+            f"parallelism.fsdp_frozen_param_dtype={name!r} differs from the compute dtype "
+            f"{precision}: frozen weights are rounded twice (master -> {frozen_dtype} -> "
+            f"{precision}). Set it to the compute dtype for a lossless cast."
+        )
+    return frozen_dtype
 
 
 def _broadcast_seed(seed: list[int], group: dist.ProcessGroup, rank: int) -> list[int]:

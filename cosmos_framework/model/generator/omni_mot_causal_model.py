@@ -589,13 +589,16 @@ class OmniMoTCausalModel(OmniMoTModel):
         *,
         mp_policy: Any | None = None,
         lora_enabled: bool | None = None,
+        frozen_param_dtype: torch.dtype | None = None,
     ) -> torch.nn.Module:
         """Resolve the selected teacher-forcing KV implementation and build it."""
         uses_multiview_replay_kv = self._uses_multiview_replay_kv()
         robot_threeway = self._uses_robot_multiview_threeway()
         uses_interactive_network = uses_multiview_replay_kv or robot_threeway
         if self.config.causal_training_strategy not in _TEACHER_FORCING_REPLAY_STRATEGIES:
-            return super().build_net(dtype, mp_policy=mp_policy, lora_enabled=lora_enabled)
+            return super().build_net(
+                dtype, mp_policy=mp_policy, lora_enabled=lora_enabled, frozen_param_dtype=frozen_param_dtype
+            )
 
         replay_policy = self._get_teacher_forcing_replay_policy()
         # The selector is the public source of truth. Resolve it to the base
@@ -660,9 +663,13 @@ class OmniMoTCausalModel(OmniMoTModel):
                     "Cosmos3VFMNetwork",
                     InteractiveCosmos3VFMNetwork,
                 ):
-                    net = super().build_net(dtype, mp_policy=mp_policy, lora_enabled=lora_enabled)
+                    net = super().build_net(
+                        dtype, mp_policy=mp_policy, lora_enabled=lora_enabled, frozen_param_dtype=frozen_param_dtype
+                    )
             else:
-                net = super().build_net(dtype, mp_policy=mp_policy, lora_enabled=lora_enabled)
+                net = super().build_net(
+                    dtype, mp_policy=mp_policy, lora_enabled=lora_enabled, frozen_param_dtype=frozen_param_dtype
+                )
             if maskless_replay:
                 # Each network owns the resolved backend geometry, independently
                 # of the student/teacher selectors restored on the model below.

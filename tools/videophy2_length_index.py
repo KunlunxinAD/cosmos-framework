@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
 """Build a per-sample token-length index for the VideoPhy-2 manifest.
 
 Why this exists: FSDP all_gather in this recipe is dominated by RANK ARRIVAL SKEW

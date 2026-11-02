@@ -86,3 +86,19 @@ class ParallelismConfig:
     # only the collective and its staging buffer change. The cost is precision, since
     # gradients are then summed across the shard group in bf16.
     fsdp_reduce_dtype: str | None = None
+
+    # Storage dtype for the FROZEN decoder parameters only, decoupled from
+    # ``fsdp_master_dtype`` above. None (the default) keeps every parameter in the master
+    # dtype. Set "bfloat16" alongside ``fsdp_master_dtype="float32"`` to halve the resident
+    # shard of everything the optimizer never touches while the trainable parameters keep
+    # their FP32 master -- 14.3 GiB/rank on Qwen3-VL-32B MoT LoRA SFT at dp_shard=8, which
+    # is what makes ``context_parallel_shard_degree=1`` fit on 96 GiB cards.
+    #
+    # Lossless where the compute dtype already is this dtype: with
+    # ``MixedPrecisionPolicy.param_dtype=bfloat16`` the all-gathered copy the forward sees
+    # is bf16 either way, and a frozen parameter is never stepped, so nothing rounds twice.
+    # It is NOT lossless if the forward runs in a wider dtype than this field.
+    #
+    # Only the decoder blocks (``model.layers``) are cast: embeddings and the LM head are
+    # left alone so tied weights keep sharing one storage.
+    fsdp_frozen_param_dtype: str | None = None

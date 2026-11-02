@@ -9,12 +9,12 @@ scripts and TOMLs are maintained only in `examples/`.
 Run every command below **from the cosmos-framework repository root** with the
 [XPU environment](../../../README.md#cosmos-framework-kunlun-branch) active.
 
-| Recipe | P800 launcher | Task | Dataset |
-| --- | --- | --- | --- |
-| DROID policy | [launch_sft_action_policy_droid_nano_p800.sh](../../../../../../../examples/launch_sft_action_policy_droid_nano_p800.sh) | `joint_pos` action policy | Cosmos3-DROID success |
-| DROID forward dynamics | [launch_sft_action_fd_droid_posttrain_p800.sh](../../../../../../../examples/launch_sft_action_fd_droid_posttrain_p800.sh) | future visual prediction | Cosmos3-DROID success + failure |
-| LIBERO-10 policy | [launch_sft_action_policy_libero_10_nano_p800.sh](../../../../../../../examples/launch_sft_action_policy_libero_10_nano_p800.sh) | action policy | `libero_10` |
-| LIBERO-all policy | [launch_sft_action_policy_libero_all_nano_p800.sh](../../../../../../../examples/launch_sft_action_policy_libero_all_nano_p800.sh) | four-suite policy | all LIBERO suites |
+| Recipe                 | P800 launcher                                                                                                                      | Task                      | Dataset                         |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | ------------------------- | ------------------------------- |
+| DROID policy           | [launch_sft_action_policy_droid_nano_p800.sh](../../../../../../../examples/launch_sft_action_policy_droid_nano_p800.sh)           | `joint_pos` action policy | Cosmos3-DROID success           |
+| DROID forward dynamics | [launch_sft_action_fd_droid_posttrain_p800.sh](../../../../../../../examples/launch_sft_action_fd_droid_posttrain_p800.sh)         | future visual prediction  | Cosmos3-DROID success + failure |
+| LIBERO-10 policy       | [launch_sft_action_policy_libero_10_nano_p800.sh](../../../../../../../examples/launch_sft_action_policy_libero_10_nano_p800.sh)   | action policy             | `libero_10`                     |
+| LIBERO-all policy      | [launch_sft_action_policy_libero_all_nano_p800.sh](../../../../../../../examples/launch_sft_action_policy_libero_all_nano_p800.sh) | four-suite policy         | all LIBERO suites               |
 
 The paired configurations are in
 [examples/toml/sft_config/](../../../../../../../examples/toml/sft_config/).
@@ -104,18 +104,18 @@ Paths are anchored to the framework repository root by the common example
 launcher. Prefer absolute dataset/tokenizer paths, since `DROID_ROOT` and
 `LIBERO_ROOT` are exported by the recipe wrappers before common path resolution.
 
-| Variable | Purpose |
-| --- | --- |
-| `DATASET_PATH` | DROID parent, LIBERO suite or LIBERO-all parent |
-| `DROID_ROOT` / `LIBERO_ROOT` | model dataset root; keep consistent with `DATASET_PATH` |
-| `BASE_CHECKPOINT_PATH` | converted Cosmos3-Nano DCP |
-| `WAN_VAE_PATH` | Wan2.2 VAE file |
-| `TOKENIZER_PATH` | local Qwen3-VL-8B tokenizer metadata |
-| `OUTPUT_ROOT` | log/run parent; defaults to each wrapper's timestamped path under `outputs/` |
-| `IMAGINAIRE_OUTPUT_ROOT` | explicit artifact root; defaults to `OUTPUT_ROOT` |
-| `CUDA_VISIBLE_DEVICES` | visible devices; eight P800s by default |
-| `NPROC_PER_NODE`, `NNODES`, `NODE_RANK`, `MASTER_ADDR`, `MASTER_PORT` | torchrun topology |
-| `ACTIVATION_CHECKPOINTING_MODE`, `ACTIVATION_CHECKPOINTING_SAVE_OPS_REGEX` | policy-wrapper activation checkpoint settings |
+| Variable                                                                   | Purpose                                                                      |
+| -------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `DATASET_PATH`                                                             | DROID parent, LIBERO suite or LIBERO-all parent                              |
+| `DROID_ROOT` / `LIBERO_ROOT`                                               | model dataset root; keep consistent with `DATASET_PATH`                      |
+| `BASE_CHECKPOINT_PATH`                                                     | converted Cosmos3-Nano DCP                                                   |
+| `WAN_VAE_PATH`                                                             | Wan2.2 VAE file                                                              |
+| `TOKENIZER_PATH`                                                           | local Qwen3-VL-8B tokenizer metadata                                         |
+| `OUTPUT_ROOT`                                                              | log/run parent; defaults to each wrapper's timestamped path under `outputs/` |
+| `IMAGINAIRE_OUTPUT_ROOT`                                                   | explicit artifact root; defaults to `OUTPUT_ROOT`                            |
+| `CUDA_VISIBLE_DEVICES`                                                     | visible devices; eight P800s by default                                      |
+| `NPROC_PER_NODE`, `NNODES`, `NODE_RANK`, `MASTER_ADDR`, `MASTER_PORT`      | torchrun topology                                                            |
+| `ACTIVATION_CHECKPOINTING_MODE`, `ACTIVATION_CHECKPOINTING_SAVE_OPS_REGEX` | policy-wrapper activation checkpoint settings                                |
 
 The existing P800 wrappers construct their own `TAIL_OVERRIDES` arrays.
 `EXTRA_TAIL_OVERRIDES` is not consumed by the current common launcher, even
