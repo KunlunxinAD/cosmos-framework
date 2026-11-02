@@ -138,6 +138,7 @@ from cosmos_framework.data.generator.sequence_packing.runtime import (
     get_all_seq_unpadded,
     get_causal_seq,
     get_full_only_seq,
+    get_host_offsets,
     get_num_real_samples,
     get_num_real_tokens,
     sequence_pack_from_packed_sequence,
@@ -310,6 +311,12 @@ def two_way_attention(
             cumulative_seqlen_KV=causal_k_offsets,
             max_seqlen_Q=max_causal_len,
             max_seqlen_KV=max_causal_len,
+            # The same ranges the two lines above name, from the host copies the pack kept at
+            # build time. The frontend passes them on only to a backend that wants them and
+            # only when both are present, so a pack without them changes nothing. Read from
+            # each stream's own pack, like the device arrays: Q and K are separate packs here.
+            cumulative_seqlen_Q_host=get_host_offsets(packed_query_states, "_causal_seq_offsets"),
+            cumulative_seqlen_KV_host=get_host_offsets(packed_key_states, "_causal_seq_offsets"),
         )
     else:
         causal_varlen_kwargs = dict()
@@ -373,6 +380,11 @@ def two_way_attention(
             cumulative_seqlen_KV=sample_kv_offsets,
             max_seqlen_Q=max_full_len,
             max_seqlen_KV=max_sample_len,
+            # As in the causal pass above. The key side pairs with ``get_all_seq``, which keys
+            # against the interleaved stream and so yields ``sample_offsets`` rather than either
+            # tower's -- so that is the duplicate to take here.
+            cumulative_seqlen_Q_host=get_host_offsets(packed_query_states, "_full_only_seq_offsets"),
+            cumulative_seqlen_KV_host=get_host_offsets(packed_key_normalized, "sample_offsets"),
         )
     else:
         # This branch takes the unpadded stream, and has to.
@@ -456,8 +468,10 @@ def three_way_attention(
     # otherwise fall back to the standard causal keys.
     if packed_key_states_normalized is not None:
         causal_k_normalized, causal_k_normalized_offsets = get_causal_seq(packed_key_states_normalized)
+        causal_k_normalized_pack = packed_key_states_normalized
     else:
         causal_k_normalized, causal_k_normalized_offsets = causal_k, causal_k_offsets
+        causal_k_normalized_pack = packed_key_states
     causal_v, _ = get_causal_seq(packed_value_states)
 
     full_q, full_q_offsets = get_full_only_seq(packed_query_states)
@@ -532,6 +546,15 @@ def three_way_attention(
         cumulative_seqlen_KV=causal_k_offsets,
         max_seqlen_Q=max_causal_len,
         max_seqlen_KV=max_causal_len,
+        # The same ranges the two lines above name, from the host copies the pack kept at build
+        # time. A backend that reads the ranges on the host otherwise copies the device array
+        # back itself, and on the Kunlun XPU runtime that copy is synchronous: it waits on every
+        # kernel queued so far, which stops the host from running ahead and keeps FSDP's
+        # all-gather from overlapping with compute. The frontend passes these on only to a
+        # backend that wants them, so a pack without them changes nothing. Read from each
+        # stream's own pack, like the device arrays beside them: Q and K are separate packs.
+        cumulative_seqlen_Q_host=get_host_offsets(packed_query_states, "_causal_seq_offsets"),
+        cumulative_seqlen_KV_host=get_host_offsets(packed_key_states, "_causal_seq_offsets"),
         is_causal=True,
         causal_type=CausalType.DontCare if use_dont_care_mask else CausalType.TopLeft,
     )  # [1,N_und,heads,head_dim]
@@ -559,6 +582,9 @@ def three_way_attention(
             cumulative_seqlen_KV=full_q_offsets,
             max_seqlen_Q=max_full_len,
             max_seqlen_KV=max_full_len,
+            # As in the causal pass above. Self-attention, so one lookup covers both sides.
+            cumulative_seqlen_Q_host=get_host_offsets(packed_query_states, "_full_only_seq_offsets"),
+            cumulative_seqlen_KV_host=get_host_offsets(packed_query_states, "_full_only_seq_offsets"),
             return_lse=True,
         )  # full_sa: [1,N_full,heads,head_dim], full_sa_lse: [1,N_full,heads]
 
@@ -570,6 +596,10 @@ def three_way_attention(
         cumulative_seqlen_KV=causal_k_normalized_offsets,
         max_seqlen_Q=max_full_len,
         max_seqlen_KV=max_causal_len,
+        # As in the causal pass above. The key side is read from whichever pack supplied
+        # ``causal_k_normalized_offsets``, which is the normed K pack when there is one.
+        cumulative_seqlen_Q_host=get_host_offsets(packed_query_states, "_full_only_seq_offsets"),
+        cumulative_seqlen_KV_host=get_host_offsets(causal_k_normalized_pack, "_causal_seq_offsets"),
         return_lse=True,
     )  # full_ca: [1,N_full,heads,head_dim], full_ca_lse: [1,N_full,heads]
 

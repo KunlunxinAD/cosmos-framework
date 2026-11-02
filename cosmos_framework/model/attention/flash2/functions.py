@@ -50,6 +50,8 @@ def flash2_attention(
     cumulative_seqlen_KV: Tensor | None = None,
     max_seqlen_Q: int | None = None,
     max_seqlen_KV: int | None = None,
+    cumulative_seqlen_Q_host: Tensor | None = None,
+    cumulative_seqlen_KV_host: Tensor | None = None,
     return_lse: bool = False,
     backend_kwargs: dict | None = None,
     deterministic: bool = False,
@@ -92,6 +94,14 @@ def flash2_attention(
         max_seqlen_KV (int | None): (varlen) Optional integer indicating the maximum key/value
             sequence length in all batches. Must be passed together with `cumulative_seqlen_{Q,KV}`
             and `max_seqlen_Q`.
+
+        cumulative_seqlen_Q_host (Tensor | None): (varlen) Optional host-resident duplicate of
+            `cumulative_seqlen_Q`. When both host arrays are given they are what gets handed to
+            `flash_attn_varlen_func`, which is strictly a host-side saving on this runtime --
+            see the note at the call site. Must hold the same values as the device arrays; that
+            is the caller's guarantee, not something checked here.
+
+        cumulative_seqlen_KV_host (Tensor | None): (varlen) The same, for `cumulative_seqlen_KV`.
 
     Other Parameters:
         return_lse (bool): Whether to return the logsumexp values. Default is False.
@@ -150,12 +160,25 @@ def flash2_attention(
         k = key.squeeze(0)  # [total_tokens,Hkv,D]
         v = value.squeeze(0)  # [total_tokens,Hkv,Dv]
         assert q.dim() == k.dim() == v.dim() == 3
+        # Hand the kernel the host ranges when the caller kept a copy. Some builds of this
+        # entry point -- the Kunlun XPU one in particular -- read the ranges on the host and
+        # copy them back themselves with a *blocking* device->host transfer preceded by a wait
+        # on the stream, so every varlen call stalls the host on all device work queued before
+        # it. That stall is what stops the host from running ahead and keeps FSDP2's implicit
+        # all-gather prefetch from overlapping with compute. Where the entry point instead
+        # takes a host array directly it skips both the wait and the copy. Verified bit-equal
+        # on P800 (output and all three input gradients) against passing the device arrays,
+        # with identical device-side time -- nothing downstream of the copy changes. Builds
+        # that keep the ranges on the device upload these instead, which is the same transfer
+        # the device arrays already cost and no worse.
+        cu_seqlens_q = cumulative_seqlen_Q if cumulative_seqlen_Q_host is None else cumulative_seqlen_Q_host
+        cu_seqlens_k = cumulative_seqlen_KV if cumulative_seqlen_KV_host is None else cumulative_seqlen_KV_host
         out, lse_, _ = flash_attn_varlen_func(
             q=query.squeeze(0),
             k=key.squeeze(0),
             v=value.squeeze(0),
-            cu_seqlens_q=cumulative_seqlen_Q,
-            cu_seqlens_k=cumulative_seqlen_KV,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen_Q,
             max_seqlen_k=max_seqlen_KV,
             softmax_scale=scale,
@@ -170,17 +193,27 @@ def flash2_attention(
             # block_table=None,
         )
         assert out.dim() == 3  # [total_tokens,H,Dv]
+        output = out.unsqueeze(0)  # [1,total_tokens,H,Dv]
 
+        # Only a caller that asked for the LSE pays for its layout fix-up. The kernel hands
+        # one back either way -- ``return_attn_probs=True`` above is what makes this call
+        # return three values at all -- but on the Kunlun build it arrives padded per sample
+        # and normalizing it costs a device-side gather index (see ``_unpad_lse_bhm``), which
+        # is wasted on a caller that drops it. ``two_way_attention`` runs two varlen passes
+        # per decoder layer and reads neither LSE, so under activation checkpointing the Super
+        # vision recipe was paying 256 discarded un-pads per optimizer step. Skipping them
+        # reduces host launch pressure; trace durations can include queued waiting time.
+        #
         # LSE layout differs across flash_attn builds:
         #   * NVIDIA: [H, total_tokens] (dim == 2)
         #   * Kunlun XPU: [batch, H, max_seqlen] (dim == 3), padded per sample.
         # Normalize both to [H, total_tokens] by un-padding the Kunlun layout using cu_seqlens_q.
-        if lse_.dim() == 3:
-            lse_ = _unpad_lse_bhm(lse_, cumulative_seqlen_Q, q.shape[0])
-        assert lse_.dim() == 2  # [H,total_tokens]
-
-        output = out.unsqueeze(0)  # [1,total_tokens,H,Dv]
-        lse = lse_.unsqueeze(0)  # [1,H,total_tokens]
+        lse = None
+        if return_lse:
+            if lse_.dim() == 3:
+                lse_ = _unpad_lse_bhm(lse_, cumulative_seqlen_Q, q.shape[0])
+            assert lse_.dim() == 2  # [H,total_tokens]
+            lse = lse_.unsqueeze(0)  # [1,H,total_tokens]
 
     else:
         output, lse, _ = flash_attn_func(  # output: [B,N,H,Dv], lse: [B,H,N]
@@ -199,8 +232,12 @@ def flash2_attention(
         )
 
     assert isinstance(output, Tensor)
-    assert isinstance(lse, Tensor)
     assert output.dim() == 4  # [B,N,H,Dv] or [1,total_tokens,H,Dv]
+
+    if not return_lse:
+        return output
+
+    assert isinstance(lse, Tensor)
     assert lse.dim() == 3  # [B,H,N] or [1,H,total_tokens]
 
     # NOTE: Do NOT call .contiguous on LSE, otherwise Attention Merging backward pass will be
@@ -208,7 +245,4 @@ def flash2_attention(
     # pointer as their corresponding attention autograd ops!
     lse = lse.permute(0, 2, 1)  # [B,N,H] or [1,total_tokens,H]
 
-    if return_lse:
-        return output, lse
-
-    return output
+    return output, lse

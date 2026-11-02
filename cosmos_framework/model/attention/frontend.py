@@ -62,6 +62,8 @@ def attention(
     cumulative_seqlen_KV: Tensor | None = None,  # [B+1]
     max_seqlen_Q: int | None = None,
     max_seqlen_KV: int | None = None,
+    cumulative_seqlen_Q_host: Tensor | None = None,  # [B+1], on the host
+    cumulative_seqlen_KV_host: Tensor | None = None,  # [B+1], on the host
     # backend & misc parameters
     backend: str | None = None,
     return_lse: bool = False,
@@ -139,6 +141,17 @@ def attention(
         max_seqlen_KV (int | None): (varlen) Optional integer indicating the maximum key/value
             sequence length in all batches. Must be passed together with `cumulative_seqlen_{Q,KV}`
             and `max_seqlen_Q`.
+
+        cumulative_seqlen_Q_host (Tensor | None): (varlen) Optional host-resident duplicate of
+            `cumulative_seqlen_Q`, holding the same values. Purely an optimization, and only for
+            backends whose kernel reads the ranges on the host: such a backend copies the device
+            array back itself, and on some runtimes that copy is synchronous and stalls the host
+            on all work queued so far. Passing the ranges already on the host skips it. Ignored
+            by every other backend, and by all of them when `cumulative_seqlen_KV_host` is not
+            passed alongside it. The caller is responsible for the two matching; nothing here
+            compares them, since comparing them would cost the synchronization this avoids.
+
+        cumulative_seqlen_KV_host (Tensor | None): (varlen) The same, for `cumulative_seqlen_KV`.
 
     Other Parameters:
         backend (str | None): Backend to run with. If unspecified (default), it will try to
@@ -245,6 +258,27 @@ def attention(
     if is_torch_compiling() and is_varlen:
         assert cumulative_seqlen_KV is not None
         cumulative_seqlen_KV = cumulative_seqlen_KV.view_as(cumulative_seqlen_KV)  # [B+1]
+
+    # Only flash2 takes the host duplicates, so only flash2 is handed them: the other five
+    # backends would have to grow a parameter they ignore. Both or neither -- one side alone
+    # would leave the backend mixing host and device ranges, and it is the pair that lets it
+    # skip the copy at all. Dropped under torch.compile: the kernel is reached through a custom
+    # op, so a host tensor there is a new graph input whose dim 0 varies with the pack, which
+    # trades a runtime stall for recompiles. Nothing is lost -- the compiled path already
+    # specializes on these lengths.
+    host_varlen_kwargs: dict = {}
+    if (
+        compatible_backend == "flash2"
+        and is_varlen
+        and not is_torch_compiling()
+        and cumulative_seqlen_Q_host is not None
+        and cumulative_seqlen_KV_host is not None
+    ):
+        host_varlen_kwargs = dict(
+            cumulative_seqlen_Q_host=cumulative_seqlen_Q_host,
+            cumulative_seqlen_KV_host=cumulative_seqlen_KV_host,
+        )
+
     return BACKEND_MAP[compatible_backend](
         query=query,
         key=key,
@@ -259,6 +293,7 @@ def attention(
         return_lse=return_lse,
         backend_kwargs=backend_kwargs,
         deterministic=deterministic,
+        **host_varlen_kwargs,
     )
 
 
