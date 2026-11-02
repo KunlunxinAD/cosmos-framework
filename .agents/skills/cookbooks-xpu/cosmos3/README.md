@@ -17,10 +17,10 @@ The cookbook contains usage documentation. All executable launchers and TOMLs
 are maintained under `examples/`; run them from the framework repository root
 after preparing the required local inputs. Super's dedicated P800 launcher is pending.
 
-| Cookbook | Recipes | Where |
-| --- | --- | --- |
-| Audiovisual SFT | Nano, Edge, Nano map-style; Super LoRA P800 entry pending | [Vision usage](generator/audiovisual/finetune/README.md) |
-| Action SFT | DROID policy, DROID forward dynamics, LIBERO-10, LIBERO-all | [Action usage](generator/action/finetune/README.md) |
+| Cookbook        | Recipes                                                     | Where                                                    |
+| --------------- | ----------------------------------------------------------- | -------------------------------------------------------- |
+| Audiovisual SFT | Nano, Edge, Nano map-style; Super LoRA P800 entry pending   | [Vision usage](generator/audiovisual/finetune/README.md) |
+| Action SFT      | DROID policy, DROID forward dynamics, LIBERO-10, LIBERO-all | [Action usage](generator/action/finetune/README.md)      |
 
 ## Prerequisites
 
@@ -133,7 +133,6 @@ training invocation with the intended settings. Preserve the container library p
 | `CUDA_VISIBLE_DEVICES`                    | `0,1,2,3,4,5,6,7`          | the 8 P800 devices to use                            |
 | `PYTHONHASHSEED`                          | `42`                       | reproducible hashing (paired with `trainer.seed=42`) |
 | `HF_HUB_OFFLINE` / `TRANSFORMERS_OFFLINE` | `1`                        | require local inputs before training                 |
-
 
 The P800 entry points are `examples/launch_sft_*_p800.sh`; their paired TOMLs
 are under `examples/toml/sft_config/`. Their runtime overrides take precedence over

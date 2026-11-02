@@ -8,12 +8,12 @@ vision SFT. This directory contains usage documentation only. Run all commands
 **from the cosmos-framework repository root**, with the
 [XPU environment](../../../README.md#cosmos-framework-kunlun-branch) active.
 
-| Recipe | P800 entry point | Base model |
-| --- | --- | --- |
-| Nano vision SFT | [launch_sft_vision_nano_p800.sh](../../../../../../../examples/launch_sft_vision_nano_p800.sh) | Cosmos3-Nano |
-| Edge vision SFT | [launch_sft_vision_edge_p800.sh](../../../../../../../examples/launch_sft_vision_edge_p800.sh) | Cosmos3-Edge |
-| Nano map-style vision SFT | [launch_sft_vision_nano_mapstyle_dataloader_p800.sh](../../../../../../../examples/launch_sft_vision_nano_mapstyle_dataloader_p800.sh) | Cosmos3-Nano |
-| Super vision LoRA | [launch_sft_vision_super_p800.sh](../../../../../../../examples/launch_sft_vision_super_p800.sh) | Cosmos3-Super |
+| Recipe                    | P800 entry point                                                                                                                       | Base model    |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | ------------- |
+| Nano vision SFT           | [launch_sft_vision_nano_p800.sh](../../../../../../../examples/launch_sft_vision_nano_p800.sh)                                         | Cosmos3-Nano  |
+| Edge vision SFT           | [launch_sft_vision_edge_p800.sh](../../../../../../../examples/launch_sft_vision_edge_p800.sh)                                         | Cosmos3-Edge  |
+| Nano map-style vision SFT | [launch_sft_vision_nano_mapstyle_dataloader_p800.sh](../../../../../../../examples/launch_sft_vision_nano_mapstyle_dataloader_p800.sh) | Cosmos3-Nano  |
+| Super vision LoRA         | [launch_sft_vision_super_p800.sh](../../../../../../../examples/launch_sft_vision_super_p800.sh)                                       | Cosmos3-Super |
 
 The launchers enable offline HF access and expect prepared local data, VAE,
 processor/tokenizer and DCP weights. They do not stage those inputs automatically.
@@ -99,18 +99,18 @@ The three existing vision P800 wrappers select FlashAttention-2, P800 fused
 kernels, BF16 model computation, FP16 VAE computation, selective activation
 checkpointing and seed 42, with `torch.compile` disabled.
 
-| Variable | Purpose |
-| --- | --- |
-| `DATASET_PATH` | directory containing `train/video_dataset_file.jsonl` |
-| `BASE_CHECKPOINT_PATH` | matching Nano or Edge DCP |
-| `WAN_VAE_PATH` | Wan2.2 VAE file |
-| `TOKENIZER_PATH` | Nano/map-style tokenizer metadata |
-| `EDGE_PROCESSOR_PATH` | native Edge processor snapshot |
-| `OUTPUT_ROOT` | log/run parent; defaults to each wrapper's timestamped path under `outputs/` |
-| `IMAGINAIRE_OUTPUT_ROOT` | explicit artifact root; defaults to `OUTPUT_ROOT` |
-| `CUDA_VISIBLE_DEVICES` | visible devices; eight P800s by default |
-| `NPROC_PER_NODE`, `NNODES`, `NODE_RANK`, `MASTER_ADDR`, `MASTER_PORT` | torchrun topology |
-| `ACTIVATION_CHECKPOINTING_MODE`, `ACTIVATION_CHECKPOINTING_SAVE_OPS_REGEX` | activation checkpoint settings |
+| Variable                                                                   | Purpose                                                                      |
+| -------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `DATASET_PATH`                                                             | directory containing `train/video_dataset_file.jsonl`                        |
+| `BASE_CHECKPOINT_PATH`                                                     | matching Nano or Edge DCP                                                    |
+| `WAN_VAE_PATH`                                                             | Wan2.2 VAE file                                                              |
+| `TOKENIZER_PATH`                                                           | Nano/map-style tokenizer metadata                                            |
+| `EDGE_PROCESSOR_PATH`                                                      | native Edge processor snapshot                                               |
+| `OUTPUT_ROOT`                                                              | log/run parent; defaults to each wrapper's timestamped path under `outputs/` |
+| `IMAGINAIRE_OUTPUT_ROOT`                                                   | explicit artifact root; defaults to `OUTPUT_ROOT`                            |
+| `CUDA_VISIBLE_DEVICES`                                                     | visible devices; eight P800s by default                                      |
+| `NPROC_PER_NODE`, `NNODES`, `NODE_RANK`, `MASTER_ADDR`, `MASTER_PORT`      | torchrun topology                                                            |
+| `ACTIVATION_CHECKPOINTING_MODE`, `ACTIVATION_CHECKPOINTING_SAVE_OPS_REGEX` | activation checkpoint settings                                               |
 
 The common example launcher resolves relative data/checkpoint paths against the
 framework repository root. Prefer absolute tokenizer/processor paths.
