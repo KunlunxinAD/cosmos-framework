@@ -497,6 +497,7 @@ class VisionDataArgs(ArgsBase, _VisionDataBase):
     resolution: Resolution | None
     aspect_ratio: AspectRatio | None
     fps: pydantic.PositiveInt
+    output_fps: pydantic.PositiveInt | None = None
     num_frames: pydantic.PositiveInt
     video_save_quality: VideoSaveQuality
     image_save_quality: ImageSaveQuality
@@ -507,6 +508,11 @@ class VisionDataArgs(ArgsBase, _VisionDataBase):
     @property
     def duration(self) -> float:
         return self.num_frames / self.fps
+
+    @property
+    def video_output_fps(self) -> int:
+        """Playback clock only; ``fps`` and ``duration`` retain their model-clock meanings."""
+        return self.output_fps if self.output_fps is not None else self.fps
 
     @property
     def vision_size(self) -> tuple[int, int]:
@@ -569,7 +575,12 @@ class VisionDataOverrides(OverridesBase, _VisionDataBase):
     """Vision aspect ratio. When None, image_edit preserves the input image's native
     aspect ratio; all other modes default to 16:9."""
     fps: Fps | None = None
-    """Vision frames per second. Recommended range [10, 30]; quality may be degraded outside of this range."""
+    """Model conditioning frames per second. Recommended range [10, 30]; quality may be degraded outside
+    of this range. Released Auto camera models require 30 (also their default); use output_fps for playback."""
+    output_fps: pydantic.PositiveInt | None = None
+    """Saved video playback FPS for Auto RGB-only generation; defaults to fps. Does not resample frames
+    or change model conditioning. Joint RGB/LiDAR currently requires output_fps == fps. Unsupported
+    for other models and LiDAR-only generation."""
     num_frames: pydantic.PositiveInt | None = None
     """Number of vision frames.
 
@@ -966,7 +977,7 @@ def _infer_multiview_caption_path(
             return f"{caption_root.rstrip('/')}/{match.group('sample_id')}_c{match.group('camera_index')}.json"
         clip_match = _MADS_CLIP_MEDIA_RE.match(filename)
         if clip_match is not None:
-            # Clip-level MADS assets (hdmap/lidar rangemap tars) have no _cN suffix.
+            # Clip-level assets (hdmap/lidar rangemap tars) have no _cN suffix.
             # Front-wide captions are the lidar-transfer training text source.
             return f"{caption_root.rstrip('/')}/{clip_match.group('sample_id')}_c0.json"
         raise ValueError(
@@ -1548,16 +1559,26 @@ class TransferDataOverrides(OverridesBase, _TransferDataBase):
                         "checkpoint with a fixed sampler or Stage 3 SF-DMD checkpoint with a fixed sampler, "
                         "with one latent frame per chunk"
                     )
-                if (
-                    len(hints) != 1
-                    or self.num_first_chunk_conditional_frames != 0
-                    or getattr(self, "control_guidance", None) != 1.0
-                    or not self.share_vision_temporal_positions
-                ):
+                # Name only the requirements this request breaks, with the values it passed.
+                culprits = []
+                if len(hints) != 1:
+                    culprits.append(f"{len(hints)} control hints {sorted(hints)} (must be exactly 1)")
+                if self.num_first_chunk_conditional_frames != 0:
+                    culprits.append(
+                        f"num_first_chunk_conditional_frames={self.num_first_chunk_conditional_frames} (must be 0)"
+                    )
+                control_guidance = getattr(self, "control_guidance", None)
+                if control_guidance != 1.0:
+                    culprits.append(
+                        f"control_guidance={control_guidance} (must be 1.0: the causal sampler has no "
+                        "control-guidance pass)"
+                    )
+                if not self.share_vision_temporal_positions:
+                    culprits.append("share_vision_temporal_positions=false (must be true to match training)")
+                if culprits:
                     raise ValueError(
-                        "Direct causal Transfer requires exactly one control hint, "
-                        "num_first_chunk_conditional_frames=0, control_guidance=1.0, "
-                        "and share_vision_temporal_positions=true"
+                        "Direct causal Transfer (transfer_resize_mode='direct_resize' on a causal checkpoint) "
+                        "cannot run this request:\n  - " + "\n  - ".join(culprits)
                     )
             if self.multiview is not None or any(
                 key not in {TransferHintKey.EDGE, TransferHintKey.BLUR, TransferHintKey.DEPTH, TransferHintKey.SEG}
@@ -1565,7 +1586,18 @@ class TransferDataOverrides(OverridesBase, _TransferDataBase):
             ):
                 raise ValueError("Direct Transfer resizing supports single-view edge, blur, depth, and seg only")
             if self.resolution not in {"480", "720"}:
-                raise ValueError("Direct Transfer resizing supports the teacher's trained 480 and 720 tiers only")
+                # A 480-only checkpoint would reject 720 later too; name its real limit instead of the teacher's tiers.
+                if (
+                    self._is_sf_dmd_transfer_model(model_config)
+                    and str(getattr(model_config, "resolution", "")) == "480"
+                ):
+                    raise ValueError(
+                        f"This SF-DMD Transfer checkpoint supports only resolution='480', got resolution='{self.resolution}'."
+                    )
+                raise ValueError(
+                    "Direct Transfer resizing supports the teacher's trained 480 and 720 tiers only, "
+                    f"got resolution='{self.resolution}'."
+                )
 
         for hint_key, config in hints.items():
             for field, default in self._TRANSFER_HINT_DEFAULTS.get(hint_key, {}).items():
@@ -1596,6 +1628,23 @@ class TransferDataOverrides(OverridesBase, _TransferDataBase):
                 if user_fields is None or field not in user_fields:
                     setattr(self, field, value)
 
+    @staticmethod
+    def _is_sf_dmd_transfer_model(model_config: "OmniMoTModelConfig") -> bool:
+        """Whether the loaded model is the causal SF-DMD Transfer student whose contract applies."""
+        video_temporal_causal = bool(getattr(model_config, "video_temporal_causal", False))
+        is_self_forcing = getattr(model_config, "simulation_mode", None) == "self_forcing"
+        is_distilled = getattr(model_config, "fixed_step_sampler_config", None) is not None
+        if not video_temporal_causal or not (is_self_forcing or is_distilled):
+            return False
+        if int(getattr(model_config, "teacher_forcing_frames_per_chunk", 1) or 1) != 1:
+            return False
+        replay_policy = getattr(model_config, "teacher_forcing_replay_policy", None)
+        return (
+            getattr(replay_policy, "control_visibility", None) == "causal"
+            and bool(getattr(replay_policy, "controls_read_strict_past_clean_rgb", False))
+            and getattr(replay_policy, "clean_pass_causality", None) == "frame"
+        )
+
     def _apply_sf_dmd_transfer_inference_contract(
         self,
         *,
@@ -1604,26 +1653,16 @@ class TransferDataOverrides(OverridesBase, _TransferDataBase):
     ) -> None:
         """Apply the resolution contract recorded by the SF-DMD Transfer checkpoint."""
         self = cast("SampleDataOverrides", self)
-        video_temporal_causal = bool(getattr(model_config, "video_temporal_causal", False))
-        is_self_forcing = getattr(model_config, "simulation_mode", None) == "self_forcing"
-        is_distilled = getattr(model_config, "fixed_step_sampler_config", None) is not None
-        if not video_temporal_causal or not (is_self_forcing or is_distilled):
-            return
-        if int(getattr(model_config, "teacher_forcing_frames_per_chunk", 1) or 1) != 1:
-            return
-        replay_policy = getattr(model_config, "teacher_forcing_replay_policy", None)
-        if (
-            getattr(replay_policy, "control_visibility", None) != "causal"
-            or not getattr(replay_policy, "controls_read_strict_past_clean_rgb", False)
-            or getattr(replay_policy, "clean_pass_causality", None) != "frame"
-        ):
+        if not self._is_sf_dmd_transfer_model(model_config):
             return
 
         resolution = self.resolution
         # The selected 480-only checkpoint must not inherit the legacy 720 preset.
         # Earlier mixed-resolution students record resolution=720 and retain both tiers.
         if str(getattr(model_config, "resolution", "")) == "480" and resolution != "480":
-            raise ValueError("This SF-DMD Transfer checkpoint supports only resolution='480'.")
+            raise ValueError(
+                f"This SF-DMD Transfer checkpoint supports only resolution='480', got resolution='{resolution}'."
+            )
         if not self.transfer_hints or not self.autoregressive:
             return
         frame_cap = self._SF_DMD_TRANSFER_MAX_FRAMES.get(resolution)
@@ -1657,8 +1696,8 @@ class _SampleDataBase:
         # single-view path reads, so the top-level mode stays None for a multiview i2v
         # sample. Leaving it None makes _get_multiview_condition_pixel_frames return
         # [None, ...] and an image2video sample then generates text2video output --
-        # byte-identical to the t2v run, with no error anywhere. Measured: parity job
-        # 2041279, all 11 views identical to the t2v run.
+        # byte-identical to the t2v run, with no error anywhere. Measured: all 11 views
+        # identical to the t2v run.
         if self.multiview is not None:
             condition_vision_mode = self.multiview.condition_vision_mode
         return SampleMeta(
@@ -1789,6 +1828,29 @@ CAUSAL_MULTIVIEW_ROLLING_EXPORT_OVERRIDES = (
     "model.config.rolling_kv_cache_chunks=2 model.config.rolling_kv_sink_chunks=1 "
     "model.config.rolling_prompt_policy=segmented"
 )
+
+
+def check_auto_fps_options(sample: "OmniSampleOverrides | OmniSampleArgs", config: Any) -> None:
+    """Validate effective arguments for CLI and API callers, including already-built samples."""
+    camera_fps = getattr(config, "_auto_camera_fps", None)
+    if camera_fps is None or sample.multiview is None:
+        if sample.output_fps is not None:
+            raise ValueError("output_fps is only supported for identified Auto camera models with multiview inputs.")
+        return
+    if sample.fps != camera_fps:
+        raise ValueError(
+            f"This Auto checkpoint requires model conditioning fps={camera_fps}, got fps={sample.fps}. "
+            f"For RGB-only playback at {sample.fps} FPS, omit --fps and use --output-fps {sample.fps} "
+            "(JSON: output_fps). Keep the synchronized input frames unchanged."
+        )
+    if sample.output_fps is not None and sample.output_fps != camera_fps:
+        if sample.is_joint_cam_lidar_transfer:
+            raise ValueError(
+                "Joint RGB/LiDAR retiming is not supported: output_fps must equal fps=30 to preserve "
+                "camera/sweep synchronization. Use different output_fps only for RGB-only Auto generation."
+            )
+        if sample.enable_sound or sample.sound_path is not None:
+            raise ValueError("Auto output_fps retiming supports RGB-only generation without audio.")
 
 
 def check_causal_multiview_lidar_prefix_options(sample: "OmniSampleOverrides", config: Any) -> None:
@@ -2001,6 +2063,17 @@ class OmniSampleOverrides(
             if "guidance" not in configured and getattr(model_config, "fixed_step_sampler_config", None) is not None:
                 self.guidance = 1.0
 
+        # Auto's released camera clock is fixed, but the shared interface remains variable-FPS
+        # for other models. Only omitted FPS gets defaulted; sample/CLI/custom-defaults values
+        # must pass validation rather than being silently replaced.
+        auto_fps = getattr(model_config, "_auto_camera_fps", None)
+        if auto_fps is not None and self.multiview is not None:
+            if "fps" not in configured or self.fps is None:
+                self.fps = auto_fps
+            if self.output_fps is None:
+                self.output_fps = self.fps
+        check_auto_fps_options(self, model_config)
+
         # Model-specific num_frames default for video generation (e.g.
         # Cosmos3-Edge -> 121). Applies only when the user did not request a
         # frame count and the mode produces a plain video; image, action, and
@@ -2055,6 +2128,9 @@ class OmniSampleOverrides(
         self._build_multiview_data(sample_meta=sample_meta, model_config=model_config)
         # After the transfer defaults, so control_guidance and the joint clock are resolved.
         check_causal_multiview_options(self, model_config)
+        check_auto_fps_options(self, model_config)
+        if auto_fps is not None and self.multiview is not None:
+            log.info(f"Model conditioning: {self.fps} FPS | Output playback: {self.output_fps} FPS")
 
         if not shift_configured and not sample_meta.model_mode.is_reasoner:
             # Unregistered backbone names (custom fine-tunes) simply skip shift
@@ -2280,6 +2356,21 @@ class OmniSetupArgs(SetupArgs):
         return self
 
 
+def _is_sf_dmd_transfer_config(config: dict[str, Any]) -> bool:
+    """Whether an exported ``model.config`` is the SF-DMD Transfer (Sim-Transfer) student."""
+    replay_policy = config.get("teacher_forcing_replay_policy")
+    if not isinstance(replay_policy, dict):
+        return False
+    return (
+        config.get("fixed_step_sampler_config") is not None
+        and config.get("video_temporal_causal") is True
+        and config.get("teacher_forcing_frames_per_chunk") == 1
+        and replay_policy.get("control_visibility") == "causal"
+        and replay_policy.get("controls_read_strict_past_clean_rgb") is True
+        and replay_policy.get("clean_pass_causality") == "frame"
+    )
+
+
 class OmniSetupOverrides(SetupOverrides):
     variant: Suppress[Literal["omni"]] = "omni"
     """Discriminator."""
@@ -2376,19 +2467,7 @@ class OmniSetupOverrides(SetupOverrides):
     def _is_sf_dmd_transfer_hf_checkpoint(self) -> bool:
         """Recognize the student inference contract without a private experiment name."""
         config = self._hf_checkpoint_model_config()
-        if config is None:
-            return False
-        replay_policy = config.get("teacher_forcing_replay_policy")
-        if not isinstance(replay_policy, dict):
-            return False
-        return (
-            config.get("fixed_step_sampler_config") is not None
-            and config.get("video_temporal_causal") is True
-            and config.get("teacher_forcing_frames_per_chunk") == 1
-            and replay_policy.get("control_visibility") == "causal"
-            and replay_policy.get("controls_read_strict_past_clean_rgb") is True
-            and replay_policy.get("clean_pass_causality") == "frame"
-        )
+        return config is not None and _is_sf_dmd_transfer_config(config)
 
     def _apply_causal_multiview_setup_contract(self, world_size: int) -> None:
         """Pin the eager rolling runtime of a causal multiview checkpoint (Cosmos3-Nano-Sim-Auto).
@@ -2501,6 +2580,42 @@ class OmniSetupOverrides(SetupOverrides):
             log.warning("CFG parallelism takes precedence over batched CFG; disabling batched CFG.")
             self.use_batched_cfg = False
 
+    def _warn_degrading_transfer_history_window(self) -> None:
+        """Warn about Sim-Transfer history windows that are known to degrade the output.
+
+        The causal Transfer window counts the frame being generated, so it exposes
+        ``kv_cache_inference_size - attention_sink_size - 1`` earlier non-sink frames. With none, the
+        output can wash out and lose fine detail. A finite window without an attention sink can let
+        brightness drift once the clip outgrows the window. Unset flags resolve to the checkpoint's
+        exported values; with neither flag set the checkpoint's own window stands and nothing is read. A sink
+        that is not smaller than the window is left to the model's own check.
+        """
+        if self.kv_cache_inference_size is None and self.attention_sink_size is None:
+            return
+        config = self._hf_checkpoint_model_config()
+        if config is None or not _is_sf_dmd_transfer_config(config):
+            return
+        window = self.kv_cache_inference_size
+        if window is None:
+            window = config.get("kv_cache_inference_size")
+        sink = self.attention_sink_size
+        if sink is None:
+            sink = config.get("attention_sink_size") or 0
+        if not window or sink >= window:
+            return
+        if window - sink - 1 < 1:
+            log.warning(
+                f"kv_cache_inference_size={window} with attention_sink_size={sink} leaves no earlier non-sink "
+                "frames in the causal history window (the window includes the frame being generated); the "
+                "output can wash out. Set kv_cache_inference_size to 0 for full history, or use a window such as 30 "
+                "with a sink of 3."
+            )
+        elif sink == 0:
+            log.warning(
+                f"kv_cache_inference_size={window} has no attention sink; once the clip outgrows the window, "
+                "brightness can drift. Set attention_sink_size to 1 or more, as in 30 with a sink of 3."
+            )
+
     @override
     def build_setup(
         self, world_size: int | None = None, local_world_size: int | None = None, device_memory_bytes: int | None = None
@@ -2519,6 +2634,7 @@ class OmniSetupOverrides(SetupOverrides):
             resolved_value = "null" if field == "kv_cache_inference_size" and value == 0 else str(value)
             self.experiment_overrides = [item for item in self.experiment_overrides if not item.startswith(key)]
             self.experiment_overrides.append(key + resolved_value)
+        self._warn_degrading_transfer_history_window()
         self._build_parallelism(
             world_size=world_size, local_world_size=local_world_size, device_memory_bytes=device_memory_bytes
         )

@@ -62,6 +62,7 @@ def test_hf_model_construction_applies_public_streaming_cache_settings(
                     }
                 },
                 "per_view_captions": True,
+                "per_view_caption_task": "av_joint_camera_lidar_transfer",
             }
         )
     )
@@ -117,6 +118,7 @@ def test_hf_model_construction_applies_public_streaming_cache_settings(
     assert pipe.model_config.kv_cache_inference_size == expected_window
     assert pipe.model_config.attention_sink_size == expected_sink
     assert pipe.per_view_captions is True
+    assert pipe.model_config._auto_camera_fps == 30
     assert config_path.read_text() == saved_config
 
 
@@ -795,7 +797,7 @@ def _prompt_sample_args(**overrides: Any) -> SimpleNamespace:
 @pytest.mark.L0
 @pytest.mark.CPU
 def test_native_upsampled_prompt_is_not_stripped() -> None:
-    """imaginaire4 returns this branch's prompt verbatim; stripping it here diverged the token ids.
+    """The upstream codebase returns this branch's prompt verbatim; stripping it here diverged the token ids.
 
     Latent at the defaults -- native_prompt_upsampling is False -- and only visible for a non-JSON
     prompt carrying leading or trailing whitespace. Where it is not latent, the two runtimes
@@ -883,11 +885,11 @@ def test_per_view_captions_use_whole_second_durations() -> None:
 
     297 frames at 30 fps is 9.9 seconds. The JSON branch already truncates
     (``int(num_frames / fps)`` in _format_json_prompt_with_template), so before this the two
-    branches disagreed with each other as well as with imaginaire4: a JSON caption read "9s" and a
+    branches disagreed with each other as well as with the upstream codebase: a JSON caption read "9s" and a
     plain-text one "9.9s" for the same clip.
 
     Measured rather than theoretical: this one character moved every decoded pixel of an 11-camera
-    run -- 0/11 views identical, mean 5.05/255 against imaginaire4 -- while leaving a video that
+    run -- 0/11 views identical, mean 5.05/255 against the upstream codebase -- while leaving a video that
     looks entirely correct.
     """
     from cosmos_framework.inference.inference import _get_per_view_prompt_sample_data

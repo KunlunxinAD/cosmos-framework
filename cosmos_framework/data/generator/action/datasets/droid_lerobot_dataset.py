@@ -190,7 +190,7 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
         self._color_augmentor: T.ColorJitter | None = None
         self._video_backend = video_backend
 
-        # Eager source registration. i4 defers this to its own dataloader's
+        # Eager source registration. Upstream defers this to its own dataloader's
         # ActionUnifiedIterableDataset.assign_worker(); cosmos-framework instead
         # drives the dataset through ActionIterableShuffleDataset (block-striding,
         # which needs the full flat index present in every worker), so we build
