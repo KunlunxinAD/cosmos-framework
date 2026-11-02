@@ -47,6 +47,45 @@ class _UnshardedLocalSFTDataset(LocalSFTDataset):
         if self.shuffle:
             rng = random.Random(self.distributor_seed + epoch)
             rng.shuffle(indices)
+
+        # Opt-in (VP2_LENGTH_BALANCE=1, default OFF): permute WITHIN each
+        # optimizer-step block so all ranks hold similar-length samples at each
+        # microstep. Attacks rank arrival skew, which measurement showed to be the
+        # dominant term in all_gather duration (skew median 17.29 ms vs transfer
+        # 5.49 ms). The block is exactly one step's sample set, so the set, the
+        # per-sample weight and the GA count are all unchanged -- only the
+        # floating-point accumulation order differs. See
+        # cosmos_framework/data/reasoner/length_balance.py for the full argument.
+        from cosmos_framework.data.reasoner import length_balance as _lb  # noqa: PLC0415
+
+        if _lb.enabled():
+            import os
+
+            index_path = os.environ.get("VP2_LENGTH_INDEX") or os.path.join(
+                os.path.dirname(self.manifest_path), "length_index.json"
+            )
+            world = int(os.environ.get("WORLD_SIZE", "1"))
+            ga = int(os.environ.get("VP2_LB_GRAD_ACCUM", "8"))
+            workers = int(os.environ.get("VP2_LB_NUM_WORKERS", "2"))
+            try:
+                lengths = _lb.load_length_index(index_path)
+            except OSError as exc:
+                log.warning(f"length-balance ON but index unreadable ({exc}); keeping stock order")
+                return indices
+            key_of = lambda i: manifest[i].get("id") or manifest[i].get("key")  # noqa: E731
+            # Anchor the block grid to the GLOBAL step index. len(manifest)=3343
+            # is not a multiple of world*ga=64, so without this the grid drifts
+            # 15 positions per epoch and blocks start straddling step
+            # boundaries -- which breaks the set-invariance argument above.
+            offset = _lb.epoch_block_offset(epoch, len(manifest), world, ga)
+            before = _lb.describe(indices, key_of, lengths, world, ga, workers, offset)
+            indices = _lb.balance_indices(indices, key_of, lengths, world, ga, workers, offset)
+            after = _lb.describe(indices, key_of, lengths, world, ga, workers, offset)
+            log.critical(
+                f"[length-balance] ON epoch={epoch} world={world} ga={ga} workers={workers} "
+                f"block_offset={offset} index={index_path} entries={len(lengths)}\n"
+                f"  BEFORE {before}\n  AFTER  {after}"
+            )
         return indices
 
 

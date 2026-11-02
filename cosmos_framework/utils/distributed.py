@@ -407,7 +407,8 @@ def ddp_sync_grad(model, enabled):
     assert isinstance(model, torch.nn.Module)
     ddp_mutated = False
     old_require_backward_grad_sync = None
-    fsdp_prev: list = []  # (FSDPModule, previous all_reduce_grads) for exactly the modules we mutated
+    fsdp_prev: list = []
+    delay_rs = os.environ.get("FSDP_DELAY_RS", "0") == "1"
     try:
         if isinstance(model, DistributedDataParallel):
             old_require_backward_grad_sync = model.require_backward_grad_sync
@@ -427,6 +428,8 @@ def ddp_sync_grad(model, enabled):
             # micro-step, so gradients stay sharded and VRAM does not grow
             # (set_requires_gradient_sync(False) would keep gradients
             # unsharded: +stored-grad-bytes per rank).
+            # Opt-in FSDP_DELAY_RS=1 also defers reduce-scatter and retains
+            # full gradients between micro-steps; measure memory before use.
             # Every non-DDP model takes this branch, including single-process
             # runs: skip early when there is nothing to sync, and before the
             # fsdp import, which fails on builds without distributed.
@@ -435,6 +438,7 @@ def ddp_sync_grad(model, enabled):
                 return
             from torch.distributed.fsdp import FSDPModule
 
+            seen_groups: set[int] = set()
             for m in model.modules():
                 if not isinstance(m, FSDPModule):
                     continue
@@ -444,17 +448,27 @@ def ddp_sync_grad(model, enabled):
                 # (module, prev) as we mutate keeps the finally-block exact
                 # even if this loop raises midway.
                 fsdp_param_group = m._get_fsdp_state()._fsdp_param_group
-                if not fsdp_param_group:
+                if not fsdp_param_group or id(fsdp_param_group) in seen_groups:
                     continue
-                prev = fsdp_param_group.all_reduce_grads
-                m.set_requires_all_reduce(enabled, recurse=False)
-                fsdp_prev.append((m, prev))
+                seen_groups.add(id(fsdp_param_group))
+                # Save before mutating: shared groups, nesting and exceptions
+                # must restore both flags to their exact original values.
+                fsdp_prev.append((
+                    m, fsdp_param_group.reduce_grads,
+                    fsdp_param_group.all_reduce_grads,
+                ))
+                if delay_rs:
+                    m.set_requires_gradient_sync(enabled, recurse=False)
+                else:
+                    m.set_requires_all_reduce(enabled, recurse=False)
         yield
     finally:
         if ddp_mutated:
             model.require_backward_grad_sync = old_require_backward_grad_sync
-        for m, prev in fsdp_prev:
-            m.set_requires_all_reduce(prev, recurse=False)
+        for m, old_reduce, old_all_reduce in reversed(fsdp_prev):
+            if delay_rs:
+                m.set_requires_gradient_sync(old_reduce, recurse=False)
+            m.set_requires_all_reduce(old_all_reduce, recurse=False)
 
 
 def collate_batches(data_batches: list[dict[str, torch.Tensor]]) -> torch.Tensor | dict[str, torch.Tensor]:
