@@ -120,6 +120,7 @@ def parallelize_vfm_network(
     ac_config: ActivationCheckpointingConfig,
     attention_io_layout: str = "sequence_sharded",
     mp_policy: MixedPrecisionPolicy | None = None,
+    frozen_param_dtype: torch.dtype | None = None,
 ) -> torch.nn.Module:
     """Optimize the model using FSDP, CP, activation checkpointing, and torch.compile.
 
@@ -148,6 +149,9 @@ def parallelize_vfm_network(
             dtype>)`` to run a low-precision forward/backward over higher-precision
             parameters; the module must already hold its parameters in ``reduce_dtype``
             when this is called, since each FSDP unit records their dtype as it is built.
+        frozen_param_dtype: Storage dtype for the frozen decoder parameters, forwarded to
+            ``parallelize_unified_mot``. ``None`` leaves every parameter in the master
+            dtype. See ``ParallelismConfig.fsdp_frozen_param_dtype``.
     """
     _validate_multiview_window_activation_checkpointing(model, ac_config)
 
@@ -162,6 +166,7 @@ def parallelize_vfm_network(
         ac_config=ac_config,
         attention_io_layout=attention_io_layout,
         mp_policy=mp_policy,
+        frozen_param_dtype=frozen_param_dtype,
     )
     apply_ac(model, ac_config)
 
