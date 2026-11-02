@@ -36,11 +36,18 @@ pad tail) so each sample attends causally only within itself — semantically id
 the per-row causal mask of padded batching. ``attention_mask`` stays ``None`` in this mode
 (it is popped in ``training_step`` and ``create_causal_mask`` early-exits under cosmos).
 
-Backend: with ``is_causal=True`` + ``CausalType.TopLeft`` + varlen, the only compatible
-``cosmos_framework.model.attention`` backend is **NATTEN** (``blackwell-fmha`` on GB200/sm100,
-``hopper-fmha`` on sm90, ``cutlass-fmha`` fallback) — NOT Flash: flash2 varlen is banned
-and flash2/flash3 only accept ``BottomRight``/``DontCare`` causal, while cuDNN varlen is
-not integrated (see ``cosmos_framework/attention/*/checks.py``).
+Backend: the causal case requests ``CausalType.DontCare`` rather than ``TopLeft``. The
+backends split on mask convention — cuDNN and NATTEN accept ``TopLeft``, flash2/flash3
+accept ``BottomRight`` — and ``DontCare`` is the only value all four accept. It is correct
+here because this adapter already guarantees equal-length causal self-attention (see the
+guards below): when ``q_len == kv_len`` the two conventions are the same matrix, which is
+precisely what ``CausalType.DontCare`` means (``model/attention/masks.py``). Pinning
+``TopLeft`` would make flash2/flash3 unselectable, and pinning ``BottomRight`` would drop
+cuDNN and NATTEN; ``DontCare`` keeps every backend in play and leaves the choice to the
+platform's candidate order. This mirrors the ``DontCare`` branch the VFM/MoT path already
+has (``model/generator/mot/attention.py``). Note that cuDNN has no varlen integration, so
+varlen causal still lands on flash2/flash3/NATTEN
+(see ``cosmos_framework/model/attention/*/checks.py``).
 
 Narrow causal-varlen contract: true-packed text uses block-diagonal causal
 self-attention with shared Q/KV boundaries (``B=1``, ``q_len == kv_len``). Those
@@ -182,7 +189,19 @@ def _hf_attention_cosmos_local(
         k = k.to(torch.bfloat16)
         v = v.to(torch.bfloat16)
 
-    causal_type = CausalType.TopLeft if is_causal else None
+    if is_causal:
+        # Equal-length causal self-attention: the top-left and bottom-right conventions
+        # coincide, and ``DontCare`` is the only value every backend accepts (cuDNN and
+        # NATTEN take ``TopLeft``, flash2/flash3 take ``BottomRight``). See the module
+        # docstring. ``q_len != kv_len`` (e.g. a KV-cache decode step) is outside this
+        # adapter's contract; keep the previous ``TopLeft`` there rather than tripping
+        # ``attention_param_checks``' DontCare guard and changing that path's behaviour.
+        # NOTE: compare on ``query``/``key``, which are still the incoming BHSD tensors
+        # (index -2 is the sequence length). The BSHD copies ``q``/``k`` hold the head
+        # count at -2, which is wrong for a GQA shape.
+        causal_type = CausalType.DontCare if query.shape[-2] == key.shape[-2] else CausalType.TopLeft
+    else:
+        causal_type = None
 
     out = imag_attention(
         q,
