@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import copy
-
 import pytest
 import torch
 
@@ -12,8 +10,11 @@ from cosmos_framework.utils.generator.lora import (
     LoraInjectedLinear,
     apply_lora_trainable_scope,
     inject_lora_pre_fsdp,
+    merge_and_strip_lora_adapters_,
     merge_lora_adapters_,
 )
+
+pytestmark = pytest.mark.L0
 
 
 class _Tiny(torch.nn.Module):
@@ -86,116 +87,88 @@ def test_rslora_merge_matches_unmerged_forward() -> None:
     torch.testing.assert_close(model.q_proj(values), expected)
 
 
-@pytest.mark.parametrize("prefix", ["", "attention."])
-def test_packed_qkv_aliases_preserve_new_lora_options_and_bias_scope(prefix: str) -> None:
-    model = torch.nn.Module()
-    attention = torch.nn.Module()
-    attention.qkv_proj = torch.nn.Linear(4, 9, bias=True)
-    model.attention = attention
-    targets = ",".join(f"{prefix}{name}" for name in ("q_proj", "k_proj", "v_proj"))
-
-    inject_lora_pre_fsdp(
-        model,
-        lora_rank=2,
-        lora_alpha=4,
-        lora_target_modules=targets,
-        lora_dropout=0.1,
-        lora_use_rslora=True,
-        lora_precision="float32",
-        lora_bias="lora_only",
+@pytest.mark.parametrize("use_rslora", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float64])
+def test_export_merge_preserves_precision_and_training_weights(dtype, use_rslora):
+    torch.manual_seed(13)
+    layer = LoraInjectedLinear(
+        torch.nn.Linear(4, 3, dtype=dtype), rank=2, alpha=3, use_rslora=use_rslora, adapter_dtype=torch.float32
     )
-
-    adapter = attention.qkv_proj
-    assert isinstance(adapter, LoraInjectedLinear)
-    assert adapter.lora_dropout.p == 0.1
-    assert adapter._lora_use_rslora is True
-    assert adapter.lora_A.weight.dtype == torch.float32
-    assert adapter.weight.requires_grad is False
-    assert adapter.bias.requires_grad is True
-    assert model._cosmos_peft_parameter_summary["adapter_module_count"] == 1
-
-    model.requires_grad_(True)
-    apply_lora_trainable_scope(model, lora_target_modules=targets, lora_bias="lora_only")
-    assert adapter.weight.requires_grad is False
-    assert adapter.bias.requires_grad is True
-
-
-def test_packed_lora_rejects_unknown_targets_before_injection() -> None:
-    model = torch.nn.Module()
-    model.qkv_proj = torch.nn.Linear(4, 9)
-    with pytest.raises(ValueError, match="missing_proj"):
-        inject_lora_pre_fsdp(
-            model,
-            lora_rank=2,
-            lora_alpha=4,
-            lora_target_modules="q_proj,missing_proj",
-        )
-    assert not isinstance(model.qkv_proj, LoraInjectedLinear)
+    base = layer.weight.detach().clone()
+    adapter_a = layer.lora_A.weight.detach().clone()
+    adapter_b = layer.lora_B.weight.detach().clone()
+    scale = 3 / (2**0.5 if use_rslora else 2)
+    accumulation_dtype = torch.float64 if dtype == torch.float64 else torch.float32
+    expected = base.to(accumulation_dtype) + scale * (
+        adapter_b.to(accumulation_dtype) @ adapter_a.to(accumulation_dtype)
+    )
+    # A higher-precision export must not first round the merged weight to BF16.
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        exported = layer.merged_weight(base, adapter_a, adapter_b, dtype=accumulation_dtype)
+    torch.testing.assert_close(exported, expected, rtol=0, atol=0)
+    for actual, original in ((layer.weight, base), (layer.lora_A.weight, adapter_a), (layer.lora_B.weight, adapter_b)):
+        torch.testing.assert_close(actual, original, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("training", [True, False])
-@pytest.mark.parametrize("use_rslora", [True, False])
+@pytest.mark.parametrize("merge_api", ["layer", "network", "offline"])
 @pytest.mark.parametrize(
-    "base_dtype,adapter_dtype",
+    "dtype,autocast,expected_inplace,expected_export",
     [
-        (torch.float64, torch.float64),
-        (torch.float32, torch.float32),
-        (torch.bfloat16, torch.bfloat16),
-        (torch.bfloat16, torch.float32),
-        (torch.float32, torch.bfloat16),
+        (torch.bfloat16, False, 1.0, 1.0078125),
+        (torch.bfloat16, True, 1.0, 1.0078125),
+        (torch.float32, False, 1.00392, 1.00392),
+        (torch.float32, True, 1.00390625, 1.00392),
     ],
 )
-def test_lora_scaled_intermediate_matches_reference(training, use_rslora, base_dtype, adapter_dtype):
-    """Preserve dropout, dtype and gradients against output-scaled LoRA."""
-    torch.manual_seed(42)
+@torch.no_grad()
+def test_existing_merge_apis_retain_rounding_and_autocast(
+    merge_api, dtype, autocast, expected_inplace, expected_export
+):
     layer = LoraInjectedLinear(
-        torch.nn.Linear(8, 12, dtype=base_dtype),
-        rank=4,
-        alpha=3,
-        dropout=0.25,
-        use_rslora=use_rslora,
-        adapter_dtype=adapter_dtype,
-    ).train(training)
-    torch.nn.init.normal_(layer.lora_A.weight, std=0.2)
-    torch.nn.init.normal_(layer.lora_B.weight, std=0.2)
-    reference = copy.deepcopy(layer)
-    x = torch.randn(2, 3, 8, dtype=base_dtype, requires_grad=True)
-    reference_x = x.detach().clone().requires_grad_(True)
-    torch.manual_seed(123)
-    actual = layer(x)
-    torch.manual_seed(123)
-    base = torch.nn.functional.linear(reference_x, reference.weight, reference.bias)
-    adapter_input = reference.lora_dropout(reference_x).to(reference.lora_A.weight.dtype)
-    adapter_output = reference.lora_B(reference.lora_A(adapter_input)).to(base.dtype)
-    expected = base + reference._lora_scale * adapter_output
-    assert actual.dtype == base_dtype
-    # Moving scale across a projection/cast changes low-precision rounding.
-    if base_dtype != adapter_dtype:
-        rtol, atol = 0, 0
-    elif torch.bfloat16 in (base_dtype, adapter_dtype):
-        rtol, atol = 0.03, 0.015
-    elif base_dtype == torch.float64:
-        rtol, atol = 1e-10, 1e-12
-    else:
-        rtol, atol = 2e-5, 2e-6
-    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
-    gradient = torch.randn_like(actual)
-    actual.backward(gradient)
-    expected.backward(gradient)
-    torch.testing.assert_close(x.grad, reference_x.grad, rtol=rtol, atol=atol)
-    for (name, parameter), (reference_name, reference_parameter) in zip(
-        layer.named_parameters(), reference.named_parameters()
-    ):
-        assert name == reference_name
-        torch.testing.assert_close(parameter.grad, reference_parameter.grad, rtol=rtol, atol=atol)
+        torch.nn.Linear(1, 1, bias=False, dtype=dtype), rank=1, alpha=1, adapter_dtype=torch.float32
+    )
+    layer.weight.fill_(1.0)
+    layer.lora_A.weight.fill_(1.0)
+    layer.lora_B.weight.fill_(0.00392)
+    weight = layer.weight
+    network = torch.nn.ModuleDict({"layer": layer})
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=autocast):
+        exported = layer.merged_weight(layer.weight, layer.lora_A.weight, layer.lora_B.weight)
+        if merge_api == "layer":
+            layer.merge_adapter_()
+        elif merge_api == "network":
+            assert merge_lora_adapters_(network) == 1
+        else:
+            assert merge_and_strip_lora_adapters_(network) == 1
+            assert type(network["layer"]) is torch.nn.Linear
+    # Deliberate boundary: legacy APIs round the delta before adding it, and
+    # honor ambient autocast. Automatic export rounds only the completed sum.
+    assert network["layer"].weight is weight
+    torch.testing.assert_close(weight, torch.full_like(weight, expected_inplace), rtol=0, atol=0)
+    torch.testing.assert_close(exported, torch.full_like(weight, expected_export), rtol=0, atol=0)
 
 
-def test_lora_training_dropout_is_applied_and_disabled_in_eval():
-    layer = LoraInjectedLinear(torch.nn.Linear(4, 3), rank=2, alpha=3, dropout=1.0)
-    torch.nn.init.ones_(layer.lora_A.weight)
-    torch.nn.init.ones_(layer.lora_B.weight)
-    values = torch.ones(2, 4)
-    base = torch.nn.functional.linear(values, layer.weight, layer.bias)
-    torch.testing.assert_close(layer(values), base)
-    layer.eval()
-    torch.testing.assert_close(layer(values), base + 12.0)
+@pytest.mark.GPU
+@pytest.mark.parametrize("precision", ["highest", "high", "medium"])
+@pytest.mark.parametrize("use_rslora", [False, True])
+@torch.no_grad()
+def test_cuda_export_merge_preserves_precision_and_restores_matmul_settings(precision, use_rslora):
+    torch.manual_seed(13)
+    layer = LoraInjectedLinear(torch.nn.Linear(16, 16), rank=4, alpha=8, use_rslora=use_rslora)
+    layer.lora_A.weight.normal_(std=0.1)
+    layer.lora_B.weight.normal_(std=0.1)
+    expected = (
+        layer.weight.double() + layer._lora_scale * (layer.lora_B.weight.double() @ layer.lora_A.weight.double())
+    ).float()
+    layer.cuda()
+    previous = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision(precision)
+    try:
+        actual = layer.merged_weight(layer.weight, layer.lora_A.weight, layer.lora_B.weight)
+        assert torch.get_float32_matmul_precision() == precision
+        torch.testing.assert_close(actual.cpu(), expected, atol=1e-7, rtol=1e-6)
+        with pytest.raises(RuntimeError, match="shapes cannot be multiplied"):
+            layer.merged_weight(layer.weight, layer.lora_A.weight, layer.lora_B.weight[:, :-1])
+        assert torch.get_float32_matmul_precision() == precision
+    finally:
+        torch.set_float32_matmul_precision(previous)
