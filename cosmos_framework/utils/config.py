@@ -31,9 +31,9 @@ except ImportError:
 
     USE_MEGATRON = False
 
+from cosmos_framework.utils import distributed
 from cosmos_framework.utils.lazy_config import LazyCall as L
 from cosmos_framework.utils.lazy_config import LazyDict
-from cosmos_framework.utils import distributed
 from cosmos_framework.utils.misc import Color
 
 T = TypeVar("T")
@@ -179,7 +179,7 @@ class ObjectStoreConfig:
 class HFExportConfig:
     # Whether to enable HuggingFace safetensors export after each DCP checkpoint.
     enabled: bool = False
-    # HuggingFace Hub repo ID to push exported weights to (e.g. "nvidia/cosmos3-qwen3-8b").
+    # Hugging Face repository selected by the operator for exported weights.
     # None means local/S3 only.
     hf_repo_id: Optional[str] = None
     # Object store for uploading exports. If not enabled, upload is skipped.
@@ -209,7 +209,7 @@ class JobConfig:
 
     @property
     def path_local(self) -> str:
-        local_root = os.environ.get("IMAGINAIRE_OUTPUT_ROOT", "/tmp/imaginaire4-output")
+        local_root = os.environ.get("IMAGINAIRE_OUTPUT_ROOT", "/tmp/cosmos-framework-output")
         return f"{local_root}/{self.path}"
 
 

@@ -503,7 +503,7 @@ def register_checkpoint(checkpoint_config: CheckpointConfig):
     DEPRECATED: Use 'CheckpointConfig.register' instead.
     """
     if not EXPERIMENTAL_CHECKPOINTS:
-        if checkpoint_config.hf.repository in ["nvidia/Cosmos-Experimental", "nvidia-cosmos-ea/Cosmos-Experimental"]:
+        if checkpoint_config.metadata.get("experimental", False):
             # Don't register experimental checkpoints. An exception will be
             # raised in CI if the checkpoint is used without
             # EXPERIMENTAL_CHECKPOINTS.

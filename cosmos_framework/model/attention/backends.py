@@ -147,7 +147,7 @@ def get_backend_list(arch_tag: int) -> list[str]:
             "torch_sdpa",
         ]
     elif arch_tag in [100, 103]:
-        # Keep Flash4 behind NATTEN during rollout; set I4_ATTN_BACKENDS=flash4 to opt in.
+        # Keep Flash4 behind NATTEN during rollout; set COSMOS_ATTN_BACKENDS=flash4 to opt in.
         default_backends = [
             "cudnn",
             "natten",
