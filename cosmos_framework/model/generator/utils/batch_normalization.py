@@ -11,11 +11,19 @@ vision layout. Model stages consume sample metadata, never a loader-class flag.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
 
 from cosmos_framework.data.generator.sequence_packing.sequence import SequencePlan
+
+
+def scale_fp32_vision_pixels(pixels: torch.Tensor) -> torch.Tensor:
+    """Map a fresh FP32 buffer containing uint8 pixel levels to [-1, 1]."""
+    if os.environ.get("COSMOS_INPLACE_FP32_VISION_NORMALIZATION", "0") == "1":
+        return pixels.div_(127.5).sub_(1.0)
+    return pixels / 127.5 - 1.0
 
 
 def _items(value: Any) -> list[torch.Tensor]:
@@ -96,7 +104,7 @@ def normalize_vision_batch_inplace(
                 raise ValueError(f"Invalid vision item shape {tuple(item.shape)} for is_image={is_image}.")
             if item.dtype == torch.uint8:
                 if not per_camera:
-                    item = item.to(**tensor_kwargs_fp32) / 127.5 - 1.0  # [1,C,T,H,W]
+                    item = scale_fp32_vision_pixels(item.to(**tensor_kwargs_fp32))  # [1,C,T,H,W]
             elif torch.is_floating_point(item):
                 item = item.to(**tensor_kwargs_fp32)  # [1,C,T,H,W]
             else:

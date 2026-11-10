@@ -120,6 +120,36 @@ def _fused_vae_norm_enabled() -> bool:
     return _FUSED_VAE_NORM
 
 
+# The encoder stores conv weights, causal caches and chunk tensors channel-adjacent
+# (``channels_last_3d``) by default -- the layout its modules, the AOT artifacts and the cost model
+# were all built around. On P800 XPU the conv kernels prefer standard NCDHW instead: a same-session
+# 8-card GA=1 A/B of the LIBERO-10 nano recipe measured the encode group at 3.724 -> 3.124 s
+# (-16.1%) and the whole optimizer step at 19.671 -> 19.226 s (-2.26%), peak allocated unchanged
+# (50.11 -> 50.07 GiB). The two arms are different storage for the same values, so latents move by
+# fp16 rounding only -- 4.6e-4 relative L2 and 5.9e-3 max absolute over a batched 17-frame encode.
+# The gain is backend-specific, so it is opt-in: ``COSMOS_VAE_ENCODER_NCDHW=1`` selects NCDHW and
+# anything else keeps channels-last. Only the encoder is affected; ``decode`` keeps its own
+# channels-last storage either way.
+_VAE_ENCODER_NCDHW: bool | None = None
+
+
+def _vae_encoder_ncdhw_enabled() -> bool:
+    """Whether the encoder runs in standard NCDHW storage instead of channels-last. Read once per process."""
+    global _VAE_ENCODER_NCDHW
+    if _VAE_ENCODER_NCDHW is None:
+        _VAE_ENCODER_NCDHW = os.environ.get("COSMOS_VAE_ENCODER_NCDHW", "0").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+    return _VAE_ENCODER_NCDHW
+
+
+def _encoder_memory_format() -> torch.memory_format:
+    """The 5-D storage layout every encoder chunk tensor -- input, cache, output -- is kept in."""
+    return torch.contiguous_format if _vae_encoder_ncdhw_enabled() else torch.channels_last_3d
+
+
 class CausalConv3d(nn.Conv3d):
     """
     Causal 3d convolution.
@@ -845,6 +875,24 @@ def _enable_channels_last(*roots: nn.Module) -> None:
                 module.output_memory_format = torch.channels_last_3d
 
 
+def _enable_contiguous(*roots: nn.Module) -> None:
+    """Store conv weights, causal caches, and layout-producing outputs under *roots* as standard NCDHW.
+
+    The mirror image of :func:`_enable_channels_last`, for the encoder arm selected by
+    ``COSMOS_VAE_ENCODER_NCDHW``. Dimension-ordered contiguity is also the class default for every
+    attribute set here, so this is only load-bearing once something -- loading or synchronizing
+    weights, or an earlier :func:`_enable_channels_last` on the same modules -- has moved them.
+    """
+    for root in roots:
+        for module in root.modules():
+            if isinstance(module, (nn.Conv2d, nn.Conv3d)):
+                module.weight.data = module.weight.to(memory_format=torch.contiguous_format)  # [O,I,(Kt,)Kh,Kw]
+            if isinstance(module, (CausalConv3d, Resample)):
+                module.cache_memory_format = torch.contiguous_format
+            if isinstance(module, (AttentionBlock, DupUp3D)):
+                module.output_memory_format = torch.contiguous_format
+
+
 class WanVAE_(nn.Module):
     output_range: str = "[-1,1]"
 
@@ -906,8 +954,16 @@ class WanVAE_(nn.Module):
         self.enable_channels_last_decoder()
 
     def enable_channels_last_encoder(self) -> None:
-        """Use channel-adjacent encoder storage without changing tensor dimensions."""
-        _enable_channels_last(self.encoder, self.conv1)
+        """Install the encoder's storage layout without changing tensor dimensions.
+
+        Channel-adjacent by default, standard NCDHW under ``COSMOS_VAE_ENCODER_NCDHW=1``
+        (see :func:`_vae_encoder_ncdhw_enabled`). Callers re-run this after anything that
+        canonicalizes strides, such as loading or synchronizing weights.
+        """
+        if _vae_encoder_ncdhw_enabled():
+            _enable_contiguous(self.encoder, self.conv1)
+        else:
+            _enable_channels_last(self.encoder, self.conv1)
 
     def enable_channels_last_decoder(self) -> None:
         """Use channel-adjacent decoder storage; ``decode`` still returns a standard-contiguous video."""
@@ -969,13 +1025,14 @@ class WanVAE_(nn.Module):
         """
         feat_cache = list(feat_cache)
 
-        assert all(c is None or c.is_contiguous(memory_format=torch.channels_last_3d) for c in feat_cache)
-        assert x_chunk.is_contiguous(memory_format=torch.channels_last_3d)
+        memory_format = _encoder_memory_format()
+        assert all(c is None or c.is_contiguous(memory_format=memory_format) for c in feat_cache)
+        assert x_chunk.is_contiguous(memory_format=memory_format)
 
         out = self.encoder(x_chunk, feat_cache=feat_cache)
 
-        assert out.is_contiguous(memory_format=torch.channels_last_3d)
-        assert all(c is None or c.is_contiguous(memory_format=torch.channels_last_3d) for c in feat_cache)
+        assert out.is_contiguous(memory_format=memory_format)
+        assert all(c is None or c.is_contiguous(memory_format=memory_format) for c in feat_cache)
 
         # Project encoder features through conv1, split to mu/log_var, and normalize.
         mu, _log_var = self.conv1(out).chunk(2, dim=1)
@@ -1000,12 +1057,15 @@ class WanVAE_(nn.Module):
 
         # AOT variants are exported with batch size one. Batched condition streaming
         # therefore uses eager execution until batch-dynamic artifacts are available.
-        # Ensure channels-last contiguity so eager and AOT execution receive deterministic strides.
-        # AOT-returned caches can otherwise have layouts different from eager-produced
-        # example caches, which can silently corrupt a later compiled chunk.
-        x_chunk = x_chunk.contiguous(memory_format=torch.channels_last_3d)  # [B,12,T,H_patch,W_patch]
+        # Normalize to the active encoder layout so eager and AOT execution receive deterministic
+        # strides. AOT-returned caches can otherwise have layouts different from eager-produced
+        # example caches, which can silently corrupt a later compiled chunk. An artifact is only
+        # valid for the layout it was exported under; a mismatched one is dropped by the
+        # correctness gate in ``compile_encode`` instead of being dispatched here.
+        memory_format = _encoder_memory_format()
+        x_chunk = x_chunk.contiguous(memory_format=memory_format)  # [B,12,T,H_patch,W_patch]
         feat_cache = [
-            c.contiguous(memory_format=torch.channels_last_3d) if c is not None else None for c in feat_cache
+            c.contiguous(memory_format=memory_format) if c is not None else None for c in feat_cache
         ]  # entries: [B,C_cache,T_cache,H_cache,W_cache]
 
         aot_chunk_fns: dict | None = getattr(self, "_aot_chunk_fns", None)
@@ -1537,7 +1597,7 @@ _AOTChunkKey = tuple[int, int, int, int]  # (T_chunk, H_patch, W_patch, cache_t)
 def _random_encode_input(t: int, h: int, w: int) -> torch.Tensor:
     """A random patchified encoder chunk ``[1,12,t,h,w]`` in the layout ``_run_encode_chunk`` uses."""
     return torch.rand((1, 12, t, h, w), dtype=torch.bfloat16, device="cuda").contiguous(
-        memory_format=torch.channels_last_3d
+        memory_format=_encoder_memory_format()
     )  # [1,12,t,h,w]
 
 
@@ -2068,8 +2128,8 @@ class Wan2pt2VAEInterface(VideoTokenizerInterface):
               - torch 2.9 produces a correct latent but a wrong returned cache slot, which
                 silently corrupts the *next* chunk once it is threaded back in.
             A latent-only check would keep the 2.9-miscompiled variant and still corrupt
-            downstream chunks. Layout is normalized to channels-last exactly as
-            ``_run_chunk`` does at dispatch time.
+            downstream chunks. Layout is normalized to the active encoder layout exactly as
+            ``_run_encode_chunk`` does at dispatch time.
             """
             t_chunk, H_patch, W_patch, cache_t = key
             x_probe = _random_encode_input(t_chunk, H_patch, W_patch)  # [1,12,T,H_patch,W_patch]
@@ -2077,7 +2137,7 @@ class Wan2pt2VAEInterface(VideoTokenizerInterface):
             # and re-canonicalizes layout so the channels-last normalization never
             # mutates the shared entry.
             probe_cache = [
-                c.contiguous(memory_format=torch.channels_last_3d) if c is not None else None
+                c.contiguous(memory_format=_encoder_memory_format()) if c is not None else None
                 for c in probe_cache_map[(H_patch, W_patch)][cache_t]
             ]
 

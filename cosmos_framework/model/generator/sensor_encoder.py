@@ -33,6 +33,7 @@ import torch
 
 from cosmos_framework.model.generator.mot.replica_partition import ReplicaPartitioner, WorkUnit
 from cosmos_framework.model.generator.mot.vae_load_balance import offload_encode
+from cosmos_framework.model.generator.utils.batch_normalization import scale_fp32_vision_pixels
 
 
 @dataclasses.dataclass(frozen=True)
@@ -84,8 +85,7 @@ def normalize_uint8_item(state: torch.Tensor, fp32_kwargs: dict[str, Any]) -> to
     # the host would run on one CPU thread under torchrun and copy four times the bytes. The
     # uint8 -> fp32 conversion is exact either way.
     normalized_state = state.to(device=fp32_kwargs["device"]).to(dtype=fp32_kwargs["dtype"])  # [...,C,T,H,W]
-    normalized_state.div_(127.5).sub_(1.0)  # [...,C,T,H,W]
-    return normalized_state
+    return scale_fp32_vision_pixels(normalized_state)  # [...,C,T,H,W]
 
 
 def regroup_vision_latents(

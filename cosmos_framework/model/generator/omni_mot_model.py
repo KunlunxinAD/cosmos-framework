@@ -7,6 +7,7 @@ import collections
 import dataclasses
 import inspect
 import json
+import os
 import time
 from collections.abc import Sequence
 from contextlib import contextmanager
@@ -78,7 +79,10 @@ from cosmos_framework.model.generator.sensor_encoder import (
     get_vae_pixel_shapes,
     normalize_uint8_item,
 )
-from cosmos_framework.model.generator.utils.batch_normalization import normalize_vision_batch_inplace
+from cosmos_framework.model.generator.utils.batch_normalization import (
+    normalize_vision_batch_inplace,
+    scale_fp32_vision_pixels,
+)
 from cosmos_framework.model.generator.utils.camera_relative_pose import (
     prepare_camera_relative_poses,
     prepare_prope_cross_view_poses,
@@ -1473,7 +1477,7 @@ class OmniMoTModel(ImaginaireModel):
         gen_data_clean: GenerationDataClean,
         data_batch: dict[str, torch.Tensor],
     ) -> None:
-        """Free raw image or video tensors from GPU after CP slot-0 tokenization.
+        """Free raw image or video tensors from GPU after tokenization.
 
         The trainer retains the original host batch for callbacks, which
         re-encode from its image or video tensors.
@@ -1484,7 +1488,7 @@ class OmniMoTModel(ImaginaireModel):
         flattens it to match the retained counts so callbacks see a self-consistent
         batch without recomputation.
         """
-        if not self.config.release_cp_raw_batch_after_preprocessing:
+        if not misc.release_raw_vision_after_tokenization_enabled(self.config):
             return
         gen_data_clean.raw_state_vision = None
         data_batch.pop(self.input_video_key, None)
@@ -1521,6 +1525,7 @@ class OmniMoTModel(ImaginaireModel):
         cp_enabled = self.parallel_dims is not None and self.parallel_dims.cp_enabled
         if not cp_enabled:
             local_training_data = self._prepare_training_data(data_batch, iteration)
+            self._release_raw_vision_after_tokenization(local_training_data[2], data_batch)
             self._update_train_stats(local_training_data[2])
             return local_training_data
 
@@ -5559,10 +5564,79 @@ class OmniMoTModel(ImaginaireModel):
             if encoder.balancing_available():
                 return encoder.encode_balanced(raw_state_vision, num_views_per_vision_item)
 
+        vae_batch_size = int(os.environ.get("COSMOS_VAE_ENCODE_BATCH_SIZE", "1"))
+        if (
+            vae_batch_size > 1
+            and len(raw_state_vision) > 1
+            and "_encode_vision_item" not in self.__dict__
+            and not any(state.requires_grad for state in raw_state_vision)
+            and all(state.ndim == 5 and state.shape[0] == 1 for state in raw_state_vision)
+        ):
+            return self._encode_vision_x0_tokens_batched(
+                raw_state_vision,
+                num_views_per_vision_item,
+                batch_size=vae_batch_size,
+            )
+
         return [
             self._encode_vision_item(state, num_views=num_views)
             for state, num_views in zip(raw_state_vision, num_views_per_vision_item, strict=True)
         ]
+
+    def _encode_vision_x0_tokens_batched(
+        self,
+        raw_state_vision: list[torch.Tensor],
+        num_views_per_vision_item: list[int],
+        batch_size: int,
+    ) -> list[torch.Tensor]:
+        # Batch consecutive same-shape 5D (B=1) vision clips into micro-batches for VAE encoding.
+        clips: list[torch.Tensor] = []
+        item_indices: list[int] = []
+        for item_idx, (state, num_views) in enumerate(zip(raw_state_vision, num_views_per_vision_item, strict=True)):
+            if num_views == 1:
+                clips.append(state)
+                item_indices.append(item_idx)
+            else:
+                num_frames = int(state.shape[2])
+                frames_per_view = num_frames // num_views
+                for view_idx in range(num_views):
+                    clips.append(state.narrow(2, view_idx * frames_per_view, frames_per_view))
+                    item_indices.append(item_idx)
+
+        encoded_per_item: list[list[torch.Tensor]] = [[] for _ in raw_state_vision]
+        start = 0
+        num_clips = len(clips)
+        while start < num_clips:
+            first = clips[start]
+            end = start + 1
+            limit = min(start + batch_size, num_clips)
+            while end < limit:
+                other = clips[end]
+                if other.shape != first.shape or other.dtype != first.dtype or other.device != first.device:
+                    break
+                end += 1
+
+            if end - start == 1:
+                encode_input = first if torch.is_floating_point(first) else self._normalize_uint8_vision_item(first)
+                latent = self.encode(encode_input)
+                del encode_input
+                encoded_per_item[item_indices[start]].append(latent.contiguous().float())
+            else:
+                batched_raw = torch.cat(clips[start:end], dim=0)
+                encode_input = (
+                    batched_raw
+                    if torch.is_floating_point(batched_raw)
+                    else self._normalize_uint8_vision_item(batched_raw)
+                )
+                del batched_raw
+                latent = self.encode(encode_input)
+                del encode_input
+                for offset, z in enumerate(latent.split(1, dim=0)):
+                    encoded_per_item[item_indices[start + offset]].append(z.contiguous().float())
+                del latent
+            start = end
+
+        return [parts[0] if len(parts) == 1 else torch.cat(parts, dim=2) for parts in encoded_per_item]
 
     def _vision_prefix_encode_applicable(
         self,
@@ -6412,12 +6486,12 @@ class OmniMoTModel(ImaginaireModel):
                         # Flattened multiview items already include B; preserve the original stacking behavior otherwise.
                         if item.ndim != 5:
                             item = torch.stack([item])  # [1,C,T,H,W]
-                        normalized_item = item.to(**self.tensor_kwargs_fp32) / 127.5 - 1.0  # [B,C,T,H,W]
+                        normalized_item = scale_fp32_vision_pixels(item.to(**self.tensor_kwargs_fp32))  # [B,C,T,H,W]
                     else:
                         # Non-flattened batches may still provide one [C,T,H,W] tensor per sample.
                         assert item[0].dtype == torch.uint8, "Video data is not in uint8 format."
-                        normalized_item = (  # [B,C,T,H,W]
-                            torch.stack(item).to(**self.tensor_kwargs_fp32) / 127.5 - 1.0
+                        normalized_item = scale_fp32_vision_pixels(  # [B,C,T,H,W]
+                            torch.stack(item).to(**self.tensor_kwargs_fp32)
                         )
                     data_batch[input_key][i] = normalized_item  # [B,C,T,H,W]
                 data_batch[IS_PREPROCESSED_KEY] = True
@@ -6581,7 +6655,7 @@ class OmniMoTModel(ImaginaireModel):
                     for img_tensor in data_batch[input_key][i]:
                         img_tensor = rearrange(img_tensor, "c h w -> 1 c 1 h w").contiguous()
                         if img_tensor.dtype == torch.uint8:
-                            img_tensor = img_tensor.to(**self.tensor_kwargs_fp32) / 127.5 - 1.0
+                            img_tensor = scale_fp32_vision_pixels(img_tensor.to(**self.tensor_kwargs_fp32))
                         new_image_tensor_list.append(img_tensor)
                 data_batch[input_key] = new_image_tensor_list
                 data_batch[IS_PREPROCESSED_KEY] = True

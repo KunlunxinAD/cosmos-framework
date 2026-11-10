@@ -1385,6 +1385,8 @@ class PackingDataLoader(JointDataLoader):
         uniae_chunk_frames: int | Mapping[str, int] | None = None,
         uniae_pad_frames: int | None = None,
         iteration_time_budget: IterationTimeBudgetConfig | None = None,
+        enable_async_batch_building: bool = False,
+        async_batch_building_timeout_s: float = 1200.0,
     ):
         """
         Args:
@@ -1416,9 +1418,11 @@ class PackingDataLoader(JointDataLoader):
             uniae_chunk_frames=uniae_chunk_frames,
             uniae_pad_frames=uniae_pad_frames,
             iteration_time_budget=iteration_time_budget,
+            enable_async_batch_building=enable_async_batch_building,
+            async_batch_building_timeout_s=async_batch_building_timeout_s,
         )
 
-    def __iter__(self):
+    def _iter_synchronous(self) -> Iterator[dict[str, Any]]:
         inner = self.dataloader_list[0]
         ds_name = getattr(inner, "dataset_name", self.dataset_name_list[0])
 
