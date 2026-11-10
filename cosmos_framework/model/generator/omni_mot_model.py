@@ -7,6 +7,7 @@ import collections
 import dataclasses
 import inspect
 import json
+import os
 import time
 from collections.abc import Sequence
 from contextlib import contextmanager
@@ -5559,10 +5560,79 @@ class OmniMoTModel(ImaginaireModel):
             if encoder.balancing_available():
                 return encoder.encode_balanced(raw_state_vision, num_views_per_vision_item)
 
+        vae_batch_size = int(os.environ.get("COSMOS_VAE_ENCODE_BATCH_SIZE", "1"))
+        if (
+            vae_batch_size > 1
+            and len(raw_state_vision) > 1
+            and "_encode_vision_item" not in self.__dict__
+            and not any(state.requires_grad for state in raw_state_vision)
+            and all(state.ndim == 5 and state.shape[0] == 1 for state in raw_state_vision)
+        ):
+            return self._encode_vision_x0_tokens_batched(
+                raw_state_vision,
+                num_views_per_vision_item,
+                batch_size=vae_batch_size,
+            )
+
         return [
             self._encode_vision_item(state, num_views=num_views)
             for state, num_views in zip(raw_state_vision, num_views_per_vision_item, strict=True)
         ]
+
+    def _encode_vision_x0_tokens_batched(
+        self,
+        raw_state_vision: list[torch.Tensor],
+        num_views_per_vision_item: list[int],
+        batch_size: int,
+    ) -> list[torch.Tensor]:
+        # Batch consecutive same-shape 5D (B=1) vision clips into micro-batches for VAE encoding.
+        clips: list[torch.Tensor] = []
+        item_indices: list[int] = []
+        for item_idx, (state, num_views) in enumerate(zip(raw_state_vision, num_views_per_vision_item, strict=True)):
+            if num_views == 1:
+                clips.append(state)
+                item_indices.append(item_idx)
+            else:
+                num_frames = int(state.shape[2])
+                frames_per_view = num_frames // num_views
+                for view_idx in range(num_views):
+                    clips.append(state.narrow(2, view_idx * frames_per_view, frames_per_view))
+                    item_indices.append(item_idx)
+
+        encoded_per_item: list[list[torch.Tensor]] = [[] for _ in raw_state_vision]
+        start = 0
+        num_clips = len(clips)
+        while start < num_clips:
+            first = clips[start]
+            end = start + 1
+            limit = min(start + batch_size, num_clips)
+            while end < limit:
+                other = clips[end]
+                if other.shape != first.shape or other.dtype != first.dtype or other.device != first.device:
+                    break
+                end += 1
+
+            if end - start == 1:
+                encode_input = first if torch.is_floating_point(first) else self._normalize_uint8_vision_item(first)
+                latent = self.encode(encode_input)
+                del encode_input
+                encoded_per_item[item_indices[start]].append(latent.contiguous().float())
+            else:
+                batched_raw = torch.cat(clips[start:end], dim=0)
+                encode_input = (
+                    batched_raw
+                    if torch.is_floating_point(batched_raw)
+                    else self._normalize_uint8_vision_item(batched_raw)
+                )
+                del batched_raw
+                latent = self.encode(encode_input)
+                del encode_input
+                for offset, z in enumerate(latent.split(1, dim=0)):
+                    encoded_per_item[item_indices[start + offset]].append(z.contiguous().float())
+                del latent
+            start = end
+
+        return [parts[0] if len(parts) == 1 else torch.cat(parts, dim=2) for parts in encoded_per_item]
 
     def _vision_prefix_encode_applicable(
         self,
