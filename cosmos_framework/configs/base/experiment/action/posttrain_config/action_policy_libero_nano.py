@@ -173,6 +173,7 @@ action_policy_libero_nano = LazyDict(
         dataloader_train=L(PackingDataLoader)(
             audio_sample_rate=48000,
             dataset_name="action_libero",
+            enable_async_batch_building=False,
             max_samples_per_batch=128,  # peak-mem bound (256 OOMs on H200); global = 128 x DP8 x grad_accum2 = 2048
             max_sequence_length=None,  # None disables token packing (TOML can't express null)
             patch_spatial=2,

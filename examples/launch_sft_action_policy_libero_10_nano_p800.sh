@@ -18,6 +18,8 @@
 #   WAN_VAE_PATH          default: examples/checkpoints/wan22_vae/Wan2.2_VAE.pth
 #   HF_TOKEN              if any tokenizer download requires gated HF access
 #   OUTPUT_ROOT           default: outputs/train
+#   COSMOS_RELEASE_RAW_VISION_AFTER_TOKENIZATION   Set to 1 to release GPU raw vision (default: on).
+#   COSMOS_INPLACE_FP32_VISION_NORMALIZATION       Set to 1 for in-place FP32 math (default: on).
 #
 # Pre-sync the 20 FPS suite once:
 #   hf download nvidia/LIBERO_LeRobot_v3 --repo-type dataset --include 'libero_10/**' --local-dir <dir>
@@ -37,6 +39,13 @@ TOML_FILE="examples/toml/sft_config/action_policy_libero_10_nano.toml"
 
 export LIBERO_ROOT="${LIBERO_ROOT:-$DATASET_PATH}"
 
+export XBLAS_GEMM_COMPUTE_TYPE=bf16
+export XPUCUDA_GREEDY_INIT=1
+export COSMOS_VAE_ENCODE_BATCH_SIZE="${COSMOS_VAE_ENCODE_BATCH_SIZE:-8}"
+export COSMOS_VAE_ENCODER_NCDHW="${COSMOS_VAE_ENCODER_NCDHW:-1}"
+export COSMOS_RELEASE_RAW_VISION_AFTER_TOKENIZATION="${COSMOS_RELEASE_RAW_VISION_AFTER_TOKENIZATION:-1}"
+export COSMOS_INPLACE_FP32_VISION_NORMALIZATION="${COSMOS_INPLACE_FP32_VISION_NORMALIZATION:-1}"
+
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
@@ -45,7 +54,6 @@ export I4_ATTN_BACKENDS=flash2
 export PYTHONHASHSEED=42
 
 export XDNN_USE_FAST_SWISH=1
-
 export COSMOS_FUSED_RMSNORM=1
 export COSMOS_FUSED_ROPE=1
 export COSMOS_FUSED_CAUSAL_CONV_PAD=1
@@ -55,13 +63,13 @@ TAIL_OVERRIDES=(
     "model.config.vlm_config.tokenizer.pretrained_model_name=$TOKENIZER_PATH"
     "model.config.compile.enabled=false"
     "model.config.parallelism.data_parallel_shard_degree=8"
-    "model.config.parallelism.data_parallel_replicate_degree=1"
-    "model.config.activation_checkpointing.mode=$ACTIVATION_CHECKPOINTING_MODE"
-    "model.config.activation_checkpointing.save_ops_regex=$ACTIVATION_CHECKPOINTING_SAVE_OPS_REGEX"
+    "model.config.parallelism.data_parallel_replicate_degree=-1"
     "model.config.tokenizer.dtype=float16"
     "trainer.seed=42"
     "trainer.callbacks.device_monitor.every_n=0"
     "trainer.callbacks.ofu.every_n=0"
+    "dataloader_train.enable_async_batch_building=true"
+    "dataloader_train.dataloader.prefetch_factor=32"
 )
 
 source "$(dirname "${BASH_SOURCE[0]}")/_sft_launcher_common.sh"
