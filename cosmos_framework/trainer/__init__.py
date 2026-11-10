@@ -483,9 +483,7 @@ class ImaginaireTrainer:
                   or ``None`` if stopped.
                 - stop_signal (bool): ``True`` if the dataloader is exhausted.
         """
-        parallel_dims = getattr(model, "parallel_dims", None)
-        cp_enabled = parallel_dims is not None and parallel_dims.cp_enabled
-        release = self._release_cp_raw_batch_after_preprocessing(model) if cp_enabled else False
+        release = self._release_cp_raw_batch_after_preprocessing(model)
 
         # Fast path: no release mode — fetch, move to CUDA, cache for later CP slots.
         if not release:
@@ -532,12 +530,9 @@ class ImaginaireTrainer:
 
     @staticmethod
     def _release_cp_raw_batch_after_preprocessing(model: ImaginaireModel) -> bool:
-        """Return whether this CP model keeps raw inputs on the host between slots."""
-        parallel_dims = getattr(model, "parallel_dims", None)
-        if parallel_dims is None or not parallel_dims.cp_enabled:
-            return False
+        """Return whether this model releases raw GPU vision inputs after tokenization."""
         model_config = getattr(model, "config", None)
-        return bool(getattr(model_config, "release_cp_raw_batch_after_preprocessing", False))
+        return misc.release_raw_vision_after_tokenization_enabled(model_config)
 
     @staticmethod
     def _context_parallel_size(model: ImaginaireModel) -> int:

@@ -79,7 +79,10 @@ from cosmos_framework.model.generator.sensor_encoder import (
     get_vae_pixel_shapes,
     normalize_uint8_item,
 )
-from cosmos_framework.model.generator.utils.batch_normalization import normalize_vision_batch_inplace
+from cosmos_framework.model.generator.utils.batch_normalization import (
+    normalize_vision_batch_inplace,
+    scale_fp32_vision_pixels,
+)
 from cosmos_framework.model.generator.utils.camera_relative_pose import (
     prepare_camera_relative_poses,
     prepare_prope_cross_view_poses,
@@ -1474,7 +1477,7 @@ class OmniMoTModel(ImaginaireModel):
         gen_data_clean: GenerationDataClean,
         data_batch: dict[str, torch.Tensor],
     ) -> None:
-        """Free raw image or video tensors from GPU after CP slot-0 tokenization.
+        """Free raw image or video tensors from GPU after tokenization.
 
         The trainer retains the original host batch for callbacks, which
         re-encode from its image or video tensors.
@@ -1485,7 +1488,7 @@ class OmniMoTModel(ImaginaireModel):
         flattens it to match the retained counts so callbacks see a self-consistent
         batch without recomputation.
         """
-        if not self.config.release_cp_raw_batch_after_preprocessing:
+        if not misc.release_raw_vision_after_tokenization_enabled(self.config):
             return
         gen_data_clean.raw_state_vision = None
         data_batch.pop(self.input_video_key, None)
@@ -1522,6 +1525,7 @@ class OmniMoTModel(ImaginaireModel):
         cp_enabled = self.parallel_dims is not None and self.parallel_dims.cp_enabled
         if not cp_enabled:
             local_training_data = self._prepare_training_data(data_batch, iteration)
+            self._release_raw_vision_after_tokenization(local_training_data[2], data_batch)
             self._update_train_stats(local_training_data[2])
             return local_training_data
 
@@ -6482,12 +6486,12 @@ class OmniMoTModel(ImaginaireModel):
                         # Flattened multiview items already include B; preserve the original stacking behavior otherwise.
                         if item.ndim != 5:
                             item = torch.stack([item])  # [1,C,T,H,W]
-                        normalized_item = item.to(**self.tensor_kwargs_fp32) / 127.5 - 1.0  # [B,C,T,H,W]
+                        normalized_item = scale_fp32_vision_pixels(item.to(**self.tensor_kwargs_fp32))  # [B,C,T,H,W]
                     else:
                         # Non-flattened batches may still provide one [C,T,H,W] tensor per sample.
                         assert item[0].dtype == torch.uint8, "Video data is not in uint8 format."
-                        normalized_item = (  # [B,C,T,H,W]
-                            torch.stack(item).to(**self.tensor_kwargs_fp32) / 127.5 - 1.0
+                        normalized_item = scale_fp32_vision_pixels(  # [B,C,T,H,W]
+                            torch.stack(item).to(**self.tensor_kwargs_fp32)
                         )
                     data_batch[input_key][i] = normalized_item  # [B,C,T,H,W]
                 data_batch[IS_PREPROCESSED_KEY] = True
@@ -6651,7 +6655,7 @@ class OmniMoTModel(ImaginaireModel):
                     for img_tensor in data_batch[input_key][i]:
                         img_tensor = rearrange(img_tensor, "c h w -> 1 c 1 h w").contiguous()
                         if img_tensor.dtype == torch.uint8:
-                            img_tensor = img_tensor.to(**self.tensor_kwargs_fp32) / 127.5 - 1.0
+                            img_tensor = scale_fp32_vision_pixels(img_tensor.to(**self.tensor_kwargs_fp32))
                         new_image_tensor_list.append(img_tensor)
                 data_batch[input_key] = new_image_tensor_list
                 data_batch[IS_PREPROCESSED_KEY] = True

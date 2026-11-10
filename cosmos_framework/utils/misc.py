@@ -32,6 +32,14 @@ from cosmos_framework.utils.easy_io import easy_io
 from cosmos_framework.utils.timer import Timer
 
 
+def release_raw_vision_after_tokenization_enabled(model_config: Any) -> bool:
+    """Use the launch override when set; otherwise keep the recipe's release policy."""
+    override = os.environ.get("COSMOS_RELEASE_RAW_VISION_AFTER_TOKENIZATION")
+    if override is not None:
+        return override == "1"
+    return bool(getattr(model_config, "release_cp_raw_batch_after_preprocessing", False))
+
+
 def requires_grad(model: torch.nn.Module, value: bool = True) -> None:
     """Set a model to require gradients or not.
 
