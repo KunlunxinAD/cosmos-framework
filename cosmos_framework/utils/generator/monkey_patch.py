@@ -112,6 +112,13 @@ def patch_qwen3_vl_forward(model):
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
+        self._cached_img_pos_idx = None
+        if input_ids is not None and pixel_values is not None:
+            input_ids_cpu = input_ids.cpu()
+            self._cached_img_pos_idx = torch.nonzero(
+                (input_ids_cpu == self.config.image_token_id).reshape(-1), as_tuple=False
+            ).squeeze(-1)
+
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -127,19 +134,22 @@ def patch_qwen3_vl_forward(model):
         has_image = pixel_values is not None
         has_video = pixel_values_videos is not None
 
+        merge_sq = self.visual.spatial_merge_size**2
         if has_image:
             if image_grid_thw is None:
                 raise ValueError("image_grid_thw must be provided when pixel_values is provided")
+            image_grid_thw_cpu = image_grid_thw.cpu()
             visual_pixel_values_list.append(pixel_values)
             visual_grid_thw_list.append(image_grid_thw)
-            image_embed_len = int((image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).sum().item())
+            image_embed_len = int((image_grid_thw_cpu.prod(-1) // merge_sq).sum().item())
 
         if has_video:
             if video_grid_thw is None:
                 raise ValueError("video_grid_thw must be provided when pixel_values_videos is provided")
+            video_grid_thw_cpu = video_grid_thw.cpu()
             visual_pixel_values_list.append(pixel_values_videos)
             visual_grid_thw_list.append(video_grid_thw)
-            video_embed_len = int((video_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).sum().item())
+            video_embed_len = int((video_grid_thw_cpu.prod(-1) // merge_sq).sum().item())
 
         if has_image or has_video:
             visual_pixel_values = torch.cat(visual_pixel_values_list, dim=0).type(self.visual.dtype)  # [N_patch,D]
@@ -159,17 +169,45 @@ def patch_qwen3_vl_forward(model):
 
             if has_image:
                 image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)  # [N_image_visual,C]
-                image_mask, _ = self.get_placeholder_mask(
-                    input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
-                )
-                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)  # [B,N_token,C]
+                if input_ids is not None:
+                    special_image_mask = (input_ids == self.config.image_token_id).to(inputs_embeds.device)
+                else:
+                    special_image_mask = (
+                        inputs_embeds
+                        == self.get_input_embeddings()(
+                            torch.tensor(self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
+                        )
+                    ).all(-1)
+                image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds)
+                B_i, N_i, C_i = inputs_embeds.shape
+                img_pos_idx_cpu = self._cached_img_pos_idx if self._cached_img_pos_idx is not None else torch.nonzero(special_image_mask.cpu().reshape(-1), as_tuple=False).squeeze(-1)
+                if img_pos_idx_cpu.numel() != image_embeds.shape[0]:
+                    raise ValueError(
+                        f"Image features and image tokens do not match: tokens: {img_pos_idx_cpu.numel()}, features {image_embeds.shape[0]}"
+                    )
+                img_pos_idx = img_pos_idx_cpu.to(inputs_embeds.device, non_blocking=True)
+                self._cached_visual_pos_idx = img_pos_idx
+                inputs_embeds = inputs_embeds.reshape(B_i * N_i, C_i).index_put((img_pos_idx,), image_embeds).reshape(B_i, N_i, C_i)
 
             if has_video:
                 video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)  # [N_video_visual,C]
-                _, video_mask = self.get_placeholder_mask(
-                    input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
-                )
-                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)  # [B,N_token,C]
+                if input_ids is not None:
+                    special_video_mask = (input_ids == self.config.video_token_id).to(inputs_embeds.device)
+                else:
+                    special_video_mask = (
+                        inputs_embeds
+                        == self.get_input_embeddings()(
+                            torch.tensor(self.config.video_token_id, dtype=torch.long, device=inputs_embeds.device)
+                        )
+                    ).all(-1)
+                video_mask = special_video_mask.unsqueeze(-1).expand_as(inputs_embeds)
+                B_v, N_v, C_v = inputs_embeds.shape
+                vid_pos_idx = torch.nonzero(special_video_mask.cpu().reshape(-1), as_tuple=False).squeeze(-1).to(inputs_embeds.device)
+                if vid_pos_idx.numel() != video_embeds.shape[0]:
+                    raise ValueError(
+                        f"Videos features and video tokens do not match: tokens: {vid_pos_idx.numel()}, features {video_embeds.shape[0]}"
+                    )
+                inputs_embeds = inputs_embeds.reshape(B_v * N_v, C_v).index_put((vid_pos_idx,), video_embeds).reshape(B_v, N_v, C_v)
 
         # Dummy visual forward for text-only data
         else:
@@ -306,6 +344,24 @@ def patch_qwen3_vl_forward(model):
             last_hidden_state=outputs.last_hidden_state,
             past_key_values=outputs.past_key_values,
             rope_deltas=self.rope_deltas,
+        )
+
+    def patched_deepstack_process(
+        self_lm, hidden_states: torch.Tensor, visual_pos_masks: torch.Tensor, visual_embeds: torch.Tensor
+    ) -> torch.Tensor:
+        visual_pos_masks = visual_pos_masks.to(hidden_states.device)
+        visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
+        B, N, C = hidden_states.shape
+        pos_idx = getattr(model, "_cached_visual_pos_idx", None)
+        if pos_idx is None or pos_idx.shape[0] != visual_embeds.shape[0]:
+            pos_idx = torch.nonzero(visual_pos_masks.reshape(-1), as_tuple=False).squeeze(-1)
+        flat = hidden_states.reshape(B * N, C)
+        out = flat.index_add(0, pos_idx, visual_embeds.reshape(-1, C))
+        return out.reshape(B, N, C)
+
+    if hasattr(model, "language_model") and hasattr(model.language_model, "_deepstack_process"):
+        model.language_model._deepstack_process = patched_deepstack_process.__get__(
+            model.language_model, type(model.language_model)
         )
 
     # Replace the forward method
@@ -764,6 +820,7 @@ def patch_qwen3_vl_vision_varlen_attention(model: torch.nn.Module, *, max_padded
             # the other implementations in that registry swallow unrecognized kwargs, so a tower
             # whose _attn_implementation changed after patching would drop them on the floor and
             # attend ACROSS image boundaries — wrong features, no error.
+            cu_seqlens_host = kwargs.get("cu_seqlens_host")
             if vision_attention_chunks is None:
                 attn_output, _ = hf_attention_cosmos(
                     self,
@@ -777,6 +834,8 @@ def patch_qwen3_vl_vision_varlen_attention(model: torch.nn.Module, *, max_padded
                     cu_seq_lens_k=cu_seqlens,
                     max_length_q=max_seqlen,
                     max_length_k=max_seqlen,
+                    cu_seq_lens_q_host=cu_seqlens_host,
+                    cu_seq_lens_k_host=cu_seqlens_host,
                     is_causal=False,
                 )  # [1,N,num_heads,head_dim]
             else:
@@ -785,6 +844,11 @@ def patch_qwen3_vl_vision_varlen_attention(model: torch.nn.Module, *, max_padded
                     # All heads for each complete frame stay together. FSDP still sees
                     # one vision/module forward; only independent attention calls split.
                     chunk_cu = cu_seqlens[first : end + 1] - token_start
+                    chunk_cu_host = (
+                        cu_seqlens_host[first : end + 1] - token_start
+                        if cu_seqlens_host is not None
+                        else None
+                    )
                     output, _ = hf_attention_cosmos(
                         self,
                         query_states[:, :, token_start:token_end],
@@ -797,6 +861,8 @@ def patch_qwen3_vl_vision_varlen_attention(model: torch.nn.Module, *, max_padded
                         cu_seq_lens_k=chunk_cu,
                         max_length_q=chunk_max,
                         max_length_k=chunk_max,
+                        cu_seq_lens_q_host=chunk_cu_host,
+                        cu_seq_lens_k_host=chunk_cu_host,
                         is_causal=False,
                     )
                     outputs.append(output)
@@ -824,14 +890,20 @@ def patch_qwen3_vl_vision_varlen_attention(model: torch.nn.Module, *, max_padded
             # sequences of the same length), so the longest sequence is max(h*w) — the same
             # value HF's FA2 branch derives from cu_seqlens, read here once for the whole
             # tower. int() is the device-to-host sync; it sits outside the compiled blocks.
+            grid_thw_cpu = grid_thw.cpu()
+            cu_seqlens_host = torch.repeat_interleave(
+                grid_thw_cpu[:, 1] * grid_thw_cpu[:, 2], grid_thw_cpu[:, 0]
+            ).cumsum(dim=0, dtype=torch.int32)
+            cu_seqlens_host = torch.nn.functional.pad(cu_seqlens_host, (1, 0), value=0)
+            kwargs.setdefault("cu_seqlens_host", cu_seqlens_host)
             if max_padded_tokens:
                 # Plan once outside the blocks and reuse during activation recomputation.
                 # This replaces the existing host read; it adds none inside attention.
-                chunks = _vision_attention_chunks(grid_thw.tolist(), max_padded_tokens)
+                chunks = _vision_attention_chunks(grid_thw_cpu.tolist(), max_padded_tokens)
                 kwargs.setdefault("max_seqlen", max(chunk[-1] for chunk in chunks))
                 kwargs["vision_attention_chunks"] = chunks if len(chunks) > 1 else None
             else:
-                kwargs.setdefault("max_seqlen", int((grid_thw[:, 1] * grid_thw[:, 2]).max()))
+                kwargs.setdefault("max_seqlen", int((grid_thw_cpu[:, 1] * grid_thw_cpu[:, 2]).max()))
             return tower_forward(hidden_states, grid_thw, **kwargs)
 
         return patched_vision_tower_forward

@@ -79,6 +79,8 @@ def _hf_attention_cosmos_local(
     cu_seq_lens_k: torch.Tensor | None = None,  # [num_sequences+1]
     max_length_q: int | None = None,
     max_length_k: int | None = None,
+    cu_seq_lens_q_host: torch.Tensor | None = None,
+    cu_seq_lens_k_host: torch.Tensor | None = None,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, None]:
     """HF-protocol attention callable that delegates to cosmos_framework.model.attention.
@@ -214,6 +216,8 @@ def _hf_attention_cosmos_local(
         cumulative_seqlen_KV=cu_seq_lens_k,
         max_seqlen_Q=max_length_q,
         max_seqlen_KV=max_length_k,
+        cumulative_seqlen_Q_host=cu_seq_lens_q_host,
+        cumulative_seqlen_KV_host=cu_seq_lens_k_host,
         # Backend selection has its own flag; the model/CLI sets the Torch mode.
         deterministic=torch.are_deterministic_algorithms_enabled(),
     )
