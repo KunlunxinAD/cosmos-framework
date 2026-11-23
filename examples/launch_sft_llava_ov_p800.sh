@@ -36,6 +36,11 @@ export XDNN_USE_FAST_GELU="${XDNN_USE_FAST_GELU:-1}"
 # FAST_SWISH takes precedence in some XPU runtimes; do not enable both.
 unset XDNN_USE_FAST_SWISH
 export XDNN_USE_FASTER_SWISH="${XDNN_USE_FASTER_SWISH:-true}"
+# XFA attention: accumulate in FP32 while using FP16 for the internal GEMM.
+# Used by the completed 500-step P800 FP16 baseline and the FASTER_SWISH comparison;
+# the standalone end-to-end speedup of these two XFA flags is not yet isolated.
+export XFA_ACCUM_TYPE="${XFA_ACCUM_TYPE:-float}"
+export XFA_GEMM_TYPE="${XFA_GEMM_TYPE:-float16}"
 # Use rounded allocation sizes to improve cache reuse; validated for BS7 over 500 steps.
 # XPU 2609 reads the legacy allocator variable; keep both names consistent.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-${PYTORCH_ALLOC_CONF:-roundup_power2_divisions:4}}"
