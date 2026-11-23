@@ -725,6 +725,20 @@ class Cosmos3EdgeModel(Cosmos3EdgePreTrainedModel):
             )
             self.rope_deltas = rope_deltas
 
+        # get_rope_index builds positions from ``attention_mask == 1`` and therefore
+        # DROPS right padding, while the decoder applies RoPE to the full padded
+        # sequence. VLMCollator right-pads to a multiple of 16, so any sample whose
+        # length is not a multiple of 16 leaves position_ids short and the rotary
+        # broadcast fails (10083-token Edge sample -> 10096 after padding). Padded
+        # positions are fully masked, so the filler value is inert; 1 matches the
+        # padding_value this port already uses inside get_rope_index.
+        if position_ids is not None and position_ids.shape[-1] < inputs_embeds.shape[1]:
+            position_ids = F.pad(
+                position_ids,
+                (0, inputs_embeds.shape[1] - position_ids.shape[-1]),
+                value=1,
+            )
+
         # position_ids: [3, bsz, seq_len]; for visual tokens the dim-0 order is t, h, w.
         return self.language_model(
             input_ids=None,
