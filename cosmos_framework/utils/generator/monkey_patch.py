@@ -691,7 +691,9 @@ def _vision_attention_chunks(
     return plan_varlen_attention_chunks(lengths, max_padded_tokens)
 
 
-def patch_qwen3_vl_vision_varlen_attention(model: torch.nn.Module, *, max_padded_tokens: int = 0) -> int:
+def patch_qwen3_vl_vision_varlen_attention(
+    model: torch.nn.Module, *, max_padded_tokens: int = 0, use_eager_vision_rope: bool = False
+) -> int:
     """Monkey-patch every Qwen3-VL vision tower **instance** under ``model`` so each block runs
     varlen attention over packed patches instead of one call per image/frame. By default
     there is one call; an optional padded-token budget bounds backward workspaces when
@@ -920,14 +922,25 @@ def patch_qwen3_vl_vision_varlen_attention(model: torch.nn.Module, *, max_padded
 
         # One tower's blocks are all the same class, so the rope helper is resolved once here.
         attention_module = importlib.import_module(type(attentions[0]).__module__)
-        patched_forward = make_patched_vision_attention_forward(attention_module.apply_rotary_pos_emb_vision)
+        rope_fn = attention_module.apply_rotary_pos_emb_vision
+        if use_eager_vision_rope:
+            rope_fn = getattr(attention_module, "__origin_apply_rotary_pos_emb_vision", None)
+            if rope_fn is None:
+                raise RuntimeError(
+                    "Vision Eager RoPE requested, but XMLIR did not preserve the original "
+                    f"function in {attention_module.__name__}"
+                )
+        patched_forward = make_patched_vision_attention_forward(rope_fn)
         for attention in attentions:
             attention.forward = patched_forward.__get__(attention, type(attention))
         n_patched += len(attentions)
 
         tower.forward = make_patched_vision_tower_forward(tower.forward)
 
-    log.info(f"Patched {n_patched} Qwen3-VL vision attention module(s) with varlen attention")
+    log.info(
+        f"Patched {n_patched} Qwen3-VL vision attention module(s) with varlen attention "
+        f"(Vision RoPE: {'eager' if use_eager_vision_rope else 'default'})"
+    )
     return n_patched
 
 

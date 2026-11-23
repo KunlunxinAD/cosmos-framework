@@ -505,7 +505,10 @@ class HFModel(nn.Module):
             from cosmos_framework.utils.generator.monkey_patch import patch_qwen3_vl_vision_varlen_attention
 
             n_vision_attns = patch_qwen3_vl_vision_varlen_attention(
-                self.model, max_padded_tokens=qwen3_vl_vision_attention_max_padded_tokens
+                self.model,
+                max_padded_tokens=qwen3_vl_vision_attention_max_padded_tokens,
+                use_eager_vision_rope=os.environ.get("COSMOS_QWEN3VL_VISION_ROPE_EAGER", "0").strip().lower()
+                in {"1", "true", "yes", "on"},
             )
             log.info(f"HFModel: applied varlen attention to {n_vision_attns} vision attention module(s)")
 
