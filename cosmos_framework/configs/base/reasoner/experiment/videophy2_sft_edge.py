@@ -49,6 +49,7 @@ from cosmos_framework.data.generator.processors import build_processor
 from cosmos_framework.data.reasoner.local_sft_dataset import LocalSFTDataset
 from cosmos_framework.data.reasoner.data_sources_videophy2.videophy2 import DATAINFO
 from cosmos_framework.utils.reasoner.constant import IGNORE_INDEX
+from cosmos_framework.utils import log
 from cosmos_framework.configs.base.reasoner.experiment.dataflow_roles import VLMCollator
 from cosmos_framework.configs.base.reasoner.experiment.videophy2_dataflow_roles import VideoPhy2Processor
 
@@ -71,6 +72,49 @@ class _UnshardedLocalSFTDataset(LocalSFTDataset):
         if self.shuffle:
             rng = random.Random(self.distributor_seed + epoch)
             rng.shuffle(indices)
+
+        # Opt-in (VP2_LENGTH_BALANCE=1): permute WITHIN each optimizer-step block so
+        # all ranks hold similar-length samples at each microstep. Ported from
+        # videophy2_sft_nano, which measured this at -34.7% s/step on the 8B model
+        # (rank-arrival skew dominated there). The block is exactly one step's
+        # sample set, so the set, the per-sample weight and the GA count are all
+        # unchanged -- only the floating-point accumulation order differs.
+        #
+        # Edge delta: the shipped length index was calibrated with the Qwen
+        # tokenizer, so absolute lengths differ (Edge: 1659/4709/10083 vs Qwen:
+        # 976/2672/5632). The per-resolution ORDERING is unchanged, so the
+        # bucketing still holds; point VP2_LENGTH_INDEX at an Edge-calibrated index
+        # (output/videophy2_sft_edge_p800/build_edge_length_index.py) to use exact
+        # values.
+        from cosmos_framework.data.reasoner import length_balance as _lb  # noqa: PLC0415
+
+        if _lb.enabled():
+            import os
+
+            index_path = os.environ.get("VP2_LENGTH_INDEX") or os.path.join(
+                os.path.dirname(self.manifest_path), "length_index.json"
+            )
+            world = int(os.environ.get("WORLD_SIZE", "1"))
+            ga = int(os.environ.get("VP2_LB_GRAD_ACCUM", "8"))
+            workers = int(os.environ.get("VP2_LB_NUM_WORKERS", "2"))
+            try:
+                lengths = _lb.load_length_index(index_path)
+            except OSError as exc:
+                log.warning(f"length-balance ON but index unreadable ({exc}); keeping stock order")
+                return indices
+            key_of = lambda i: manifest[i].get("id") or manifest[i].get("key")  # noqa: E731
+            # Anchor the block grid to the GLOBAL step index: len(manifest)=3343 is
+            # not a multiple of world*ga=64, so without this the grid drifts each
+            # epoch and blocks straddle step boundaries.
+            offset = _lb.epoch_block_offset(epoch, len(manifest), world, ga)
+            before = _lb.describe(indices, key_of, lengths, world, ga, workers, offset)
+            indices = _lb.balance_indices(indices, key_of, lengths, world, ga, workers, offset)
+            after = _lb.describe(indices, key_of, lengths, world, ga, workers, offset)
+            log.critical(
+                f"[length-balance] ON epoch={epoch} world={world} ga={ga} workers={workers} "
+                f"block_offset={offset} index={index_path} entries={len(lengths)}\n"
+                f"  BEFORE {before}\n  AFTER  {after}"
+            )
         return indices
 
 

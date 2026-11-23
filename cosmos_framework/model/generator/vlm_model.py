@@ -397,6 +397,34 @@ class VLMModel(ImaginaireModel):
         }
         log.info(f"freeze config applied (model_type={self.hf_config.model_type}): {self.parameter_summary}")
 
+        # Opt-in FSDP2 reshard policy. Default FSDP2 re-shards every unit right after
+        # its forward and re-all-gathers it before backward, i.e. two full parameter
+        # sweeps per micro-step. Keeping the unsharded copy alive skips the backward
+        # re-gather (halving all-gather volume) at the cost of one unsharded copy of
+        # the parameters per rank (~4.8 GB bf16 for Edge).
+        #   FSDP_NOSHARD_ALL=1      every unit
+        #   FSDP_FROZEN_NOSHARD=1   only fully frozen units (vision tower)
+        # Duck-typed on purpose: FSDP2 swaps each block's __class__, so
+        # isinstance(module, FSDPModule) is not reliable here.
+        _noshard_all = os.environ.get("FSDP_NOSHARD_ALL", "0") == "1"
+        _noshard_frozen = os.environ.get("FSDP_FROZEN_NOSHARD", "0") == "1"
+        if _noshard_all or _noshard_frozen:
+            _units = _released = 0
+            for _name, _module in self.model.model.named_modules():
+                if not callable(getattr(_module, "set_reshard_after_forward", None)):
+                    continue
+                _units += 1
+                _own = list(_module.parameters())
+                if not _own:
+                    continue
+                if _noshard_all or not any(p.requires_grad for p in _own):
+                    _module.set_reshard_after_forward(False, recurse=False)
+                    _released += 1
+            log.info(
+                f"FSDP_NOSHARD: units={_units} released={_released} "
+                f"(all={_noshard_all} frozen_only={_noshard_frozen})"
+            )
+
         # Logits-based CE remains CP-disabled. The configured fused path uses
         # CP-global sample weights and WORLD normalization, verified against CP=1.
         self.context_parallel_data_window: bool = False

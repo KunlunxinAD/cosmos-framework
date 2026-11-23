@@ -19,6 +19,7 @@ State-dict keys are contractual (safetensors loader, freeze regex
 from __future__ import annotations
 
 import contextlib
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Tuple, Union
@@ -103,6 +104,24 @@ class Cosmos3EdgeRMSNorm(nn.Module):
         return (self.weight.to(torch.float32) * hidden_states).to(input_dtype)
 
 
+# On the SDPA backend `_update_causal_mask` materialises an additive [B, 1, S, S]
+# mask and hands it to `transformers.sdpa_attention_forward`, which makes SDPA
+# fall off its fused kernel: measured 2.1-2.4x slower than `is_causal=True` at
+# S in {1664, 4720, 10096} on P800 (and the mask itself is 204 MB at S=10096).
+# For a right-padded batch the two are mathematically the same mask -- a real
+# token at position i only sees keys j <= i, and every padded key sits after it
+# -- so the mask can be dropped. Default on; EDGE_SDPA_CAUSAL=0 falls back to
+# the masked path (the P800 launcher sets it explicitly either way).
+_EDGE_SDPA_CAUSAL = os.environ.get("EDGE_SDPA_CAUSAL", "1") == "1"
+
+
+def _is_right_padded(attention_mask: torch.Tensor) -> bool:
+    """True when every row is a run of ones followed by a run of zeros."""
+    lengths = attention_mask.sum(-1, keepdim=True)
+    positions = torch.arange(attention_mask.shape[-1], device=attention_mask.device)
+    return bool(torch.equal(attention_mask, (positions < lengths).to(attention_mask.dtype)))
+
+
 class Cosmos3EdgeTextAttention(nn.Module):
     """Port of NemotronHAttention (GQA + partial mRoPE), KV-cache path dropped."""
 
@@ -144,6 +163,29 @@ class Cosmos3EdgeTextAttention(nn.Module):
         if position_embeddings is not None:
             cos, sin = position_embeddings
             query_states, key_states = apply_rotary_pos_emb_partial(query_states, key_states, cos, sin)
+
+        if (
+            _EDGE_SDPA_CAUSAL
+            and self.config._attn_implementation == "sdpa"
+            and attention_mask is None
+            and packing_args is None
+        ):
+            # Mask-free SDPA: same result as the [B, 1, S, S] additive causal mask
+            # (see _EDGE_SDPA_CAUSAL), but keeps the backend's fused kernel.
+            # query/key/value already arrive heads-first ([B, H, S, D]) -- the
+            # same layout `sdpa_attention_forward` expects.
+            attn_output = F.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=None,
+                dropout_p=0.0 if not self.training else self.attention_dropout,
+                is_causal=self.is_causal,
+                scale=self.scaling,
+                enable_gqa=self.num_key_value_groups > 1,
+            )
+            attn_output = attn_output.transpose(1, 2).contiguous().reshape(*input_shape, -1)
+            return self.o_proj(attn_output), None
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
@@ -398,6 +440,12 @@ class Cosmos3EdgeTextModel(Cosmos3EdgePreTrainedModel):
             if attention_mask is not None and 0.0 in attention_mask:
                 return attention_mask
             return None
+
+        if _EDGE_SDPA_CAUSAL and self.config._attn_implementation == "sdpa":
+            # Purely causal (right padding only) -> is_causal=True in the attention
+            # fast path below is equivalent, so skip building the dense mask.
+            if attention_mask is None or (attention_mask.dim() == 2 and _is_right_padded(attention_mask)):
+                return None
 
         dtype, device = input_tensor.dtype, input_tensor.device
         min_dtype = torch.finfo(dtype).min
@@ -724,6 +772,20 @@ class Cosmos3EdgeModel(Cosmos3EdgePreTrainedModel):
                 attention_mask=attention_mask_tensor,
             )
             self.rope_deltas = rope_deltas
+
+        # get_rope_index builds positions from ``attention_mask == 1`` and therefore
+        # DROPS right padding, while the decoder applies RoPE to the full padded
+        # sequence. VLMCollator right-pads to a multiple of 16, so any sample whose
+        # length is not a multiple of 16 leaves position_ids short and the rotary
+        # broadcast fails (10083-token Edge sample -> 10096 after padding). Padded
+        # positions are fully masked, so the filler value is inert; 1 matches the
+        # padding_value this port already uses inside get_rope_index.
+        if position_ids is not None and position_ids.shape[-1] < inputs_embeds.shape[1]:
+            position_ids = F.pad(
+                position_ids,
+                (0, inputs_embeds.shape[1] - position_ids.shape[-1]),
+                value=1,
+            )
 
         # position_ids: [3, bsz, seq_len]; for visual tokens the dim-0 order is t, h, w.
         return self.language_model(
