@@ -31,6 +31,11 @@ export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
 export USE_FAST_RMS_LAYER_NORM="${USE_FAST_RMS_LAYER_NORM:-1}"
 export BKCL_MAX_CLUSTERS="${BKCL_MAX_CLUSTERS:-8}"
 export XDNN_USE_FAST_GELU="${XDNN_USE_FAST_GELU:-1}"
+# Experimental SiLU fast path: ~2% more useful tokens/s in matched BS7 steps.
+# Full 500-step stability is unverified (step 232 hang, grad-norm spikes).
+# FAST_SWISH takes precedence in some XPU runtimes; do not enable both.
+unset XDNN_USE_FAST_SWISH
+export XDNN_USE_FASTER_SWISH="${XDNN_USE_FASTER_SWISH:-true}"
 # Use rounded allocation sizes to improve cache reuse; validated for BS7 over 500 steps.
 # XPU 2609 reads the legacy allocator variable; keep both names consistent.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-${PYTORCH_ALLOC_CONF:-roundup_power2_divisions:4}}"
