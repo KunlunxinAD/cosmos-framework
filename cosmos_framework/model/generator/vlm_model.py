@@ -61,6 +61,7 @@ from cosmos_framework.utils.generator.input_probe import (
 )
 from cosmos_framework.utils.generator.optimizer import OptimizersContainer
 from cosmos_framework.utils.generator.parallelism import ParallelDims
+from cosmos_framework.utils.generator.perf_flags import get_torch_chunked_ce_tokens
 from cosmos_framework.utils.generator.reasoner.constant import IGNORE_INDEX
 from cosmos_framework.utils.generator.reasoner.model_path import resolve_hf_model_path
 from cosmos_framework.utils.generator.reasoner.true_packing import (
@@ -354,6 +355,11 @@ class VLMModel(ImaginaireModel):
         init_flash_attn_meta(config.deterministic)
         if config.policy.enable_fused_weighted_ce and not config.policy.use_weighted_ce:
             raise ValueError("enable_fused_weighted_ce requires policy.use_weighted_ce=True")
+        self._torch_chunked_ce_tokens = get_torch_chunked_ce_tokens()
+        if self._torch_chunked_ce_tokens:
+            if config.parallelism.context_parallel_shard_degree != 1:
+                raise ValueError("Chunked CE currently requires CP=1")
+            log.info(f"Enabling experimental PyTorch chunked CE (chunk_tokens={self._torch_chunked_ce_tokens})")
         self._init_vlm(config, checkpoint)
 
         # Apply freeze before the optimizer is built — ``build_optimizer`` reads
@@ -481,10 +487,13 @@ class VLMModel(ImaginaireModel):
             # a cache directory and no longer identifies the Edge Reasoner.
             configured_model_name_or_path=policy.backbone.model_name,
             qwen35_fp32_recurrent_a_log=policy.qwen35_fp32_recurrent_a_log,
-            enable_fused_weighted_ce=policy.enable_fused_weighted_ce,
+            enable_fused_weighted_ce=policy.enable_fused_weighted_ce or self._torch_chunked_ce_tokens > 0,
+            torch_chunked_ce_tokens=self._torch_chunked_ce_tokens,
             recompute_fused_weighted_ce=policy.recompute_fused_weighted_ce,
             qwen3_vl_accumulate_head_grad_fp32=policy.qwen3_vl_accumulate_head_grad_fp32,
-            weighted_ce_exponent=policy.weighted_ce_exponent,
+            weighted_ce_exponent=(
+                policy.weighted_ce_exponent if policy.use_weighted_ce or not self._torch_chunked_ce_tokens else 0.0
+            ),
             qwen3_vl_moe_fixed_sum=policy.qwen3_vl_moe_fixed_sum,
             qwen3_vl_vision_attention_max_padded_tokens=policy.qwen3_vl_vision_attention_max_padded_tokens,
             qwen3_vl_decoder_attention_max_padded_tokens=policy.qwen3_vl_decoder_attention_max_padded_tokens,
@@ -920,6 +929,8 @@ class VLMModel(ImaginaireModel):
             return
         if true_packing is not True:
             raise TypeError("true_packing must be a Python bool")
+        if getattr(self, "_torch_chunked_ce_tokens", 0):
+            raise ValueError("Chunked CE currently requires unpacked batches")
         cp_size = self.parallel_dims.cp_size if self.parallel_dims is not None else 1
         loader_cp_size = data.get("context_parallel_size", 1)
         if loader_cp_size != cp_size:
@@ -1048,7 +1059,10 @@ class VLMModel(ImaginaireModel):
         self._parity_probe_step = iteration
 
         forward_loss_kwargs = (
-            {"labels": labels} if getattr(self.config.policy, "enable_fused_weighted_ce", False) else {}
+            {"labels": labels}
+            if getattr(self.config.policy, "enable_fused_weighted_ce", False)
+            or getattr(self, "_torch_chunked_ce_tokens", 0) > 0
+            else {}
         )
         logits = self.model(_probe_step=iteration, _probe_tag="native", **forward_loss_kwargs, **data)
         loss_kwargs: dict[str, Any] = {}
@@ -1179,7 +1193,10 @@ class VLMModel(ImaginaireModel):
         labels = data.pop("labels")
         self._set_moe_token_mask(data.get("context_parallel_token_mask", data.get("attention_mask")))
         forward_loss_kwargs = (
-            {"labels": labels} if getattr(self.config.policy, "enable_fused_weighted_ce", False) else {}
+            {"labels": labels}
+            if getattr(self.config.policy, "enable_fused_weighted_ce", False)
+            or getattr(self, "_torch_chunked_ce_tokens", 0) > 0
+            else {}
         )
         logits = self.model(**forward_loss_kwargs, **data)
         loss_kwargs: dict[str, Any] = {}

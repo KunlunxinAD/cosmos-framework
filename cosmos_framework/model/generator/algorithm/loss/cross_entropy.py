@@ -38,6 +38,7 @@ per-sample counts are reduced over CP before applying the sample weighting.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -330,6 +331,7 @@ def fused_weighted_cross_entropy_loss(
     cu_seq_lens: torch.Tensor | None = None,
     recompute: bool = False,
     accumulate_head_grad_fp32: bool = False,
+    chunk_tokens: int = 0,
 ) -> tuple[torch.Tensor, LossStatistics]:
     """Compute the unified weighted objective without allocating [B,T,vocabulary] logits.
 
@@ -356,6 +358,60 @@ def fused_weighted_cross_entropy_loss(
     weight = lm_head_weight.to(hidden_states.dtype)
     targets = labels[:, 1:].contiguous() if context_parallel_group is None else labels.contiguous()
     hidden = hidden_states[:, :-1] if context_parallel_group is None else hidden_states
+    # Experimental performance-first PyTorch CE: compute the LM head only for
+    # supervised targets, in chunks. Keep the entire batch in one autograd node
+    # so only ONE FP32 LM-head gradient accumulator is allocated.
+    if chunk_tokens < 0:
+        raise ValueError("chunk_tokens must be non-negative")
+    if chunk_tokens > 0:
+        if context_parallel_group is not None or cu_seq_lens is not None:
+            raise ValueError("PyTorch chunked CE currently supports only unpacked CP=1 batches")
+        from cosmos_framework.model.generator.algorithm.loss.torch_chunked_linear_ce import (
+            torch_chunked_linear_ce_sums,
+        )
+
+        counts = (targets != ignore_index).sum(dim=1)
+        sample_counts = counts.detach().to(torch.float32)
+        loss_sums = torch_chunked_linear_ce_sums(
+            hidden.contiguous(),
+            weight,
+            targets,
+            ignore_index=ignore_index,
+            chunk_tokens=chunk_tokens,
+        ).float()
+        has_valid = sample_counts > 0
+        safe_counts = sample_counts.clamp(min=1)
+        sample_numerators = loss_sums / safe_counts.pow(exponent)
+        sample_denominators = torch.where(has_valid, safe_counts.pow(1 - exponent), 0.0)
+        numerator = sample_numerators.sum()
+        denominator = sample_denominators.sum()
+        global_denominator = denominator.detach().clone()
+        world_size = 1
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(global_denominator, op=dist.ReduceOp.SUM)
+            world_size = dist.get_world_size()
+        loss = numerator / global_denominator.clamp(min=1) * world_size
+        if os.environ.get("COSMOS_CHUNKED_CE_LOG_SHAPES", "0") == "1" and not getattr(
+            fused_weighted_cross_entropy_loss, "_chunked_ce_logged", False
+        ):
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            print(
+                f"[TORCH_CHUNKED_CE] rank={rank} B={targets.shape[0]} T={targets.shape[1]} "
+                f"valid={int(counts.sum().item())}/{targets.numel()} chunk={chunk_tokens}",
+                flush=True,
+            )
+            setattr(fused_weighted_cross_entropy_loss, "_chunked_ce_logged", True)
+        return loss, LossStatistics(
+            objective_numerator=numerator.detach(),
+            objective_denominator=denominator.detach(),
+            global_objective_denominator=global_denominator.detach(),
+            token_ce_sum=loss_sums.sum().detach(),
+            valid_token_count=counts.sum().detach(),
+            per_sample_objective_numerator=sample_numerators.detach(),
+            per_sample_objective_denominator=sample_denominators.detach(),
+            per_sample_token_ce_sum=loss_sums.detach(),
+            per_sample_valid_token_count=counts.detach().to(torch.long),
+        )
     if cu_seq_lens is None:
         segments = [(hidden[index], targets[index]) for index in range(labels.shape[0])]
     else:

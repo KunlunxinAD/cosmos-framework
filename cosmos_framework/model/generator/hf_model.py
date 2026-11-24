@@ -45,6 +45,7 @@ from cosmos_framework.model.generator.reasoner.qwen35_caption import (
 from cosmos_framework.model.generator.utils.safetensors_loader import load_language_model, load_vlm_model
 from cosmos_framework.utils.generator.input_probe import maybe_dump_pre_forward
 from cosmos_framework.utils.generator.parallelism import ParallelDims
+from cosmos_framework.utils.generator.perf_flags import perf_flag_enabled
 
 if TYPE_CHECKING:
     from cosmos_framework.configs.base.defaults.reasoner import SoundUnderstandingConfig
@@ -293,6 +294,7 @@ class HFModel(nn.Module):
         qwen3_vl_vision_attention_max_padded_tokens: int = 0,
         qwen3_vl_decoder_attention_max_padded_tokens: int = 0,
         qwen3_vl_accumulate_head_grad_fp32: bool = True,
+        torch_chunked_ce_tokens: int = 0,
     ):
         super().__init__()
         self.context_parallel_batch_policy: ContextParallelBatchPolicy | None = None
@@ -307,6 +309,10 @@ class HFModel(nn.Module):
             raise ValueError("sound_und_config is required when sound_und=True")
         hf_config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
         self.hf_config = hf_config
+        if torch_chunked_ce_tokens and hf_config.model_type not in {"qwen3_vl", "qwen3_vl_moe"}:
+            raise ValueError("COSMOS_TORCH_CHUNKED_CE_TOKENS requires Qwen3-VL")
+        if torch_chunked_ce_tokens and not enable_fused_weighted_ce:
+            raise ValueError("Chunked CE requires the fused CE model wrapper")
         if sound_und and enable_fused_weighted_ce and hf_config.model_type in {"qwen3_vl", "qwen3_vl_moe"}:
             raise ValueError("Qwen3-VL fused weighted CE does not support sound_und=True")
         if qwen3_vl_decoder_attention_max_padded_tokens < 0:
@@ -469,7 +475,10 @@ class HFModel(nn.Module):
         if hf_config.model_type in ("qwen3_vl", "qwen3_vl_moe") and hasattr(self.model, "model"):
             from cosmos_framework.utils.generator.monkey_patch import patch_qwen3_vl_forward
 
-            patch_qwen3_vl_forward(self.model.model)
+            patch_qwen3_vl_forward(
+                self.model.model,
+                use_visual_index=perf_flag_enabled("COSMOS_QWEN3VL_VISUAL_INDEX"),
+            )
             log.info(f"HFModel: applied patch_qwen3_vl_forward ({hf_config.model_type}) for text-only batch support")
             if enable_fused_weighted_ce:
                 configure_qwen3_vl_fused_ce(
@@ -477,6 +486,7 @@ class HFModel(nn.Module):
                     exponent=weighted_ce_exponent,
                     recompute=recompute_fused_weighted_ce,
                     accumulate_head_grad_fp32=qwen3_vl_accumulate_head_grad_fp32,
+                    chunk_tokens=torch_chunked_ce_tokens,
                 )
 
         # Swap HF's per-expert Python loop for the fused grouped_mm expert kernel. HF's loop
@@ -507,8 +517,8 @@ class HFModel(nn.Module):
             n_vision_attns = patch_qwen3_vl_vision_varlen_attention(
                 self.model,
                 max_padded_tokens=qwen3_vl_vision_attention_max_padded_tokens,
-                use_eager_vision_rope=os.environ.get("COSMOS_QWEN3VL_VISION_ROPE_EAGER", "0").strip().lower()
-                in {"1", "true", "yes", "on"},
+                use_eager_vision_rope=perf_flag_enabled("COSMOS_QWEN3VL_VISION_ROPE_EAGER"),
+                use_host_cu_seqlens=perf_flag_enabled("COSMOS_QWEN3VL_VISION_HOST_CU_SEQLENS"),
             )
             log.info(f"HFModel: applied varlen attention to {n_vision_attns} vision attention module(s)")
 

@@ -216,8 +216,8 @@ def _hf_attention_cosmos_local(
         cumulative_seqlen_KV=cu_seq_lens_k,
         max_seqlen_Q=max_length_q,
         max_seqlen_KV=max_length_k,
-        cumulative_seqlen_Q_host=cu_seq_lens_q_host,
-        cumulative_seqlen_KV_host=cu_seq_lens_k_host,
+        **({"cumulative_seqlen_Q_host": cu_seq_lens_q_host} if cu_seq_lens_q_host is not None else {}),
+        **({"cumulative_seqlen_KV_host": cu_seq_lens_k_host} if cu_seq_lens_k_host is not None else {}),
         # Backend selection has its own flag; the model/CLI sets the Torch mode.
         deterministic=torch.are_deterministic_algorithms_enabled(),
     )
