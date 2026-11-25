@@ -96,17 +96,24 @@ TORCHRUN_ARGS=(--nproc_per_node="${NPROC_PER_NODE:-8}" --master_port="${MASTER_P
 [[ -n "${NODE_RANK:-}" ]]   && TORCHRUN_ARGS+=(--node_rank="$NODE_RANK")
 [[ -n "${MASTER_ADDR:-}" ]] && TORCHRUN_ARGS+=(--master_addr="$MASTER_ADDR")
 
+COSMOS_DETERMINISTIC_FLAG=""
+case "${COSMOS_DETERMINISTIC:-0}" in
+    1 | true | TRUE | True | yes | YES) COSMOS_DETERMINISTIC_FLAG="--deterministic" ;;
+esac
+
 if [[ -n "${LOG_FILTER_REGEX:-}" ]]; then
     IMAGINAIRE_OUTPUT_ROOT="$IMAGINAIRE_OUTPUT_ROOT" PYTHONPATH=. \
         torchrun "${TORCHRUN_ARGS[@]}" -m cosmos_framework.scripts.train \
-        --sft-toml="$TOML_FILE" \
+        --sft-toml="$TOML_FILE" ${EXTRA_TRAIN_ARGS:-} \
+        ${COSMOS_DETERMINISTIC_FLAG:-} \
         "${TRAILING_ARGS[@]}" \
         2>&1 | sed -u -E "/$LOG_FILTER_REGEX/d" | tee "$LOG_FILE"
     EXIT_CODE=${PIPESTATUS[0]}
 else
     IMAGINAIRE_OUTPUT_ROOT="$IMAGINAIRE_OUTPUT_ROOT" PYTHONPATH=. \
         torchrun "${TORCHRUN_ARGS[@]}" -m cosmos_framework.scripts.train \
-        --sft-toml="$TOML_FILE" \
+        --sft-toml="$TOML_FILE" ${EXTRA_TRAIN_ARGS:-} \
+        ${COSMOS_DETERMINISTIC_FLAG:-} \
         "${TRAILING_ARGS[@]}" \
         2>&1 | tee "$LOG_FILE"
     EXIT_CODE=${PIPESTATUS[0]}
