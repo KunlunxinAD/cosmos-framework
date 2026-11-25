@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
 """Opt-in PyTorch-only sparse/chunked LM-head cross entropy.
 
 Batches are reduced in one autograd node: this avoids keeping one large
