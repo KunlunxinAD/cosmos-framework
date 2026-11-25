@@ -14,6 +14,7 @@ import math
 
 import torch
 import torch.nn.functional as F
+from cosmos_framework.utils.deterministic_training import deterministic_trunc_normal_
 from packaging.version import Version
 from torch import nn
 
@@ -52,7 +53,9 @@ class DomainAwareLinear(nn.Module):
 
     def initialize_action_parameters(self, std: float) -> None:
         """Apply the shared Cosmos3 action-boundary initialization policy."""
-        nn.init.trunc_normal_(self.fc.weight, std=std, a=-3 * std, b=3 * std)  # [N,O*I]
+        deterministic_trunc_normal_(
+            self.fc.weight, std, name=f"domain_action:{self.input_size}:{self.output_size}:{self.num_domains}"
+        )  # [N,O*I]
         nn.init.zeros_(self.bias.weight)  # [N,O]
 
     def forward(self, x: torch.Tensor, domain_id: torch.LongTensor) -> torch.Tensor:

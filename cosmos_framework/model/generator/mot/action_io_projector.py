@@ -7,9 +7,9 @@ import math
 
 import torch
 import torch.nn.functional as F
-from torch import nn
-
 from cosmos_framework.model.generator.mot.domain_aware_linear import DomainAwareLinear
+from cosmos_framework.utils.deterministic_training import deterministic_trunc_normal_
+from torch import nn
 
 ACTION_IO_PROJECTOR_DOMAIN_AWARE = "domain_aware"
 ACTION_IO_PROJECTOR_SHARED_WEIGHT_BIAS = "shared_weight_bias"
@@ -48,7 +48,9 @@ class SharedWeightBiasLinear(nn.Module):
 
     def initialize_action_parameters(self, std: float) -> None:
         """Apply the shared Cosmos3 action-boundary initialization policy."""
-        nn.init.trunc_normal_(self.weight, std=std, a=-3 * std, b=3 * std)  # [O,I]
+        deterministic_trunc_normal_(
+            self.weight, std, name=f"{type(self).__name__}:{self.input_size}:{self.output_size}:{self.num_types}"
+        )  # [O,I]
         nn.init.zeros_(self.bias)  # [O]
 
     def forward(
@@ -86,7 +88,9 @@ class SharedWeightNoBiasLinear(nn.Module):
 
     def initialize_action_parameters(self, std: float) -> None:
         """Apply the shared Cosmos3 action-boundary initialization policy."""
-        nn.init.trunc_normal_(self.weight, std=std, a=-3 * std, b=3 * std)  # [O,I]
+        deterministic_trunc_normal_(
+            self.weight, std, name=f"{type(self).__name__}:{self.input_size}:{self.output_size}:{self.num_types}"
+        )  # [O,I]
 
     def forward(
         self, x: torch.Tensor, type_id: torch.LongTensor

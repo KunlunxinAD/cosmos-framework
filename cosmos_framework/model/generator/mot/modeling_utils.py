@@ -4,10 +4,10 @@
 import math
 
 import torch
+from cosmos_framework.data.generator.sequence_packing import ModalityData
+from cosmos_framework.utils.deterministic_training import canonical_timestep_frequencies
 from torch import nn
 from transformers.activations import ACT2FN
-
-from cosmos_framework.data.generator.sequence_packing import ModalityData
 
 
 def has_noisy_tokens(modality_data: ModalityData | None) -> bool:
@@ -68,6 +68,8 @@ class TimestepEmbedder(nn.Module):
         device: torch.device | None = None,
     ) -> torch.Tensor:  # [D/2]
         """Build device frequencies from the original CPU calculation."""
+        if torch.are_deterministic_algorithms_enabled():
+            return canonical_timestep_frequencies(dim, max_period, device)
         half = dim // 2
         frequencies = torch.exp(  # [D/2]
             -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half

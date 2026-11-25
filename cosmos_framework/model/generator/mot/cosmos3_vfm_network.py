@@ -7,11 +7,6 @@ from collections.abc import Sequence
 from typing import List, Tuple
 
 import torch
-from torch import nn
-from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_utils import PreTrainedModel
-
-from cosmos_framework.utils import log
 from cosmos_framework.configs.base.defaults.joint_attention import packing_layout
 from cosmos_framework.configs.base.defaults.multiview_attention import (
     CrossViewTemporalWindowConfig,
@@ -22,6 +17,15 @@ from cosmos_framework.configs.base.defaults.multiview_attention import (
     SameViewTemporalWindowConfig,
     normalize_multiview_temporal_windows,
     upgrade_saved_multiview_attention,
+)
+from cosmos_framework.data.generator.sequence_packing import ModalityData, PackedSequence
+from cosmos_framework.data.generator.sequence_packing.natten import verify_natten_parameter_list
+from cosmos_framework.data.generator.sequence_packing.runtime import (
+    SequencePack,
+    from_all_seq,
+    get_caption_seq_offsets,
+    get_causal_seq,
+    get_full_only_seq,
 )
 from cosmos_framework.model.generator.mot.action_io_projector import (
     ACTION_IO_PROJECTOR_DOMAIN_AWARE,
@@ -63,16 +67,12 @@ from cosmos_framework.model.generator.utils.camera_relative_pose import (
 )
 from cosmos_framework.model.generator.utils.memory import MemoryState
 from cosmos_framework.model.generator.utils.rig_view_embedding import add_view_embeddings
-from cosmos_framework.data.generator.sequence_packing import ModalityData, PackedSequence
-from cosmos_framework.data.generator.sequence_packing.natten import verify_natten_parameter_list
-from cosmos_framework.data.generator.sequence_packing.runtime import (
-    SequencePack,
-    from_all_seq,
-    get_caption_seq_offsets,
-    get_causal_seq,
-    get_full_only_seq,
-)
+from cosmos_framework.utils import log
+from cosmos_framework.utils.deterministic_training import deterministic_trunc_normal_
 from cosmos_framework.utils.generator.spatial_patch import normalize_spatial_patch_hw
+from torch import nn
+from transformers.configuration_utils import PretrainedConfig
+from transformers.modeling_utils import PreTrainedModel
 
 
 class Cosmos3VFMNetworkConfig(PretrainedConfig):
@@ -502,7 +502,9 @@ class Cosmos3VFMNetwork(PreTrainedModel):
 
             if self.config.enable_action_modality_embedding:
                 std = 1.0 / math.sqrt(self.hidden_size)
-                torch.nn.init.trunc_normal_(self.action_modality_embed, std=std, a=-3 * std, b=3 * std)  # [hidden_size]
+                deterministic_trunc_normal_(
+                    self.action_modality_embed, std, name="action_modality_embed"
+                )  # [hidden_size]
 
         if self.config.sound_gen:
             # sound2llm: input_size=sound_dim, output_size=hidden_size

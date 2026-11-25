@@ -13,6 +13,7 @@ from typing import Any, Callable, Optional, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from cosmos_framework.utils.deterministic_training import canonical_rotary_frequencies
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
@@ -34,11 +35,6 @@ if "default" not in ROPE_INIT_FUNCTIONS:
         return inv_freq, 1.0
 
     ROPE_INIT_FUNCTIONS["default"] = _default_rope_init
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from transformers.processing_utils import Unpack
-from transformers.utils import is_torchdynamo_compiling
-from transformers.utils.deprecation import deprecate_kwarg
-
 # Import masking functions from utils for compatibility
 from cosmos_framework.model.generator.reasoner.qwen3_vl.utils import (
     create_causal_mask,
@@ -52,9 +48,13 @@ from cosmos_framework.model.generator.reasoner.qwen3_vl.utils import (
 from cosmos_framework.model.generator.reasoner.qwen3_vl.utils import (
     get_rope_index as _get_rope_index,
 )
-from cosmos_framework.model.generator.utils.fused_rope import maybe_fused_rope
 from cosmos_framework.model.generator.utils.fused_rms_norm import maybe_fused_rms_norm
+from cosmos_framework.model.generator.utils.fused_rope import maybe_fused_rope
 from cosmos_framework.utils.generator.quantization import _ModelOptFloat8Linear
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.processing_utils import Unpack
+from transformers.utils import is_torchdynamo_compiling
+from transformers.utils.deprecation import deprecate_kwarg
 
 from .configuration_qwen3_vl import Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig
 
@@ -333,7 +333,15 @@ class Qwen3VLTextRotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
-        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device=buffer_device)
+        if torch.are_deterministic_algorithms_enabled() and self.rope_type == "default":
+            head_dim = (
+                getattr(self.config, "head_dim", None) or self.config.hidden_size // self.config.num_attention_heads
+            )
+            dim = int(head_dim * getattr(self.config, "partial_rotary_factor", 1.0))
+            inv_freq = canonical_rotary_frequencies(self.config.rope_theta, dim, buffer_device)
+            self.attention_scaling = 1.0
+        else:
+            inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device=buffer_device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def apply_interleaved_mrope(self, freqs, mrope_section):
@@ -370,7 +378,12 @@ class Qwen3VLTextRotaryEmbedding(nn.Module):
         )  # [3,B,head_dim//2,1]
         position_ids_expanded = position_ids[:, :, None, :]  # [3,B,1,N]
 
-        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)  # [3,B,N,head_dim//2]
+        # Use elementwise FP32 multiplication in deterministic mode to avoid
+        # backend-specific GEMM rounding differences (see tools/op_fp32_probe.py).
+        if torch.are_deterministic_algorithms_enabled():
+            freqs = (inv_freq_expanded.float() * position_ids_expanded.float()).transpose(2, 3)  # [3,B,N,head_dim//2]
+        else:
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)  # [3,B,N,head_dim//2]
         freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)  # [B,N,head_dim//2]
         emb = torch.cat((freqs, freqs), dim=-1)  # [B,N,head_dim]
         cos = emb.cos() * self.attention_scaling  # [B,N,head_dim]
