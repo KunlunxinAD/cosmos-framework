@@ -49,8 +49,8 @@ export COSMOS_QWEN3VL_VISUAL_INDEX="${COSMOS_QWEN3VL_VISUAL_INDEX:-1}"
 export COSMOS_QWEN3VL_VISION_HOST_CU_SEQLENS="${COSMOS_QWEN3VL_VISION_HOST_CU_SEQLENS:-1}"
 # 使用 Vision Eager RoPE 路径，保留原有 Text RoPE 路径。
 export COSMOS_QWEN3VL_VISION_ROPE_EAGER="${COSMOS_QWEN3VL_VISION_ROPE_EAGER:-1}"
-# 启用 Sparse Chunked CE 并指定每块监督 Token 数，0 表示关闭。
-export COSMOS_TORCH_CHUNKED_CE_TOKENS="${COSMOS_TORCH_CHUNKED_CE_TOKENS:-1024}"
+# 启用 Sparse Chunked CE，默认每块 4096 个监督 Token，0 表示关闭。
+export COSMOS_TORCH_CHUNKED_CE_TOKENS="${COSMOS_TORCH_CHUNKED_CE_TOKENS:-4096}"
 # 首次 Chunked CE 调用时记录监督 Token 数及分块大小。
 export COSMOS_CHUNKED_CE_LOG_SHAPES="${COSMOS_CHUNKED_CE_LOG_SHAPES:-1}"
 
@@ -77,12 +77,12 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-${PYTORCH_ALLOC_CONF:
 # 同步 XPU 2609 Runtime 读取的旧版分配器环境变量。
 export PYTORCH_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF"
 
-# 每 Rank 最大 Batch Size，默认使用已完成 500 步验证的 BS7。
-export LLAVA_OV_MAX_BATCH_SIZE="${LLAVA_OV_MAX_BATCH_SIZE:-7}"
+# 每 Rank 最大 Batch Size，默认使用已完成 500 步验证的 BS14。
+export LLAVA_OV_MAX_BATCH_SIZE="${LLAVA_OV_MAX_BATCH_SIZE:-14}"
 # Batch Token 预算，沿用长程性能实验的 131072。
 export LLAVA_OV_MAX_TOKENS="${LLAVA_OV_MAX_TOKENS:-131072}"
-# 动态组批样本池大小，沿用长程性能实验的 32。
-export LLAVA_OV_POOL_SIZE="${LLAVA_OV_POOL_SIZE:-32}"
+# 动态组批样本池大小，默认使用已完成 500 步验证的 128。
+export LLAVA_OV_POOL_SIZE="${LLAVA_OV_POOL_SIZE:-128}"
 # 性能回调预热步数，沿用长程实验的 5。
 export LLAVA_OV_PERF_HIT_THRES="${LLAVA_OV_PERF_HIT_THRES:-5}"
 # 是否跳过最终 Checkpoint 保存，正常训练默认保留，纯性能实验可设为 1。
@@ -91,7 +91,7 @@ export COSMOS_SKIP_FINAL_CHECKPOINT="${COSMOS_SKIP_FINAL_CHECKPOINT:-0}"
 
 TAIL_OVERRIDES=(
     "model.config.policy.backbone.model_name=$MODEL_PATH"
-    # 与已验证的 BS7 动态组批及性能统计配置对齐；外部 EXTRA_TAIL_OVERRIDES 仍可覆盖。
+    # 与已验证的 BS14 / Pool128 动态组批及性能统计配置对齐；外部 EXTRA_TAIL_OVERRIDES 仍可覆盖。
     "dataloader_train.batcher.max_batch_size=$LLAVA_OV_MAX_BATCH_SIZE"
     "dataloader_train.batcher.max_tokens=$LLAVA_OV_MAX_TOKENS"
     "dataloader_train.batcher.pool_size=$LLAVA_OV_POOL_SIZE"
