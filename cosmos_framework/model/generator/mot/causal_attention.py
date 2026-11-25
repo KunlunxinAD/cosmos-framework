@@ -379,6 +379,7 @@ def dispatch_attention_no_memory_ac_safe(
     attention_mask: object | SplitInfo,
     natten_metadata: dict | None = None,
     packed_key_states_normalized: SequencePack | None = None,
+    backend: str | None = None,
 ) -> SequencePack:
     """Interactive no-memory dispatch with AC-safe three-way merging."""
     if isinstance(attention_mask, SplitInfo) and attention_mask.is_three_way:
@@ -399,6 +400,7 @@ def dispatch_attention_no_memory_ac_safe(
         natten_metadata=natten_metadata,
         memory_value=None,
         packed_key_states_normalized=packed_key_states_normalized,
+        backend=backend,
     )
     return output
 

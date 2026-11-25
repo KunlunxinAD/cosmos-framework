@@ -21,6 +21,7 @@ from cosmos_framework.model.attention.masks import CausalType
 from cosmos_framework.model.attention.natten import (
     NATTEN_BLACKWELL_DETERMINISTIC_VERSION,
     NATTEN_BLACKWELL_PARTIAL_HEAD_DIM_VERSION,
+    NATTEN_DENSE_FALLBACK,
     NATTEN_HOPPER_CAUSAL_VARLEN_VERSION,
     NATTEN_SUPPORTED,
     get_natten_version,
@@ -297,6 +298,28 @@ def natten_attention_check(
     target_fn = partial(log_or_raise_error, raise_error=raise_error)
 
     if not NATTEN_SUPPORTED:
+        if NATTEN_DENSE_FALLBACK:
+            # Dense FlashAttention-2 serves this slot on this device, so its constraints
+            # are the ones that decide compatibility.
+            from cosmos_framework.model.attention.natten.dense_fallback import (
+                dense_fallback_attention_check,
+            )
+
+            return dense_fallback_attention_check(
+                query_shape=query_shape,
+                key_shape=key_shape,
+                value_shape=value_shape,
+                dtype=dtype,
+                device=device,
+                requires_grad=requires_grad,
+                is_causal=is_causal,
+                causal_type=causal_type,
+                is_varlen=is_varlen,
+                deterministic=deterministic,
+                return_lse=return_lse,
+                is_compiling=is_compiling,
+                raise_error=raise_error,
+            )
         target_fn(
             "NATTEN is not supported in this environment. Run with debug logs to find out why, or choose another backend.",
             exception=RuntimeError,
@@ -469,6 +492,23 @@ def natten_multi_dim_attention_check(
     target_fn = partial(log_or_raise_error, raise_error=raise_error)
 
     if not NATTEN_SUPPORTED:
+        if NATTEN_DENSE_FALLBACK:
+            # Dense FlashAttention-2 serves this slot on this device, so its constraints
+            # are the ones that decide compatibility.
+            from cosmos_framework.model.attention.natten.dense_fallback import (
+                dense_fallback_multi_dim_attention_check,
+            )
+
+            return dense_fallback_multi_dim_attention_check(
+                query_shape=query_shape,
+                key_shape=key_shape,
+                value_shape=value_shape,
+                dtype=dtype,
+                device=device,
+                requires_grad=requires_grad,
+                deterministic=deterministic,
+                raise_error=raise_error,
+            )
         target_fn(
             "NATTEN is not supported in this environment. Run with debug logs to find out why, or choose another backend.",
             exception=RuntimeError,

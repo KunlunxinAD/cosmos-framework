@@ -114,6 +114,7 @@ def get_action_droid_sft_dataset(
     jitter_after_compose: bool = False,
     use_filter_dict: bool = False,
     filter_dict_path: str | None = None,
+    filter_dict_source_prefix: str = "",
     resolution: str | int = "256",
     max_action_dim: int = 64,
     tokenizer_config: dict | None = None,
@@ -145,6 +146,7 @@ def get_action_droid_sft_dataset(
         jitter_after_compose=jitter_after_compose,
         use_filter_dict=use_filter_dict,
         filter_dict_path=filter_dict_path,
+        filter_dict_source_prefix=filter_dict_source_prefix,
         use_success_only=use_success_only,
         video_backend=video_backend,
     )

@@ -9,6 +9,8 @@ Flash Attention v2 (flash2) Backend: intermediate APIs
 Only safe to import when FLASH2_SUPPORTED is True.
 """
 
+import os
+
 import torch
 from flash_attn.flash_attn_interface import flash_attn_func, flash_attn_varlen_func
 from torch import Tensor
@@ -129,6 +131,7 @@ def flash2_attention(
     if "deterministic" in backend_kwargs:
         deterministic = deterministic or backend_kwargs["deterministic"]
         del backend_kwargs["deterministic"]
+    deterministic = deterministic or torch.are_deterministic_algorithms_enabled()
 
     assert flash2_attention_check(
         query_shape=query.shape,
@@ -195,23 +198,18 @@ def flash2_attention(
         assert out.dim() == 3  # [total_tokens,H,Dv]
         output = out.unsqueeze(0)  # [1,total_tokens,H,Dv]
 
-        # Only a caller that asked for the LSE pays for its layout fix-up. The kernel hands
-        # one back either way -- ``return_attn_probs=True`` above is what makes this call
-        # return three values at all -- but on the Kunlun build it arrives padded per sample
-        # and normalizing it costs a device-side gather index (see ``_unpad_lse_bhm``), which
-        # is wasted on a caller that drops it. ``two_way_attention`` runs two varlen passes
-        # per decoder layer and reads neither LSE, so under activation checkpointing the Super
-        # vision recipe was paying 256 discarded un-pads per optimizer step. Skipping them
-        # reduces host launch pressure; trace durations can include queued waiting time.
-        #
-        # LSE layout differs across flash_attn builds:
-        #   * NVIDIA: [H, total_tokens] (dim == 2)
-        #   * Kunlun XPU: [batch, H, max_seqlen] (dim == 3), padded per sample.
-        # Normalize both to [H, total_tokens] by un-padding the Kunlun layout using cu_seqlens_q.
+        # Normalize LSE to [H, total_tokens] only when requested. Some Kunlun builds
+        # expose a 3-D buffer even when the kernel writes packed head-major LSE.
         lse = None
         if return_lse:
             if lse_.dim() == 3:
-                lse_ = _unpad_lse_bhm(lse_, cumulative_seqlen_Q, q.shape[0])
+                if os.environ.get("COSMOS_FLASH2_VARLEN_PACKED_LSE") == "1":
+                    # Keep a view of the packed prefix so merge backward can write it back.
+                    _, heads, _ = lse_.shape
+                    total_queries = q.shape[0]
+                    lse_ = lse_.view(-1)[: heads * total_queries].view(heads, total_queries)
+                else:
+                    lse_ = _unpad_lse_bhm(lse_, cumulative_seqlen_Q, q.shape[0])
             assert lse_.dim() == 2  # [H,total_tokens]
             lse = lse_.unsqueeze(0)  # [1,H,total_tokens]
 
@@ -243,6 +241,14 @@ def flash2_attention(
     # NOTE: Do NOT call .contiguous on LSE, otherwise Attention Merging backward pass will be
     # incorrect. All output and lse tensors passed into `merge_attentions` must have the same data
     # pointer as their corresponding attention autograd ops!
+    # Affected Kunlun dense builds store LSE head-major across batches.
+    # Normalize every dense caller's LSE here, including teacher-forcing chunks
+    # that bypass the frame-causal fallback.
+    if not is_varlen and lse.shape[0] > 1 and os.environ.get(
+        "COSMOS_FLASH2_LSE_BHFIX", "0"
+    ) not in {"0", "", "false", "no"}:
+        batches, heads, tokens = lse.shape
+        lse = lse.view(heads, batches, tokens).permute(1, 0, 2)
     lse = lse.permute(0, 2, 1)  # [B,N,H] or [1,total_tokens,H]
 
     return output, lse
