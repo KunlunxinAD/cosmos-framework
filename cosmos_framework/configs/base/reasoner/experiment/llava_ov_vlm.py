@@ -47,6 +47,8 @@ See ``launch_vlm_llava_ov.sh`` for a ready-to-run shell script.
 from __future__ import annotations
 
 import copy
+import os
+from pathlib import Path
 from typing import Any
 
 from hydra.core.config_store import ConfigStore
@@ -76,6 +78,20 @@ cs = ConfigStore.instance()
 # ---------------------------------------------------------------------------
 
 
+def _resolve_local_llava_ov_parquet_files(local_dir: str, subset: str, split: str) -> list[str]:
+    """Resolve local parquet shard files for LLaVA-OneVision-Data."""
+    base = Path(local_dir)
+    if not base.is_dir():
+        raise FileNotFoundError(f"LLAVA_OV_LOCAL_DATA_DIR does not exist or is not a directory: {local_dir}")
+    candidate_dir = base / subset if (base / subset).is_dir() else base
+    parquet_files = sorted(str(p) for p in candidate_dir.glob(f"{split}*.parquet"))
+    if not parquet_files:
+        parquet_files = sorted(str(p) for p in candidate_dir.glob("*.parquet"))
+    if not parquet_files:
+        raise FileNotFoundError(f"No parquet files found for split={split!r} under {candidate_dir}")
+    return parquet_files
+
+
 def get_llava_ov_streaming(
     subset: str = "si",
     split: str = "train",
@@ -96,12 +112,22 @@ def get_llava_ov_streaming(
     except ImportError as exc:
         raise ImportError("pip install datasets to use lmms-lab/LLaVA-OneVision-Data") from exc
 
-    ds = load_dataset(
-        "lmms-lab/LLaVA-OneVision-Data",
-        name=subset,
-        split=split,
-        streaming=True,
-    )
+    local_dir = os.environ.get("LLAVA_OV_LOCAL_DATA_DIR", "").strip()
+    if local_dir:
+        parquet_files = _resolve_local_llava_ov_parquet_files(local_dir, subset, split)
+        ds = load_dataset(
+            "parquet",
+            data_files={split: parquet_files},
+            split=split,
+            streaming=True,
+        )
+    else:
+        ds = load_dataset(
+            "lmms-lab/LLaVA-OneVision-Data",
+            name=subset,
+            split=split,
+            streaming=True,
+        )
     # Pre-filter to remove records without an image or conversations so
     # sft_process_sample never receives unparseable samples (the packing
     # engine does not tolerate None returns from the processor).
@@ -140,7 +166,12 @@ def get_llava_ov_map(
     """
     from datasets import load_dataset
 
-    ds = load_dataset("lmms-lab/LLaVA-OneVision-Data", name=subset, split=split, streaming=False)
+    local_dir = os.environ.get("LLAVA_OV_LOCAL_DATA_DIR", "").strip()
+    if local_dir:
+        parquet_files = _resolve_local_llava_ov_parquet_files(local_dir, subset, split)
+        ds = load_dataset("parquet", data_files={split: parquet_files}, split=split, streaming=False)
+    else:
+        ds = load_dataset("lmms-lab/LLaVA-OneVision-Data", name=subset, split=split, streaming=False)
     ds = ds.filter(lambda x: x.get("image") is not None and len(x.get("conversations") or []) >= 2)
     if n is not None and n < len(ds):
         ds = ds.select(range(n))

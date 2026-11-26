@@ -16,7 +16,12 @@ from cosmos_framework.model.generator.reasoner.qwen35_caption import Qwen35Capti
 
 
 def configure_qwen3_vl_fused_ce(
-    model: nn.Module, *, exponent: float, recompute: bool = False, accumulate_head_grad_fp32: bool = True
+    model: nn.Module,
+    *,
+    exponent: float,
+    recompute: bool = False,
+    accumulate_head_grad_fp32: bool = True,
+    chunk_tokens: int = 0,
 ) -> None:
     """Evaluate LM projection and CE while the FSDP root's weight is gathered.
 
@@ -34,7 +39,10 @@ def configure_qwen3_vl_fused_ce(
     model = cast(Qwen3VLForConditionalGeneration | Qwen3VLMoeForConditionalGeneration, model)
     # Evaluate native position phases in FP32 on the fused path, using the same
     # phases in CP=1 and CP>1 when comparing the fused path.
-    configure_qwen3_vl_fp32_rope(model.model.language_model.rotary_emb)
+    # Preserve the existing RoPE policy when measuring the torch-only CE backend
+    # against the normal logits loss; Liger's original path retains FP32 RoPE.
+    if chunk_tokens == 0:
+        configure_qwen3_vl_fp32_rope(model.model.language_model.rotary_emb)
     original_forward = model.forward
 
     @wraps(original_forward.__func__)
@@ -57,6 +65,7 @@ def configure_qwen3_vl_fused_ce(
             cu_seq_lens=kwargs.get("cu_seq_lens_q"),
             recompute=recompute,
             accumulate_head_grad_fp32=accumulate_head_grad_fp32 and kwargs.get("cu_seq_lens_q") is not None,
+            chunk_tokens=chunk_tokens,
         )
         return Qwen35CaptionLoss(loss, stats)
 
