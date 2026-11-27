@@ -150,6 +150,65 @@ def _encoder_memory_format() -> torch.memory_format:
     return torch.contiguous_format if _vae_encoder_ncdhw_enabled() else torch.channels_last_3d
 
 
+# P800's conv3d splits the reduction over input channels differently between launches for both
+# kernel shapes in this VAE that are 1x1 in H and W: the 1x1x1 residual shortcuts, unstable at
+# every size tried, and the (3,1,1) stride-2 temporal downsamples, unstable at 832-wide input and
+# stable at 640. One input gives two or three distinct outputs, which is enough to make every
+# training step of a run differ. Measured 2026-11-18: 16 repeats of a 160->320 shortcut at
+# [1,160,1,44,80] gave 2 distinct results in bf16 (3.9e-3 max absolute) and 3 in fp32 (4.8e-7),
+# while conv2d, matmul and F.linear over the same values were bitwise identical over all 16, and a
+# 3x3x3 conv3d was too.
+#
+# A kernel that is 1x1 in H and W is a per-position channel projection of its temporal taps, so the
+# same arithmetic is kt linear layers accumulated in fp32 and rounded once, which is what conv3d
+# does internally. The result is repeatable but not bitwise equal to conv3d, so it follows torch's
+# determinism flag by default; ``COSMOS_VAE_CONV1X1_AS_LINEAR=0``/``1`` forces it off or on.
+_VAE_CONV1X1_AS_LINEAR: bool | None = None
+
+
+def _conv1x1_as_linear_enabled() -> bool:
+    """Whether spatially-pointwise convolutions run as linear layers. Read once per process."""
+    global _VAE_CONV1X1_AS_LINEAR
+    if _VAE_CONV1X1_AS_LINEAR is None:
+        override = os.environ.get("COSMOS_VAE_CONV1X1_AS_LINEAR", "").strip().lower()
+        if override in {"0", "false", "no"}:
+            _VAE_CONV1X1_AS_LINEAR = False
+        elif override in {"1", "true", "yes"}:
+            _VAE_CONV1X1_AS_LINEAR = True
+        else:
+            _VAE_CONV1X1_AS_LINEAR = torch.are_deterministic_algorithms_enabled()
+    return _VAE_CONV1X1_AS_LINEAR
+
+
+def _pointwise_conv3d_as_linear(
+    x: torch.Tensor,  # [B,C,T,H,W]
+    weight: torch.Tensor,  # [out_C,C,kt,1,1]
+    bias: torch.Tensor | None,  # [out_C]
+    temporal_stride: int,
+) -> torch.Tensor:  # [B,out_C,T_out,H,W]
+    """conv3d for a kernel that is 1x1 in H and W, as one channel projection per temporal tap.
+
+    Channels-last storage puts the channel dim innermost, which makes the two ``movedim`` calls
+    views rather than copies.
+    """
+    channel_last = x.movedim(1, -1)  # [B,T,H,W,C]
+    taps = weight.shape[2]
+    if taps == 1:
+        return F.linear(channel_last, weight[:, :, 0, 0, 0], bias).movedim(-1, 1)
+    out_frames = (x.shape[2] - taps) // temporal_stride + 1
+    span = (out_frames - 1) * temporal_stride + 1
+    total = None
+    for tap in range(taps):
+        window = channel_last.narrow(1, tap, span)
+        if temporal_stride != 1:
+            window = window[:, ::temporal_stride]  # [B,T_out,H,W,C]
+        projected = F.linear(window, weight[:, :, tap, 0, 0]).float()  # [B,T_out,H,W,out_C]
+        total = projected if total is None else total + projected
+    if bias is not None:
+        total = total + bias.float()
+    return total.to(dtype=x.dtype).movedim(-1, 1)  # [B,out_C,T_out,H,W]
+
+
 class CausalConv3d(nn.Conv3d):
     """
     Causal 3d convolution.
@@ -168,6 +227,23 @@ class CausalConv3d(nn.Conv3d):
             0,
         )
         self.padding = (0, 0, 0)
+        # Whether this kernel reads exactly one position in H and W, which is what makes the
+        # linear rewrite in ``_conv_forward`` arithmetically equivalent.
+        self._spatially_pointwise = (
+            tuple(self.kernel_size[1:]) == (1, 1)
+            and tuple(self.stride[1:]) == (1, 1)
+            and tuple(self.dilation) == (1, 1, 1)
+            and self.groups == 1
+        )
+
+    def _conv_forward(self, input, weight, bias):  # noqa: A002 -- nn.Conv3d's own parameter name
+        """The convolution itself, after ``forward`` has applied padding and any causal cache."""
+        if self._spatially_pointwise and _conv1x1_as_linear_enabled():
+            out = _pointwise_conv3d_as_linear(input, weight, bias, self.stride[0])
+            if self.cache_memory_format == torch.channels_last_3d:
+                return out.contiguous(memory_format=torch.channels_last_3d)
+            return out.contiguous()
+        return super()._conv_forward(input, weight, bias)
 
     def forward(self, x, cache_x=None):  # x: [B,C,T,H,W]
         padding = list(self._padding)

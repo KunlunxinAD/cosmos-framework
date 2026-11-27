@@ -27,6 +27,7 @@ from torch.distributed._functional_collectives import AsyncCollectiveTensor
 from torch.distributed._tensor.api import DTensor
 
 from cosmos_framework.utils import distributed, log
+from cosmos_framework.utils.deterministic_training import set_base_seed
 from cosmos_framework.utils.distributed import all_gather_tensor
 from cosmos_framework.utils.easy_io import easy_io
 from cosmos_framework.utils.timer import Timer
@@ -141,6 +142,7 @@ def set_random_seed(seed: int, by_rank: bool = False) -> None:
         seed (int): Random seed.
         by_rank (bool): if true, each GPU will use a different random seed.
     """
+    set_base_seed(seed)
     if by_rank:
         seed += distributed.get_rank()
     log.info(f"Using random seed {seed}.")

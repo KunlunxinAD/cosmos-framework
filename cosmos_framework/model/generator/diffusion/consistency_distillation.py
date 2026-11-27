@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from cosmos_framework.model.generator.distillation.common_loss import (
@@ -21,6 +23,48 @@ def shift_rectified_flow_time(
     if shift_tensor.ndim == 1 and sigma_unshifted.ndim == 2:
         shift_tensor = shift_tensor.unsqueeze(1)  # [B,1]
     return shift_tensor * sigma_unshifted / (1.0 + (shift_tensor - 1.0) * sigma_unshifted)  # [B,N] or [B]
+
+
+_LADDER_CALLS = 0
+
+
+def _ladder_pin_seed() -> int | None:
+    """Base seed for the host-RNG ladder draw, or None when the draw stays on device."""
+    raw = os.environ.get("COSMOS_DCM_LADDER_SEED", "")
+    return None if raw in ("", "0", "off", "none") else int(raw)
+
+
+def _ladder_fixed_u() -> float | None:
+    """A literal u for every rank and every step, so sigma is a chosen constant."""
+    raw = os.environ.get("COSMOS_DCM_LADDER_U", "")
+    return None if raw in ("", "off", "none") else float(raw)
+
+
+def _ladder_rank() -> int:
+    return torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+
+def _ladder_u(batch_size: int, max_u: float, device, dtype) -> torch.Tensor:  # [B,1]
+    """Draw the ladder offset u, optionally from a platform-independent host stream.
+
+    The device draw cannot agree between a CUDA box and an XPU box even at one seed,
+    and u alone decides which sigma pair the endpoint loss sees -- worth 3x in the
+    logged loss. Pinning it is alignment instrumentation, not a training default.
+    """
+    global _LADDER_CALLS
+    index = _LADDER_CALLS
+    _LADDER_CALLS += 1
+    fixed = _ladder_fixed_u()
+    if fixed is not None:
+        value = min(max(fixed, 0.0), max_u)
+        return torch.full((batch_size, 1), value, device=device, dtype=dtype)  # [B,1]
+    base = _ladder_pin_seed()
+    if base is None:
+        return torch.rand((batch_size, 1), device=device, dtype=dtype) * max_u  # [B,1]
+    generator = torch.Generator()  # CPU: same bits on every platform
+    generator.manual_seed(base + 65536 * index + _ladder_rank())
+    host = torch.rand((batch_size, 1), generator=generator, dtype=torch.float32)  # [B,1]
+    return (host * max_u).to(device=device, dtype=dtype)  # [B,1]
 
 
 def sample_dcm_ladder(
@@ -45,7 +89,7 @@ def sample_dcm_ladder(
     dtype = tensor_kwargs.get("dtype", torch.float32)
     du = 1.0 / float(total_steps)
     max_u = 1.0 - float(skipping_interval_steps) * du
-    u = torch.rand((batch_size, 1), device=device, dtype=dtype) * max_u  # [B,1]
+    u = _ladder_u(batch_size, max_u, device, dtype)  # [B,1]
     k = torch.arange(skipping_interval_steps + 1, device=device, dtype=dtype).unsqueeze(0)  # [1,N+1]
     sigma_unshifted = 1.0 - (u + k * du)  # [B,N+1]
     sigmas = shift_rectified_flow_time(sigma_unshifted, shift).clamp(0.0, 1.0)  # [B,N+1]

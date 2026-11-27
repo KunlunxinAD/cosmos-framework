@@ -9,6 +9,8 @@ Flash Attention v2 (flash2) Backend: intermediate APIs
 Only safe to import when FLASH2_SUPPORTED is True.
 """
 
+import os
+
 import torch
 from flash_attn.flash_attn_interface import flash_attn_func, flash_attn_varlen_func
 from torch import Tensor
@@ -17,6 +19,160 @@ from cosmos_framework.model.attention.checks import assert_universal_tensor_chec
 from cosmos_framework.model.attention.flash2.checks import flash2_attention_check
 from cosmos_framework.model.attention.masks import CausalType
 from cosmos_framework.model.attention.utils.environment import is_torch_compiling
+
+
+# --- COSMOS_FLASH2_SAC_CUSTOM_OP ---
+def _maybe_enable_flash2_sac_custom_op() -> None:
+    if os.environ.get("COSMOS_FLASH2_SAC_CUSTOM_OP", "0") != "1":
+        return
+    import flash_attn.flash_attn_interface as fai
+
+    if getattr(fai, "_cosmos_sac_custom_op_enabled", False):
+        return
+
+    orig_fwd = fai._flash_attn_forward
+    orig_varlen_fwd = fai._flash_attn_varlen_forward
+
+    @torch.library.custom_op("flash_attn::_flash_attn_forward", mutates_args=())
+    def _flash_attn_forward_op(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        dropout_p: float,
+        softmax_scale: float,
+        causal: bool,
+        window_size_left: int,
+        window_size_right: int,
+        alibi_slopes: torch.Tensor | None,
+        return_softmax: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        out, _q, _k, _v, _out_padded, softmax_lse, s_dmask, rng_state = orig_fwd(
+            q,
+            k,
+            v,
+            dropout_p,
+            softmax_scale,
+            causal,
+            (window_size_left, window_size_right),
+            alibi_slopes,
+            return_softmax,
+        )
+        return out, softmax_lse, s_dmask, rng_state
+
+    @torch.library.custom_op("flash_attn::_flash_attn_varlen_forward", mutates_args=())
+    def _flash_attn_varlen_forward_op(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        dropout_p: float,
+        softmax_scale: float,
+        causal: bool,
+        window_size_left: int,
+        window_size_right: int,
+        alibi_slopes: torch.Tensor | None,
+        return_softmax: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        out, _q, _k, _v, _out_padded, softmax_lse, s_dmask, rng_state = orig_varlen_fwd(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_p,
+            softmax_scale,
+            causal,
+            (window_size_left, window_size_right),
+            alibi_slopes,
+            return_softmax,
+        )
+        return out, softmax_lse, s_dmask, rng_state
+
+    def _wrapped_flash_attn_forward(
+        q, k, v, dropout_p, softmax_scale, causal, window_size, alibi_slopes, return_softmax
+    ):
+        if q.shape[-1] % 8 != 0:
+            return orig_fwd(
+                q, k, v, dropout_p, softmax_scale, causal, window_size, alibi_slopes, return_softmax
+            )
+        maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
+        q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+        out, softmax_lse, s_dmask, rng_state = torch.ops.flash_attn._flash_attn_forward(
+            q,
+            k,
+            v,
+            float(dropout_p),
+            float(softmax_scale),
+            bool(causal),
+            int(window_size[0]),
+            int(window_size[1]),
+            alibi_slopes,
+            bool(return_softmax),
+        )
+        return out, q, k, v, out, softmax_lse, s_dmask, rng_state
+
+    def _wrapped_flash_attn_varlen_forward(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        alibi_slopes,
+        return_softmax,
+    ):
+        if q.shape[-1] % 8 != 0:
+            return orig_varlen_fwd(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p,
+                softmax_scale,
+                causal,
+                window_size,
+                alibi_slopes,
+                return_softmax,
+            )
+        maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
+        q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+        out, softmax_lse, s_dmask, rng_state = torch.ops.flash_attn._flash_attn_varlen_forward(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            int(max_seqlen_q),
+            int(max_seqlen_k),
+            float(dropout_p),
+            float(softmax_scale),
+            bool(causal),
+            int(window_size[0]),
+            int(window_size[1]),
+            alibi_slopes,
+            bool(return_softmax),
+        )
+        return out, q, k, v, out, softmax_lse, s_dmask, rng_state
+
+    fai._flash_attn_forward = _wrapped_flash_attn_forward
+    fai._flash_attn_varlen_forward = _wrapped_flash_attn_varlen_forward
+    fai._cosmos_sac_custom_op_enabled = True
+
+
+_maybe_enable_flash2_sac_custom_op()
 
 
 def _unpad_lse_bhm(lse_: Tensor, cumulative_seqlen_Q: Tensor, total_tokens: int) -> Tensor:
@@ -129,6 +285,7 @@ def flash2_attention(
     if "deterministic" in backend_kwargs:
         deterministic = deterministic or backend_kwargs["deterministic"]
         del backend_kwargs["deterministic"]
+    deterministic = deterministic or torch.are_deterministic_algorithms_enabled()
 
     assert flash2_attention_check(
         query_shape=query.shape,
@@ -195,23 +352,18 @@ def flash2_attention(
         assert out.dim() == 3  # [total_tokens,H,Dv]
         output = out.unsqueeze(0)  # [1,total_tokens,H,Dv]
 
-        # Only a caller that asked for the LSE pays for its layout fix-up. The kernel hands
-        # one back either way -- ``return_attn_probs=True`` above is what makes this call
-        # return three values at all -- but on the Kunlun build it arrives padded per sample
-        # and normalizing it costs a device-side gather index (see ``_unpad_lse_bhm``), which
-        # is wasted on a caller that drops it. ``two_way_attention`` runs two varlen passes
-        # per decoder layer and reads neither LSE, so under activation checkpointing the Super
-        # vision recipe was paying 256 discarded un-pads per optimizer step. Skipping them
-        # reduces host launch pressure; trace durations can include queued waiting time.
-        #
-        # LSE layout differs across flash_attn builds:
-        #   * NVIDIA: [H, total_tokens] (dim == 2)
-        #   * Kunlun XPU: [batch, H, max_seqlen] (dim == 3), padded per sample.
-        # Normalize both to [H, total_tokens] by un-padding the Kunlun layout using cu_seqlens_q.
+        # Normalize LSE to [H, total_tokens] only when requested. Some Kunlun builds
+        # expose a 3-D buffer even when the kernel writes packed head-major LSE.
         lse = None
         if return_lse:
             if lse_.dim() == 3:
-                lse_ = _unpad_lse_bhm(lse_, cumulative_seqlen_Q, q.shape[0])
+                if os.environ.get("COSMOS_FLASH2_VARLEN_PACKED_LSE") == "1":
+                    # Keep a view of the packed prefix so merge backward can write it back.
+                    _, heads, _ = lse_.shape
+                    total_queries = q.shape[0]
+                    lse_ = lse_.view(-1)[: heads * total_queries].view(heads, total_queries)
+                else:
+                    lse_ = _unpad_lse_bhm(lse_, cumulative_seqlen_Q, q.shape[0])
             assert lse_.dim() == 2  # [H,total_tokens]
             lse = lse_.unsqueeze(0)  # [1,H,total_tokens]
 
@@ -243,6 +395,14 @@ def flash2_attention(
     # NOTE: Do NOT call .contiguous on LSE, otherwise Attention Merging backward pass will be
     # incorrect. All output and lse tensors passed into `merge_attentions` must have the same data
     # pointer as their corresponding attention autograd ops!
+    # Affected Kunlun dense builds store LSE head-major across batches.
+    # Normalize every dense caller's LSE here, including teacher-forcing chunks
+    # that bypass the frame-causal fallback.
+    if not is_varlen and lse.shape[0] > 1 and os.environ.get(
+        "COSMOS_FLASH2_LSE_BHFIX", "0"
+    ) not in {"0", "", "false", "no"}:
+        batches, heads, tokens = lse.shape
+        lse = lse.view(heads, batches, tokens).permute(1, 0, 2)
     lse = lse.permute(0, 2, 1)  # [B,N,H] or [1,total_tokens,H]
 
     return output, lse

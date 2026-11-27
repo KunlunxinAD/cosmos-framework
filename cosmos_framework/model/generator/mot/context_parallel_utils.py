@@ -338,22 +338,24 @@ def all_to_all_tensor(
     Input placement: Shard(gather_dim) -> The dimension we are about to gather was split.
     Output placement: Shard(scatter_dim) -> The dimension we are about to scatter will be split.
     """
-    # Both the wrap and the redistribute below decide how to split a dimension across the mesh, and
-    # each decision includes asking whether that dimension is empty. One of the two is the sequence
-    # dimension, which ``_mark_pack_unbacked`` has made unbacked -- ``gather_seq_scatter_heads``
-    # gathers it, this shape's ``gather_dim``, and ``gather_heads_scatter_seq`` scatters it, the
-    # ``scatter_dim``. The question then has no answer and Dynamo raises rather than guarding. The
-    # other of the two is the head dimension, whose size is static, so its own question answers
-    # itself; covering both keeps this correct whichever direction the caller asked for.
-    #
-    # Asserted only where the length is *not* already known to be zero, because zero is a real
-    # length here: AR inference with a KV cache skips the und tokens and hands this an empty
-    # causal stream (see the note in ``context_parallel_attention``), and an unconditional
-    # ``!= 0`` would refuse the gen-only frames outright. Such a stream is concretely empty rather
-    # than symbolic -- ``_mark_pack_unbacked`` declines to mark a length of 0 or 1 -- so
-    # ``guard_or_false`` resolves it statically and skips, leaving that path exactly as it was.
-    # What remains asserted is the unbacked case, where the length is at least 2 for the same
-    # reason, which is the case the compiler cannot settle for itself.
+    # An AR rollout can skip the text stream on every CP rank. Redistributing
+    # that empty tensor needs only a shape change. Use the same chunk sizes as
+    # DTensor's Shard placement, including an empty trailing shard.
+    if scatter_dim != gather_dim and (
+        guard_or_false(local_input.shape[gather_dim] == 0)
+        or guard_or_false(local_input.shape[scatter_dim] == 0)
+    ):
+        cp_size = cp_mesh.size()
+        shape = list(local_input.shape)
+        scatter_size = shape[scatter_dim]
+        chunk_size = (scatter_size + cp_size - 1) // cp_size
+        offset = cp_mesh.get_local_rank() * chunk_size
+        shape[scatter_dim] = max(0, min(chunk_size, scatter_size - offset))
+        shape[gather_dim] *= cp_size
+        return local_input.reshape(shape)
+
+    # _mark_pack_unbacked marks only lengths greater than one. Assert those
+    # symbolic sizes are nonzero so Dynamo can trace DTensor's split checks.
     for dim in (scatter_dim, gather_dim):
         size = local_input.shape[dim]
         if not guard_or_false(size == 0):

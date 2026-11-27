@@ -8,6 +8,8 @@ Unified implementation for all Attention implementations.
 NATTEN Backend
 """
 
+import os
+
 import torch
 
 from cosmos_framework.model.attention.utils.safe_ops import log
@@ -89,8 +91,28 @@ def natten_supported() -> bool:
 
 NATTEN_SUPPORTED = natten_supported()
 
+
+# NATTEN is CUDA-only, so where it is missing this slot raises for every caller. The
+# frame-causal MoT problems are expressible as exact dense FlashAttention-2 calls, and
+# COSMOS_NATTEN_DENSE_FALLBACK=1 binds that implementation (dense_fallback) here in place
+# of the stubs. Opt-in: without it, an environment without NATTEN keeps NATTEN's own error.
+NATTEN_DENSE_FALLBACK = not NATTEN_SUPPORTED and os.environ.get(
+    "COSMOS_NATTEN_DENSE_FALLBACK", "0"
+).strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
+
 if NATTEN_SUPPORTED:
     from cosmos_framework.model.attention.natten.functions import (
+        natten_attention,
+        natten_multi_dim_attention,
+        natten_multi_dim_attention_varlen,
+    )
+
+elif NATTEN_DENSE_FALLBACK:
+    from cosmos_framework.model.attention.natten.dense_fallback import (
         natten_attention,
         natten_multi_dim_attention,
         natten_multi_dim_attention_varlen,
@@ -108,6 +130,7 @@ __all__ = [
     "natten_multi_dim_attention",
     "natten_multi_dim_attention_varlen",
     "NATTEN_SUPPORTED",
+    "NATTEN_DENSE_FALLBACK",
     "NATTEN_MIN_VERSION",
     "NATTEN_VARLEN_MULTI_DIM_VERSION",
     "get_natten_version",

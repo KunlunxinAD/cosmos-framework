@@ -29,6 +29,7 @@ from cosmos_framework.utils.lazy_config.registry import locate
 from cosmos_framework.model._base import ImaginaireModel
 from cosmos_framework.utils import log, misc
 from cosmos_framework.utils.count_params import count_params
+from cosmos_framework.utils.deterministic_training import randn_with_generator
 from cosmos_framework.model.generator.algorithm.loss.flow_matching import (
     ACTION_SLOT_SAMPLE_COUNT_KEY,
     ACTION_SLOT_SAMPLE_LOSS_KEY,
@@ -2686,14 +2687,14 @@ class OmniMoTModel(ImaginaireModel):
         noise_gen: torch.Generator | None = None
         if iteration is not None and torch.are_deterministic_algorithms_enabled():
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-            noise_gen = torch.Generator(device=self.tensor_kwargs_fp32["device"])
+            noise_gen = torch.Generator(device="cpu")
             noise_gen.manual_seed(iteration * 65536 + rank + 32768)
 
         # Vision
         x0_vision = gen_data_clean.x0_tokens_vision  # list of [C,T,H,W]
         assert x0_vision is not None, "Vision tokens are required for VFM noising."
         epsilon_vision = [
-            torch.randn(x0_vision_i.size(), generator=noise_gen, **self.tensor_kwargs_fp32) for x0_vision_i in x0_vision
+            randn_with_generator(x0_vision_i.size(), generator=noise_gen, **self.tensor_kwargs_fp32) for x0_vision_i in x0_vision
         ]  # list of [C,T,H,W]
         # Under CP, every rank holds the same x0 (the post-tokenizer payload is broadcast
         # round-robin above) but each samples its own ε from a rank-divergent RNG. Broadcasting
@@ -2738,7 +2739,7 @@ class OmniMoTModel(ImaginaireModel):
             )
             assert sigmas_lidar is not None, "sigmas_lidar required when LiDAR tokens exist"
             epsilon_lidar = [
-                torch.randn(x0_i.size(), generator=noise_gen, **self.tensor_kwargs_fp32) for x0_i in x0_lidar
+                randn_with_generator(x0_i.size(), generator=noise_gen, **self.tensor_kwargs_fp32) for x0_i in x0_lidar
             ]  # list of [C,T,H,W]
             context_parallel_broadcast_tensor_list(epsilon_lidar, self.parallel_dims)
             # sigmas_lidar[i] is (1,) → view (1,1,1), broadcast against condition_mask [T,1,1].
@@ -2763,7 +2764,7 @@ class OmniMoTModel(ImaginaireModel):
             )
             assert sigmas_radar is not None, "sigmas_radar required when radar tokens exist"
             epsilon_radar = [
-                torch.randn(x0_i.size(), generator=noise_gen, **self.tensor_kwargs_fp32) for x0_i in x0_radar
+                randn_with_generator(x0_i.size(), generator=noise_gen, **self.tensor_kwargs_fp32) for x0_i in x0_radar
             ]  # list of [C,T,H,W]
             context_parallel_broadcast_tensor_list(epsilon_radar, self.parallel_dims)
             # sigmas_radar[i] is (1,) → view (1,1,1), broadcast against condition_mask [T,1,1].
@@ -2809,7 +2810,7 @@ class OmniMoTModel(ImaginaireModel):
                 ]  # list of [T,action_dim]
             else:
                 epsilon_action = [
-                    torch.randn(x0_action_i.size(), generator=noise_gen, **self.tensor_kwargs_fp32)
+                    randn_with_generator(x0_action_i.size(), generator=noise_gen, **self.tensor_kwargs_fp32)
                     for x0_action_i in x0_action
                 ]  # list of [T,action_dim]
                 context_parallel_broadcast_tensor_list(epsilon_action, self.parallel_dims)
@@ -2852,7 +2853,7 @@ class OmniMoTModel(ImaginaireModel):
             )
             sound_batch_size = len(packed_sequence.sound.condition_mask)
             epsilon_sound = [
-                torch.randn(x0_i.size(), generator=noise_gen, **self.tensor_kwargs_fp32) for x0_i in x0_sound
+                randn_with_generator(x0_i.size(), generator=noise_gen, **self.tensor_kwargs_fp32) for x0_i in x0_sound
             ]  # list of [C,T_sound]
             context_parallel_broadcast_tensor_list(epsilon_sound, self.parallel_dims)
             # Conditioning frames are zeroed via (1 - condition_mask) in all modes (base/TF/DF).

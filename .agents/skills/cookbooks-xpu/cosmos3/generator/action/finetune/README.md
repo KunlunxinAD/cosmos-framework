@@ -18,10 +18,13 @@ Run every command below **from the cosmos-framework repository root** with the
 
 The paired configurations are in
 [examples/toml/sft_config/](../../../../../../../examples/toml/sft_config/).
-The P800 scripts set FlashAttention-2, fused kernels, FP16 VAE computation and
-single-node runtime settings. They enable offline HF access during training,
-so prepare the inputs below before launching. They do not download the dataset,
-VAE, tokenizer or base checkpoint automatically.
+The P800 scripts set FlashAttention-2 (`COSMOS_ATTN_BACKENDS=flash2`), fused
+kernels, P800 VAE/memory switches (see
+[P800 runtime switches](../../../README.md#p800-runtime-switches)), FP16 VAE
+computation, disabled `device_monitor`/`ofu` callbacks, and single-node runtime
+settings. They enable offline HF access during training, so prepare the inputs
+below before launching. They do not download the dataset, VAE, tokenizer or
+base checkpoint automatically.
 
 ## Prepare shared inputs
 
@@ -64,9 +67,17 @@ bash examples/launch_sft_action_fd_droid_posttrain_p800.sh
 ```
 
 The policy wrapper derives `DROID_ROOT` from `DATASET_PATH` unless explicitly
-set. Keep both consistent when relocating the dataset. The optional keep-ranges
-filter is disabled in the registered policy experiment by default; these P800
-wrappers do not download or configure it through a `FILTER_PATH` variable.
+set. Keep both consistent when relocating the dataset. On P800, the DROID policy
+wrapper overrides HSDP to shard 8 / replicate 1, selects the `pyav` video
+backend, disables `compile_tokenizer`, and sets `batch_size=16`,
+`max_samples_per_batch=16`, `grad_accum_iter=1`, `num_workers=8`,
+`persistent_workers=true`, `enable_async_batch_building=true`, and
+`prefetch_factor=2`. The DROID forward-dynamics wrapper disables
+`straggler_detection` and `compile_tokenizer` and sets
+`enable_async_batch_building=true` with `prefetch_factor=32`. The optional
+keep-ranges filter is disabled in the registered policy experiment by default;
+these P800 wrappers do not download or configure it through a `FILTER_PATH`
+variable.
 See [DROID policy training](../../../../../../../docs/action_policy_droid_posttrain.md)
 and [forward-dynamics training](../../../../../../../docs/action_fd_droid_posttrain.md)
 for task details.
@@ -94,7 +105,10 @@ bash examples/launch_sft_action_policy_libero_all_nano_p800.sh
 ```
 
 Choose the intended recipe rather than running both sequentially by default.
-The wrappers override the reference HSDP topology to shard 8 / replicate 1.
+Both LIBERO wrappers override HSDP shard degree to 8 (`replicate_degree=-1` on
+LIBERO-10, auto-derived to 1 on an 8-GPU node; `replicate_degree=1` on
+LIBERO-all) and enable `enable_async_batch_building=true` with
+`prefetch_factor=32`.
 The [LIBERO training and closed-loop guide](../../../../../../../docs/action_policy_libero_posttrain.md)
 describes the action normalization, camera layout and simulator/client contract.
 
@@ -104,18 +118,18 @@ Paths are anchored to the framework repository root by the common example
 launcher. Prefer absolute dataset/tokenizer paths, since `DROID_ROOT` and
 `LIBERO_ROOT` are exported by the recipe wrappers before common path resolution.
 
-| Variable                                                                   | Purpose                                                                      |
-| -------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| `DATASET_PATH`                                                             | DROID parent, LIBERO suite or LIBERO-all parent                              |
-| `DROID_ROOT` / `LIBERO_ROOT`                                               | model dataset root; keep consistent with `DATASET_PATH`                      |
-| `BASE_CHECKPOINT_PATH`                                                     | converted Cosmos3-Nano DCP                                                   |
-| `WAN_VAE_PATH`                                                             | Wan2.2 VAE file                                                              |
-| `TOKENIZER_PATH`                                                           | local Qwen3-VL-8B tokenizer metadata                                         |
-| `OUTPUT_ROOT`                                                              | log/run parent; defaults to each wrapper's timestamped path under `outputs/` |
-| `IMAGINAIRE_OUTPUT_ROOT`                                                   | explicit artifact root; defaults to `OUTPUT_ROOT`                            |
-| `CUDA_VISIBLE_DEVICES`                                                     | visible devices; eight P800s by default                                      |
-| `NPROC_PER_NODE`, `NNODES`, `NODE_RANK`, `MASTER_ADDR`, `MASTER_PORT`      | torchrun topology                                                            |
-| `ACTIVATION_CHECKPOINTING_MODE`, `ACTIVATION_CHECKPOINTING_SAVE_OPS_REGEX` | policy-wrapper activation checkpoint settings                                |
+| Variable                                                              | Purpose                                                                      |
+| --------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `DATASET_PATH`                                                        | DROID parent, LIBERO suite or LIBERO-all parent                              |
+| `DROID_ROOT` / `LIBERO_ROOT`                                          | model dataset root; keep consistent with `DATASET_PATH`                      |
+| `BASE_CHECKPOINT_PATH`                                                | converted Cosmos3-Nano DCP                                                   |
+| `WAN_VAE_PATH`                                                        | Wan2.2 VAE file                                                              |
+| `TOKENIZER_PATH`                                                      | local Qwen3-VL-8B tokenizer metadata                                         |
+| `OUTPUT_ROOT`                                                         | log/run parent; defaults to each wrapper's timestamped path under `outputs/` |
+| `IMAGINAIRE_OUTPUT_ROOT`                                              | explicit artifact root; defaults to `OUTPUT_ROOT`                            |
+| `CUDA_VISIBLE_DEVICES`                                                | visible devices; eight P800s by default                                      |
+| `NPROC_PER_NODE`, `NNODES`, `NODE_RANK`, `MASTER_ADDR`, `MASTER_PORT` | torchrun topology                                                            |
+| `COSMOS_DETERMINISTIC`                                                | set to `1` to pass `--deterministic` via the common launcher                 |
 
 The existing P800 wrappers construct their own `TAIL_OVERRIDES` arrays.
 `EXTRA_TAIL_OVERRIDES` is not consumed by the current common launcher, even
