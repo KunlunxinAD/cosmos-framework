@@ -21,6 +21,160 @@ from cosmos_framework.model.attention.masks import CausalType
 from cosmos_framework.model.attention.utils.environment import is_torch_compiling
 
 
+# --- COSMOS_FLASH2_SAC_CUSTOM_OP ---
+def _maybe_enable_flash2_sac_custom_op() -> None:
+    if os.environ.get("COSMOS_FLASH2_SAC_CUSTOM_OP", "0") != "1":
+        return
+    import flash_attn.flash_attn_interface as fai
+
+    if getattr(fai, "_cosmos_sac_custom_op_enabled", False):
+        return
+
+    orig_fwd = fai._flash_attn_forward
+    orig_varlen_fwd = fai._flash_attn_varlen_forward
+
+    @torch.library.custom_op("flash_attn::_flash_attn_forward", mutates_args=())
+    def _flash_attn_forward_op(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        dropout_p: float,
+        softmax_scale: float,
+        causal: bool,
+        window_size_left: int,
+        window_size_right: int,
+        alibi_slopes: torch.Tensor | None,
+        return_softmax: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        out, _q, _k, _v, _out_padded, softmax_lse, s_dmask, rng_state = orig_fwd(
+            q,
+            k,
+            v,
+            dropout_p,
+            softmax_scale,
+            causal,
+            (window_size_left, window_size_right),
+            alibi_slopes,
+            return_softmax,
+        )
+        return out, softmax_lse, s_dmask, rng_state
+
+    @torch.library.custom_op("flash_attn::_flash_attn_varlen_forward", mutates_args=())
+    def _flash_attn_varlen_forward_op(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        dropout_p: float,
+        softmax_scale: float,
+        causal: bool,
+        window_size_left: int,
+        window_size_right: int,
+        alibi_slopes: torch.Tensor | None,
+        return_softmax: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        out, _q, _k, _v, _out_padded, softmax_lse, s_dmask, rng_state = orig_varlen_fwd(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_p,
+            softmax_scale,
+            causal,
+            (window_size_left, window_size_right),
+            alibi_slopes,
+            return_softmax,
+        )
+        return out, softmax_lse, s_dmask, rng_state
+
+    def _wrapped_flash_attn_forward(
+        q, k, v, dropout_p, softmax_scale, causal, window_size, alibi_slopes, return_softmax
+    ):
+        if q.shape[-1] % 8 != 0:
+            return orig_fwd(
+                q, k, v, dropout_p, softmax_scale, causal, window_size, alibi_slopes, return_softmax
+            )
+        maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
+        q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+        out, softmax_lse, s_dmask, rng_state = torch.ops.flash_attn._flash_attn_forward(
+            q,
+            k,
+            v,
+            float(dropout_p),
+            float(softmax_scale),
+            bool(causal),
+            int(window_size[0]),
+            int(window_size[1]),
+            alibi_slopes,
+            bool(return_softmax),
+        )
+        return out, q, k, v, out, softmax_lse, s_dmask, rng_state
+
+    def _wrapped_flash_attn_varlen_forward(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        alibi_slopes,
+        return_softmax,
+    ):
+        if q.shape[-1] % 8 != 0:
+            return orig_varlen_fwd(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p,
+                softmax_scale,
+                causal,
+                window_size,
+                alibi_slopes,
+                return_softmax,
+            )
+        maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
+        q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+        out, softmax_lse, s_dmask, rng_state = torch.ops.flash_attn._flash_attn_varlen_forward(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            int(max_seqlen_q),
+            int(max_seqlen_k),
+            float(dropout_p),
+            float(softmax_scale),
+            bool(causal),
+            int(window_size[0]),
+            int(window_size[1]),
+            alibi_slopes,
+            bool(return_softmax),
+        )
+        return out, q, k, v, out, softmax_lse, s_dmask, rng_state
+
+    fai._flash_attn_forward = _wrapped_flash_attn_forward
+    fai._flash_attn_varlen_forward = _wrapped_flash_attn_varlen_forward
+    fai._cosmos_sac_custom_op_enabled = True
+
+
+_maybe_enable_flash2_sac_custom_op()
+
+
 def _unpad_lse_bhm(lse_: Tensor, cumulative_seqlen_Q: Tensor, total_tokens: int) -> Tensor:
     """Un-pad a ``[batch, H, max_seqlen]`` LSE into the packed ``[H, total_tokens]`` layout.
 

@@ -9,18 +9,19 @@ P800 counterparts of the [NVIDIA Cosmos3 cookbooks](../../cookbooks/cosmos3/READ
 The existing P800 examples target a single eight-device node with the fused kernels enabled. Each recipe README links back here for
 setup and for the P800 switch reference.
 
-| Backend                                                             | Use it for                                                | Used by                         |
-| ------------------------------------------------------------------- | --------------------------------------------------------- | ------------------------------- |
-| [Cosmos Framework (Kunlun branch)](#cosmos-framework-kunlun-branch) | Native PyTorch training on P800, launched with `torchrun` | Generator (Audiovisual, Action) |
+| Backend                                                             | Use it for                                                | Used by                              |
+| ------------------------------------------------------------------- | --------------------------------------------------------- | ------------------------------------ |
+| [Cosmos Framework (Kunlun branch)](#cosmos-framework-kunlun-branch) | Native PyTorch training on P800, launched with `torchrun` | Generator (Audiovisual, Action, Sim) |
 
 The cookbook contains usage documentation. All executable launchers and TOMLs
 are maintained under `examples/`; run them from the framework repository root
-after preparing the required local inputs. Super's dedicated P800 launcher is pending.
+after preparing the required local inputs.
 
-| Cookbook        | Recipes                                                     | Where                                                    |
-| --------------- | ----------------------------------------------------------- | -------------------------------------------------------- |
-| Audiovisual SFT | Nano, Edge, Nano map-style; Super LoRA P800 entry pending   | [Vision usage](generator/audiovisual/finetune/README.md) |
-| Action SFT      | DROID policy, DROID forward dynamics, LIBERO-10, LIBERO-all | [Action usage](generator/action/finetune/README.md)      |
+| Cookbook         | Recipes                                                           | Where                                                    |
+| ---------------- | ----------------------------------------------------------------- | -------------------------------------------------------- |
+| Audiovisual SFT  | Nano, Edge, Nano map-style, Super LoRA                            | [Vision usage](generator/audiovisual/finetune/README.md) |
+| Action SFT       | DROID policy, DROID forward dynamics, LIBERO-10, LIBERO-all       | [Action usage](generator/action/finetune/README.md)      |
+| Sim-Bimanual SFT | Stage 0 (Bidir), Stage 1 (TF), Stage 2 (TF-dCM), Stage 3 (SF-DMD) | [Sim usage](generator/sim/finetune/README.md)            |
 
 ## Prerequisites
 
@@ -100,12 +101,24 @@ The launchers and paired TOMLs live in `examples/` alongside the framework train
    python -m pip install --no-deps 'lerobot==0.4.4'
    ```
 
+   **Sim-Bimanual** (Stage 0–3) — build on top of the **Action** environment above, then add the
+   video-decoding and MuJoCo/rendering packages without replacing the container's Torch/XPU stack:
+
+   ```shell
+   # Pin torchcodec==0.9.1 (CPU wheel) with --no-deps: torchcodec 0.10.0's official CPU wheel
+   # has ABI/symbol mismatches against the container's PyTorch build.
+   python -m pip install --no-deps torchcodec==0.9.1 \
+     --index-url https://download.pytorch.org/whl/cpu
+   python -m pip install --no-deps \
+     mujoco==3.10.0 glfw==2.11.0 PyOpenGL==3.1.10 etils==1.15.0
+   ```
+
 Preserve the container's `LD_LIBRARY_PATH`; remove an inherited entry only after
 identifying a conflicting library. For CPU placement, see the
 [Kunlun NUMA affinity guide](../../../../docs/numa_cpu_affinity.md).
 
 Prepare the datasets, VAE, matching processor/tokenizer and base DCP using the
-vision/action guides before launching. The example helper resolves repository-relative
+vision/action/sim guides before launching. The example helper resolves repository-relative
 paths from `examples/`; the P800 wrappers enable offline access during training.
 
 ## P800 runtime switches
@@ -125,20 +138,51 @@ training invocation with the intended settings. Preserve the container library p
 | `COSMOS_FUSED_CAUSAL_CONV_PAD` | `1`     | fused causal-conv padding       |
 | `COSMOS_FUSED_VAE_NORM`        | `1`     | fused VAE normalization         |
 
+### Memory & VAE switches (all recipes)
+
+| Switch                                         | Default | Effect                                                    |
+| ---------------------------------------------- | ------- | --------------------------------------------------------- |
+| `COSMOS_SKIP_FINAL_CHECKPOINT`                 | `1`     | skip final checkpoint write at end of run                 |
+| `COSMOS_VAE_ENCODE_BATCH_SIZE`                 | `8`     | micro-batch size for VAE encoding                         |
+| `COSMOS_VAE_ENCODER_NCDHW`                     | `1`     | keep VAE encoder activations in NCDHW layout              |
+| `COSMOS_RELEASE_RAW_VISION_AFTER_TOKENIZATION` | `1`     | release raw vision tensors immediately after tokenization |
+| `COSMOS_INPLACE_FP32_VISION_NORMALIZATION`     | `1`     | in-place FP32 normalization for vision inputs             |
+
 ### Runtime / determinism (all recipes)
 
-| Switch                                    | Default                    | Effect                                               |
-| ----------------------------------------- | -------------------------- | ---------------------------------------------------- |
-| `COSMOS_TRAINING`                         | `1`                        | select the training runtime path                     |
-| `CUDA_VISIBLE_DEVICES`                    | `0,1,2,3,4,5,6,7`          | the 8 P800 devices to use                            |
-| `PYTHONHASHSEED`                          | `42`                       | reproducible hashing (paired with `trainer.seed=42`) |
-| `HF_HUB_OFFLINE` / `TRANSFORMERS_OFFLINE` | `1`                        | require local inputs before training                 |
+| Switch                                    | Default           | Effect                                                        |
+| ----------------------------------------- | ----------------- | ------------------------------------------------------------- |
+| `COSMOS_TRAINING`                         | `1`               | select the training runtime path                              |
+| `COSMOS_ATTN_BACKENDS`                    | `flash2`          | select FlashAttention-2 attention backend                     |
+| `CUDA_VISIBLE_DEVICES`                    | `0,1,2,3,4,5,6,7` | the 8 P800 devices to use                                     |
+| `PYTHONHASHSEED`                          | `42`              | reproducible hashing (paired with `trainer.seed=42`)          |
+| `COSMOS_DETERMINISTIC`                    | `0` (unset)       | when `1`, common launcher passes `--deterministic` to `train` |
+| `HF_HUB_OFFLINE` / `TRANSFORMERS_OFFLINE` | `1`               | require local inputs before training                          |
+
+### Sim-Bimanual compatibility switches
+
+Set by `examples/launch_sft_sim_bimanual_p800.sh` for P800 neighborhood-attention and
+FlashAttention-2 LSE compatibility:
+
+| Switch                            | Default | Effect                                                                                                     |
+| --------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------- |
+| `COSMOS_NATTEN_DENSE_FALLBACK`    | `1`     | dense attention fallback for NATTEN on P800                                                                |
+| `COSMOS_FLASH2_LSE_BHFIX`         | `0`     | head-major dense LSE workaround for legacy `libxpu_flash_attention_train.so` (keep `0` with `torch_xmlir`) |
+| `COSMOS_FLASH2_VARLEN_PACKED_LSE` | `0`     | packed varlen LSE workaround for legacy `libxpu_flash_attention_train.so` (keep `0` with `torch_xmlir`)    |
+
+> **Note on FlashAttention-2 `.so` versions:** The container's built-in
+> `torch_xmlir/libxpu_flash_attention.so` already outputs standard Dense (`[B, H, N]`)
+> and Varlen padded (`[B, H, max_seqlen_q]`) LSE layouts, so both
+> `COSMOS_FLASH2_LSE_BHFIX` and `COSMOS_FLASH2_VARLEN_PACKED_LSE` **must remain `0`**
+> (enabling them with `torch_xmlir/libxpu_flash_attention.so` corrupts LSE during
+> multi-batch or chunked `merge_attentions`). Only set them to `1` if you installed an
+> external/legacy `flash_attn` Python wheel that ships `libxpu_flash_attention_train.so`
+> and overrides the container's FlashAttention library.
 
 The P800 entry points are `examples/launch_sft_*_p800.sh`; their paired TOMLs
-are under `examples/toml/sft_config/`. Their runtime overrides take precedence over
-the TOMLs, and their current common helper does not read `EXTRA_TAIL_OVERRIDES`.
+are under `examples/toml/sft_config/`.
 See [vision usage](generator/audiovisual/finetune/README.md),
-[action usage](generator/action/finetune/README.md), the
+[action usage](generator/action/finetune/README.md),
+[sim usage](generator/sim/finetune/README.md), the
 [SFT examples](../../../../examples/README.md) and the
-[training reference](../../../../docs/training.md). Super's P800 launcher will be
-added separately; no replacement script is created by this documentation cleanup.
+[training reference](../../../../docs/training.md).

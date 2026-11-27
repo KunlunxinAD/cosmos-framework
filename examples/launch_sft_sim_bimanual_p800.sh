@@ -44,20 +44,26 @@ export COSMOS_INPLACE_FP32_VISION_NORMALIZATION=1
 
 export COSMOS_DETERMINISTIC=0
 export COSMOS_NATTEN_DENSE_FALLBACK=1
-export COSMOS_FLASH2_LSE_BHFIX=1
-export COSMOS_FLASH2_VARLEN_PACKED_LSE=1
+export COSMOS_FLASH2_SAC_CUSTOM_OP=1
+# Container torch_xmlir/libxpu_flash_attention.so produces standard LSE layouts (keep 0).
+# Only set to 1 if an external/legacy flash_attn wheel providing libxpu_flash_attention_train.so is active.
+export COSMOS_FLASH2_LSE_BHFIX=0
+export COSMOS_FLASH2_VARLEN_PACKED_LSE=0
 
 TAIL_OVERRIDES=(
     "model.config.tokenizer.vae_path=$WAN_VAE_PATH"
     "model.config.tokenizer.dtype=float16"
-    "trainer.callbacks.compile_tokenizer.enabled=false"
     "trainer.seed=42"
+    "model.config.activation_checkpointing.mode=selective"
     "dataloader_train.max_samples_per_batch=1"
     "trainer.logging_iter=1"
     "trainer.grad_accum_iter=1"
     "trainer.max_iter=12"
     "model.config.ema.enabled=false"
 )
+if [[ "$stage" != "3" ]]; then
+    TAIL_OVERRIDES+=("trainer.callbacks.compile_tokenizer.enabled=false")
+fi
 TAIL_OVERRIDES+=("$@")
 
 source "$(dirname "${BASH_SOURCE[0]}")/_sft_launcher_common.sh"
